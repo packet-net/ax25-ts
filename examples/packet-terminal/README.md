@@ -4,7 +4,7 @@ A self-contained browser terminal app that uses `@packet-net/ax25` and
 `xterm.js` to drive a USB KISS modem from the browser. Late-80s phosphor-CRT
 aesthetic, TNC2 command set.
 
-![PACKET/TERM screenshot — phosphor green CRT styling with status bar showing MYCALL, LINK, MODEM state, terminal area, and command rail.](#)
+<img width="1065" height="746" src="https://github.com/user-attachments/assets/1d934e8f-a4d3-4695-95a6-930364fcd13d" />
 
 ## Run it
 
