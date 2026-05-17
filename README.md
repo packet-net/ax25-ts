@@ -2,8 +2,6 @@
 
 Browser-targeted TypeScript library for AX.25 v2.2 connected-mode sessions over KISS modems. Open a connection to a remote callsign, get back a bidirectional `Stream`-ish session with `onData(...)`, `write(...)`, and `disconnect()`. The library walks the generated AX.25 SDL state-machine tables verbatim — no prior amateur-radio-app-development experience required to use it.
 
-## Install
-
 ```sh
 npm install @packet-net/ax25
 ```
@@ -41,11 +39,11 @@ await session.disconnect();
 await stack.stop();
 ```
 
-The same code as a typechecking file lives at [`examples/quick-start.ts`](examples/quick-start.ts). Two more end-to-end examples (Node TCP, in-memory mock for unit tests) live alongside it — see [`examples/`](examples/).
+The same code as a typechecking file lives at [`examples/quick-start.ts`](examples/quick-start.ts). Two more end-to-end examples (Node TCP, in-memory mock for unit tests) live alongside it in [`examples/`](examples/).
 
 ## Listening for inbound connections
 
-`Ax25Stack` is outbound-only — it expects you to call `connect({ from, to })` and treats the resulting session as the only one on the modem. For node-style usage (a station that exists to accept inbound connections — a BBS, a gateway, an automatic forwarder, the TUI), reach for `Ax25Listener` instead. The listener owns one transport, address-filters inbound frames against your own callsign, builds (or reuses) a session on the first SABM from each peer, and surfaces `sessionAccepted` so application code can wire per-session handlers.
+`Ax25Stack` is outbound-only. For node-style usage (BBS, gateway, automatic forwarder, TUI), reach for `Ax25Listener` — it owns one transport, address-filters inbound frames against your callsign, builds (or reuses) a session on the first SABM from each peer, and surfaces `sessionAccepted` so application code can wire per-session handlers.
 
 ```ts
 import {
@@ -62,15 +60,14 @@ const listener = new Ax25Listener(transport, {
 listener.onSessionAccepted((session) => {
   console.log("inbound from", session.context.remote.toString());
 
-  // Send a welcome message — once the session is Connected, the SDL
-  // accepts DL_DATA_request events on this session.
+  // Once the session is Connected, the SDL accepts DL_DATA_request:
   session.postEvent({
     name: "DL_DATA_request",
-    data: new TextEncoder().encode("Hello from packet.net!\r"),
+    data: new TextEncoder().encode("Hello!\r"),
     pid: 0xf0,
   });
 
-  // Surface inbound I-frames / disconnects via the upward-signal hook.
+  // Surface inbound I-frames / disconnects:
   session.onDataLinkSignal((sig) => {
     if (sig.type === "DL_DATA_indication") {
       process.stdout.write(new TextDecoder().decode(sig.data));
@@ -82,81 +79,57 @@ listener.onSessionAccepted((session) => {
 });
 
 await listener.start();
-// Application keeps running — the listener accepts inbound connections
-// for the lifetime of the process.
-
-// Flip to refuse new connections (existing ones keep running):
-//   listener.acceptIncoming = false;
-//
-// Or initiate outbound from this listener (shares the per-peer cache):
-//   const session = await listener.connect(Callsign.parse("GB7CIP"));
 ```
 
-The full end-to-end example (against a paired in-memory `MockTransport`) lives at [`examples/inbound-listener.ts`](examples/inbound-listener.ts).
+Per-peer sessions are cached, surviving disconnect — sequence-variable history and SRT/T1V smoothing carry over to the next connect from the same callsign. The cache evicts LRU past `maxCachedPeers` (default 64). Full worked example at [`examples/inbound-listener.ts`](examples/inbound-listener.ts).
 
-Per-peer sessions are cached, surviving disconnect — sequence-variable history and SRT/T1V smoothing carry over to the next connect from the same callsign. The cache evicts LRU past `maxCachedPeers` (default 64).
-
-## Transport seams
+## Transports
 
 `Ax25Stack` accepts any `Ax25Transport` (a 3-method interface: `start` / `send` / `stop`). The library ships three concrete transports plus a documented "implement-your-own" seam:
 
-| Transport | Where it lives | Environment | Status |
+| Transport | Where | Environment | Status |
 | --- | --- | --- | --- |
-| `WebSerialKissTransport` | `@packet-net/ax25` main entry | Chromium browsers (Chrome / Edge / Opera / Brave) | Provided |
-| `TcpKissTransport` | `@packet-net/ax25/tcp-transport` subpath | Node.js (uses `node:net`) | Provided |
-| `MockTransport` | `tests/mock-transport.ts` (not in published bundle — copy into your project for testing) | Anywhere | Provided for tests |
-| AGW (over TCP) | n/a | Node | Not yet implemented |
-| AXUDP | n/a | Node | Not yet implemented |
-| Audio (modem-in-browser) | n/a | Browser | Not yet implemented |
+| `WebSerialKissTransport` | main entry | Chromium browsers (Chrome / Edge / Opera / Brave) | ✓ |
+| `TcpKissTransport` | `/tcp-transport` subpath | Node.js | ✓ |
+| `MockTransport` | `tests/mock-transport.ts` | Anywhere (test-only) | ✓ |
+| AGW (over TCP) | — | Node | not implemented |
+| AXUDP | — | Node | not implemented |
+| Audio (browser AFSK) | — | Browser | not implemented |
 
 To roll your own, implement `Ax25Transport` and pass it to `new Ax25Stack(yourTransport)`.
 
-## Scope — what's in v0.1, what's deliberately out
-
-> The tables below are the consumer-facing view of *this runtime's* scope. For the **cross-runtime** view — which capabilities exist in C# but not TS (or vice versa), which transports each runtime ships, which SDL subroutines are wired where — see [`docs/runtime-capability-matrix.md`](../../docs/runtime-capability-matrix.md). The matrix is the canonical multi-runtime status doc; the tables here stay focused on `@packet-net/ax25` itself.
+## Scope — what's in, what's out
 
 ### In
 
 - Frame codec for U/S/I frames (mod-8): SABM, SABME (factory + classify only — sequence numbers are still mod-8), UA, DISC, DM, UI, RR, RNR, REJ, I.
 - 7-octet callsign codec with SSID + C/H + E-bit handling.
 - KISS framing (FEND/FESC/TFEND/TFESC, multi-port nibble).
-- Web Serial transport for the browser.
-- Node TCP transport for KISS-over-TCP listeners (BPQ / Xrouter / direwolf / net-sim).
-- Table-driven session machine that walks the generated SDL transitions in [`ax25sdl`](../../ts-spec/) — same architecture as the C# runtime in [`src/Packet.Ax25/Session/`](../../src/Packet.Ax25/Session/).
-- SABM → UA → Connected, DISC → UA → Disconnected.
-- I-frame TX/RX with V(s)/V(r)/V(a) bookkeeping, k=1 outstanding window, FIFO TX queue.
-- T1 retry capped at N2 (default 10), SDL `RC_eq_N2` guard.
-- **Inbound listener** — `Ax25Listener` accepts inbound SABM, fires `sessionAccepted`, caches per-peer sessions with LRU eviction, mirrors AX.25 §C.2 path reversal on responses. See "Listening for inbound connections" below.
-- Public API: `Ax25Stack`, `Ax25Session`, `Ax25Listener`, `Ax25Frame`, `Callsign`, KISS helpers, `Ax25Transport` interface.
+- Web Serial transport for the browser, Node TCP for KISS-over-TCP listeners (BPQ / Xrouter / direwolf / net-sim).
+- Table-driven session machine walking the SDL transitions from [`ax25sdl`](https://www.npmjs.com/package/ax25sdl) — same architecture as the C# reference runtime in [`m0lte/packet.net`'s `Packet.Ax25`](https://github.com/m0lte/packet.net/tree/main/src/Packet.Ax25/Session).
+- SABM → UA → Connected, DISC → UA → Disconnected, I-frame TX/RX with V(s)/V(r)/V(a) bookkeeping, T1 retry capped at N2.
+- **Inbound listener** — `Ax25Listener` accepts inbound SABM, fires `sessionAccepted`, caches per-peer sessions with LRU eviction, mirrors AX.25 §C.2 path reversal on responses.
 
-### Out (deliberate — will land in later versions)
+### Out (deliberate — planned for later)
 
-| Missing feature | Behaviour today | Tracked for |
+| Feature | Today | Tracked for |
 | --- | --- | --- |
 | mod-128 (SABME, extended sequence numbers) | SDL `version_2_2` / `mod_128` predicates return false; mod-128 branches route-around | post-v0.1 |
-| REJ / SREJ recovery loops | Wire frames emit, but the `Invoke_Retransmission` / `N_r_Error_Recovery` subroutines are no-op stubs | post-v0.1 |
+| REJ / SREJ recovery loops | Wire frames emit, but `Invoke_Retransmission` / `N_r_Error_Recovery` subroutines are no-op stubs | post-v0.1 |
 | FRMR generation / handling | Inbound FRMR silently dropped | post-v0.1 |
-| figc4.7 subroutine walker | The dispatcher inlines `Establish_Data_Link` + `Check_I_Frame_Acknowledged`; everything else routes through no-op registry stubs | post-v0.1 |
+| figc4.7 subroutine walker | Most verbs route through no-op registry stubs | post-v0.1 |
 | Multi-frame TX window (k>1) | Hard-coded k=1 | post-v0.1 |
 | `via` digipeater paths | `stack.connect({ via: [...] })` throws | post-v0.1 |
-| AGW client / server | Not implemented (Node-side; the [Packet.Agw .NET package](../../src/Packet.Agw/) has the working reference impl) | post-v0.1 |
+| AGW client / server | Not implemented (the [`Packet.Agw`](https://github.com/m0lte/packet.net/tree/main/src/Packet.Agw) .NET package has the working reference impl) | post-v0.1 |
 | Audio modem transport (browser-side AFSK) | Not implemented | post-v0.1 |
 | XID negotiation | Not implemented — defaults used (mod-8, no SREJ) | post-v0.1 |
 | Dynamic T1 (`Select_T1_Value`) | Stub; caller-supplied `t1Ms` is honoured for the lifetime of the session | post-v0.1 |
 
-## Documentation
-
-- **API reference** — [`docs/web-ax25/api/`](../../docs/web-ax25/api/) (regenerated by `npm run docs`; see also the [docs index](../../docs/web-ax25/README.md)).
-- **Worked examples** — [`examples/`](examples/) — three self-contained, typechecked examples (Web Serial, Node TCP, in-memory mock).
-- **Distribution & publishing** — [`docs/web-ax25/publishing.md`](../../docs/web-ax25/publishing.md). Written for `.NET` / NuGet veterans new to npm.
-- **Changelog** — [`CHANGELOG.md`](CHANGELOG.md).
-- **C# reference implementation** — for spec-purity-minded readers, [`src/Packet.Ax25/Session/`](../../src/Packet.Ax25/Session/) is the fuller AX.25 v2.2 runtime, walking the same SDL transitions this library walks. It implements the figc4.7 subroutines and REJ/SREJ recovery this library currently stubs.
-
 ## Browser compatibility
 
-Web Serial is supported in Chromium-based browsers (Chrome, Edge, Opera, Brave) on desktop OSes. Firefox and Safari don't expose it. The user must grant permission per port via `navigator.serial.requestPort()` from a user-gesture handler (button click, etc.).
+Web Serial is supported in Chromium browsers (Chrome / Edge / Opera / Brave) on desktop OSes. Firefox and Safari don't expose it. The user must grant permission per port via `navigator.serial.requestPort()` from a user-gesture handler (button click, etc.).
 
-For non-browser environments (Node.js, Bun, Deno) reach for the `TcpKissTransport` subpath import (`@packet-net/ax25/tcp-transport`) or implement your own transport against `Ax25Transport`.
+For non-browser environments (Node.js / Bun / Deno) use the `TcpKissTransport` subpath or implement your own transport.
 
 ## Source layout
 
@@ -165,22 +138,38 @@ src/
 ├── address.ts                 Ax25Address record + codec
 ├── callsign.ts                Callsign type
 ├── frame.ts                   Ax25Frame, factories, encode/decode, classify
-├── kiss.ts                    KISS framing (FEND/FESC/TFEND/TFESC)
+├── kiss.ts                    KISS framing
 ├── transport.ts               Ax25Transport interface
-├── webserial-transport.ts     KISS over Web Serial port
-├── tcp-transport.ts           KISS over TCP socket (Node-only)
-├── session.ts                 Public Ax25Stack / Ax25Session — outbound-only convenience facade
+├── webserial-transport.ts     KISS over Web Serial
+├── tcp-transport.ts           KISS over TCP (Node-only)
+├── session.ts                 Public Ax25Stack / Ax25Session — outbound facade
 ├── listener.ts                Ax25Listener — inbound-accepting node coordinator
 └── sdl/                       Table-walking session engine
-    ├── events.ts                  Ax25Event variants (frame-receipt, timer, DL primitives)
-    ├── timer-scheduler.ts         T1/T2/T3 arming + isRunning bindings
-    ├── session-context.ts         Mutable per-session state (V(S)/V(A)/V(R), flags, queues)
-    ├── guard-evaluator.ts         Parses `"a and not b or c"` against a bindings dict
-    ├── session-bindings.ts        Builds the dict — predicate name → closure
-    ├── action-dispatcher.ts       Switch over the ~140 SDL action verbs
-    ├── subroutine-registry.ts     figc4.7 subroutine stub registry (gaps documented)
+    ├── events.ts                  Ax25Event variants
+    ├── timer-scheduler.ts         T1/T2/T3 arming
+    ├── session-context.ts         Mutable per-session state
+    ├── guard-evaluator.ts         Parses `"a and not b or c"` guards
+    ├── session-bindings.ts        Predicate name → closure
+    ├── action-dispatcher.ts       Switch over ~140 SDL action verbs
+    ├── subroutine-registry.ts     figc4.7 subroutine stub registry
     └── session-driver.ts          PostEvent → find transition → execute → advance
 ```
+
+## Provenance
+
+Extracted from `m0lte/packet.net` on 2026-05-17 (history preserved via `git filter-repo --path web/ax25/ --path-rename web/ax25/:` — 13 commits spanning the library's full life). Before the split, the library lived at `web/ax25/` in that monorepo.
+
+The cross-runtime integration test (`tests/integration/linbpq-via-netsim.test.ts`) runs in [`m0lte/packet.net`'s `interop.yml`](https://github.com/m0lte/packet.net/blob/main/.github/workflows/interop.yml) — that workflow clones this repo and dials the docker stack standing up there (LinBPQ + Xrouter + rax25 + netsim). The docker stack lives in `m0lte/packet.net` and isn't replicated here.
+
+## Sibling repos
+
+| Repo | What it is |
+| --- | --- |
+| **`m0lte/ax25-ts`** *(here)* | `@packet-net/ax25` browser TS library |
+| [`m0lte/ax25sdl`](https://github.com/m0lte/ax25sdl) | SDL transcriptions + codegen — publishes the [`ax25sdl`](https://www.npmjs.com/package/ax25sdl) npm package this library consumes |
+| [`m0lte/packet.net`](https://github.com/m0lte/packet.net) | .NET libraries + node host + docker interop matrix (which exercises this library's integration suite) |
+| [`m0lte/packet-term-tui`](https://github.com/m0lte/packet-term-tui) | C# Terminal.Gui TUI (the .NET counterpart of [`packet-term-web`](https://github.com/m0lte/packet-term-web)) |
+| [`m0lte/packet-term-web`](https://github.com/m0lte/packet-term-web) | Browser TNC2 emulator at https://packet-term.m0lte.uk — consumes this library |
 
 ## License
 
