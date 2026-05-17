@@ -1,0 +1,91 @@
+name: publish
+
+# Publishes `@packet-net/ax25` to npmjs.com on any tag matching `v*`.
+# Version is taken from the tag (strip the leading `v`), so e.g.
+# tagging `v0.2.1` publishes 0.2.1.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    # Manual trigger lets you validate the workflow shape from a branch
+    # without actually publishing — the `if: env.NPM_TOKEN != ''` guard
+    # on the publish step will skip the upload if the secret is unset.
+    inputs:
+      override_version:
+        description: 'Override version (only used for workflow_dispatch; tag wins for push events)'
+        required: false
+        default: ''
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  resolve-version:
+    name: resolve version from tag
+    runs-on: [self-hosted, Linux, X64]
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+    steps:
+      - id: parse
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # github.ref is refs/tags/v0.2.1 — strip prefix + leading v.
+            tag="${GITHUB_REF#refs/tags/}"
+            version="${tag#v}"
+          else
+            version="${{ inputs.override_version }}"
+          fi
+          if [ -z "$version" ]; then
+            echo "::error::No version resolved (tag was '${GITHUB_REF}', input was empty)."
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Publishing version: ${version}"
+
+  publish-npm:
+    name: publish @packet-net/ax25 to npmjs.com
+    needs: resolve-version
+    runs-on: [self-hosted, Linux, X64]
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      VERSION: ${{ needs.resolve-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org/'
+
+      - name: pin version from tag
+        run: |
+          echo "Pinning package.json → ${VERSION}"
+          npm pkg set "version=${VERSION}"
+
+      - name: install + build
+        run: |
+          npm ci
+          npm run build
+
+      - name: pack (dry-run sanity check)
+        run: npm pack --dry-run
+
+      - name: publish
+        if: env.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
+
+      - name: warn if NPM_TOKEN missing
+        if: env.NPM_TOKEN == ''
+        run: |
+          echo "::warning::NPM_TOKEN secret is not set — npm publish was skipped."
