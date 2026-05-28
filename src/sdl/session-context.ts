@@ -114,6 +114,10 @@ export function incrementSeq(ctx: Ax25SessionContext, value: number): number {
   return (value + 1) % modulus(ctx);
 }
 
+export function decrementSeq(ctx: Ax25SessionContext, value: number): number {
+  return (value + modulus(ctx) - 1) % modulus(ctx);
+}
+
 /** Build a fresh session context for a `(local, remote)` pair. */
 export function createSessionContext(
   local: Callsign,

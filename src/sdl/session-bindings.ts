@@ -96,6 +96,11 @@ export function createSessionBindings(
   bindings.set("vr_i_frame_stored", () =>
     context.storedReceivedIFrames.has(context.vr),
   );
+  // Spelling the codegen actually emits for the figc4.4/4.5 stored-frame
+  // drain loop predicate (capital spec-variable I, lower-case vr).
+  bindings.set("vr_I_frame_stored", () =>
+    context.storedReceivedIFrames.has(context.vr),
+  );
 
   // ─── figc4.7 subroutine predicates ─────────────────────────────────
   bindings.set("mod_128", () => context.isExtended);

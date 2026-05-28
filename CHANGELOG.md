@@ -4,6 +4,25 @@ All notable changes to `@packet-net/ax25` will be documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Subject lines stay short by convention; bodies wrap to the GitHub viewer's viewport.
 
+## [0.4.0] — 2026-05-28
+
+> Note: `0.3.0` was published in error from `main` before this change merged, so it carries the old `ax25sdl ^0.6.0` dependency and **does not** include SDL loop execution. It is deprecated on npm — use `0.4.0` or later.
+
+Consumes `ax25sdl` 0.7.0, which recovers the AX.25 SDL loops the codegen had previously been dropping (ax25sdl#44/#48/#49). The session runtime now *executes* those loops instead of running each body once — the TypeScript mirror of the C# `SdlLoopExecutor` work in `m0lte/packet.net`.
+
+### Changed
+
+- Bump the `ax25sdl` dependency to `^0.7.0`.
+
+### Added
+
+- SDL loop execution in the session driver: a transition's `loop_while` ranges (the figc4.4 / figc4.5 stored-frame drain) are now expanded — a head-test loop re-checks its continue predicate before each iteration (zero-or-more runs), a tail-test after (one-or-more) — with an iteration cap that throws rather than spinning. Subroutine bodies are still not table-walked in this port, so only transition loops apply.
+- Stored-frame drain support: `Retrieve Stored V(r) I Frame` now consumes the stored frame at V(r) and stages it for the following `DL-DATA Indication` to deliver (the retrieve/deliver split the figure draws as two actions, avoiding double-delivery); plus `V(r) := V(r) - 1` (figc4.5) and the `vr_I_frame_stored` loop-predicate binding.
+
+### Fixed
+
+- An in-sequence I-frame arriving in Connected or Timer Recovery no longer throws `UnknownActionError` on the drain loop's `Retrieve Stored V(r) I Frame` verb — which surfaced the moment the 0.7.0 tables started carrying the recovered loop.
+
 ## [0.2.1] — 2026-05-17
 
 Lifts the friendly facade methods (`onData`, `onDisconnected`, `write`, `disconnect`, `to`) onto `Ax25ListenerSession`, so a session from `Ax25Listener.connect()` or `Ax25Listener.onSessionAccepted` is now drop-in compatible with one from `Ax25Stack.connect()`. Consumers that just want the high-level shape no longer need to write adapter code on top of `Ax25ListenerSession`'s raw `postEvent` / `onDataLinkSignal` API — the raw API stays available for advanced use. Surfaced by the packet-terminal example modernization (issue: the example would otherwise have had to reimplement what `Ax25Session` already provides).

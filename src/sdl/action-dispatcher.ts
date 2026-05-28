@@ -18,6 +18,7 @@ import {
 import type { Ax25Event } from "./events.js";
 import {
   type Ax25SessionContext,
+  decrementSeq,
   incrementSeq,
 } from "./session-context.js";
 import type { SubroutineRegistry } from "./subroutine-registry.js";
@@ -45,6 +46,15 @@ export interface TransitionContext {
    * is dispatched after the current action chain completes.
    */
   readonly postEvent: (event: Ax25Event) => void;
+  /**
+   * A stored out-of-sequence I-frame just dequeued by
+   * `Retrieve Stored V(r) I Frame`, staged for the next `DL-DATA Indication`
+   * to deliver. Null/undefined when the indication should deliver the
+   * triggering frame instead. The figc4.4/4.5 stored-frame drain loop draws
+   * retrieval and delivery as two separate actions, so a single iteration
+   * stages here then delivers.
+   */
+  retrievedStoredFrame?: { info: Uint8Array; pid: number } | null;
 }
 
 /**
@@ -295,6 +305,10 @@ export class ActionDispatcher {
       case "V(s) <- V(s) + 1":         ctx.vs = incrementSeq(ctx, ctx.vs); return;
       case "V(r) := 0":                 ctx.vr = 0; return;
       case "V(r) := V(r) + 1":          ctx.vr = incrementSeq(ctx, ctx.vr); return;
+      // figc4.5 Timer Recovery draws the stored-frame drain with V(r) := V(r) - 1.
+      // Surprising for a drain; flagged upstream for spec-author review
+      // (ax25sdl#49). Encoded faithfully pending that.
+      case "V(r) := V(r) - 1":          ctx.vr = decrementSeq(ctx, ctx.vr); return;
       case "V(a) := 0":                 ctx.va = 0; return;
       case "RC := 0":                   ctx.rc = 0; return;
       case "RC := 1":
@@ -452,7 +466,8 @@ export class ActionDispatcher {
       // ─── Save / retrieve out-of-sequence I-frames ─────────────────
       case "save_contents_of_I_frame":
       case "Save Contents of I Frame":  saveIncomingIFrame(tx); return;
-      case "retrieve_stored_V_r_I_frame": retrieveStoredVrIFrame(tx); return;
+      case "retrieve_stored_V_r_I_frame":
+      case "Retrieve Stored V(r) I Frame": retrieveStoredVrIFrame(tx); return;
 
       // ─── Subroutine calls ──────────────────────────────────────────
       // The subroutine registry handles dispatch; in our TS port the
@@ -715,19 +730,28 @@ function saveIncomingIFrame(tx: TransitionContext): void {
   tx.context.storedReceivedIFrames.set(ns, { info, pid });
 }
 
+// Implements `Retrieve Stored V(r) I Frame`: consume the stored frame at V(r)
+// and *stage* it on tx for the following `DL-DATA Indication` to deliver. The
+// figc4.4/4.5 drain loop draws retrieval and delivery as two separate actions,
+// so staging (rather than delivering here) avoids the loop body double-
+// delivering. No-op if nothing is stored at V(r).
 function retrieveStoredVrIFrame(tx: TransitionContext): void {
   const ctx = tx.context;
   const stored = ctx.storedReceivedIFrames.get(ctx.vr);
   if (!stored) return;
   ctx.storedReceivedIFrames.delete(ctx.vr);
-  tx.emitUpward({
-    type: "DL_DATA_indication",
-    data: stored.info,
-    pid: stored.pid,
-  });
+  tx.retrievedStoredFrame = stored;
 }
 
 function buildDataIndication(tx: TransitionContext): DataLinkSignal {
+  // Inside the stored-frame drain loop, a preceding `Retrieve Stored V(r) I
+  // Frame` stages the frame to deliver here; consume it. Outside the loop,
+  // deliver the triggering frame.
+  if (tx.retrievedStoredFrame != null) {
+    const staged = tx.retrievedStoredFrame;
+    tx.retrievedStoredFrame = null;
+    return { type: "DL_DATA_indication", data: staged.info, pid: staged.pid };
+  }
   if (!tx.event.frame) {
     throw new Error(
       "action 'DL_DATA_indication' requires the trigger to be a frame-receipt event.",
