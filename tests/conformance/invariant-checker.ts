@@ -22,7 +22,10 @@ import { modulus } from "../../src/sdl/session-context.js";
 const KNOWN_STATES = new Set([
   "Disconnected",
   "AwaitingConnection",
-  "AwaitingConnection22",
+  // The figc4.6 state's own SDL name (was mis-keyed "AwaitingConnection22" in
+  // the driver's STATE_PAGES before the ax25Spec44 redirect made it routable —
+  // the driver now keys it by the SDL spelling, so the oracle follows).
+  "AwaitingV22Connection",
   "AwaitingRelease",
   "Connected",
   "TimerRecovery",

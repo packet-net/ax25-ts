@@ -50,6 +50,11 @@ import {
   createSessionContext,
   modulus,
 } from "../../src/sdl/session-context.js";
+import {
+  type Ax25SessionQuirks,
+  defaultSessionQuirks,
+  strictlyFaithfulSessionQuirks,
+} from "../../src/sdl/session-quirks.js";
 import { SdlSessionDriver } from "../../src/sdl/session-driver.js";
 import type { TimerName, TimerScheduler } from "../../src/sdl/timer-scheduler.js";
 import { assertConverged, checkSafety } from "./invariant-checker.js";
@@ -131,6 +136,16 @@ export class Endpoint {
   readonly delivered: Uint8Array[] = [];
   /** Inbound event queue — frames classified from the wire, pumped by settle. */
   readonly inbound: Ax25Event[] = [];
+  /** Every frame this station received from its peer (post round-trip through
+   * the codec, address-matched, not dropped), in order. The per-endpoint
+   * analogue of {@link Link.log} (which is every frame on the wire from either
+   * station). Mirrors `Endpoint.ReceivedFromPeer` in packet.net. */
+  readonly receivedFromPeer: Ax25Frame[] = [];
+  /** Every {@link DataLinkSignal} this station raised upward, in order — the
+   * full signal log (DL-CONNECT/DISCONNECT/DATA/ERROR indications + confirms),
+   * for asserting on signals other than DL-DATA-indication. Mirrors
+   * `Endpoint.Signals` in packet.net. */
+  readonly signals: DataLinkSignal[] = [];
 
   constructor(
     readonly name: string,
@@ -159,6 +174,12 @@ export interface HarnessOptions {
   t1Ms?: number;
   n2?: number;
   extended?: boolean;
+  /** Per-session quirk toggles. Defaults to {@link defaultSessionQuirks}
+   * (spec-correct). Pass {@link strictlyFaithfulSessionQuirks} (or use
+   * {@link TwoStationHarness.buildStrictlyFaithful}) to run the SDL figures
+   * exactly as drawn, defects and all. Mirrors the C# harness's `quirks`
+   * parameter. */
+  quirks?: Ax25SessionQuirks;
 }
 
 function mapKindToEvent(kind: string): string | null {
@@ -200,11 +221,35 @@ export class TwoStationHarness {
    * Defaults true (oracle runs after every step). */
   checkAfterEachStep = true;
 
+  private readonly fired = new Set<string>();
+
+  /** Every `(state, transition-id)` that has fired on either station's real
+   * driver over this harness's lifetime — the substrate for behavioural
+   * transition-coverage measurement. Populated from each driver's
+   * `onTransitionFired` hook (the TS analogue of the C# session's
+   * `TransitionFired` event). Membership is tested via {@link firedTransition};
+   * exposed as a string set keyed `"<from> <id>"`. */
+  get firedTransitions(): ReadonlySet<string> {
+    return this.fired;
+  }
+
+  /** True if the transition `(from, id)` has fired on either station. The TS
+   * analogue of `h.FiredTransitions.Should().Contain((from, id))`. */
+  firedTransition(from: string, id: string): boolean {
+    return this.fired.has(`${from} ${id}`);
+  }
+
   private constructor(a: Endpoint, b: Endpoint, link: Link, t1Ms: number) {
     this.a = a;
     this.b = b;
     this.link = link;
     this.t1Ms = t1Ms;
+  }
+
+  /** Record a fired transition. Wired into each endpoint's driver as the
+   * `onTransitionFired` hook by {@link build}. */
+  private recordTransition(from: string, id: string): void {
+    this.fired.add(`${from} ${id}`);
   }
 
   /**
@@ -232,6 +277,7 @@ export class TwoStationHarness {
       t1Ms = DEFAULT_T1_MS,
       n2 = DEFAULT_N2,
       extended = false,
+      quirks = defaultSessionQuirks,
     } = opts;
     const nodeA = Callsign.parse("M0LTEA-1");
     const nodeB = Callsign.parse("M0LTEB-2");
@@ -244,13 +290,23 @@ export class TwoStationHarness {
     // sharing only the clock); here each `ManualScheduler` is its own clock,
     // advanced in lock-step by `advanceT1` / `recoverUntilConverged`.
     const refs: { a?: Endpoint; b?: Endpoint } = {};
+    // The transition-coverage recorder routes through a mutable ref because the
+    // drivers are built (with their hooks) before the harness exists — the same
+    // late-binding idiom as `refs` for the peer wiring. `recordTransition` on
+    // the harness fills `record` once the harness is constructed.
+    const recorder: { record?: (from: string, id: string) => void } = {};
+    const onTransitionFired = (
+      spec: { from: string; id: string },
+      _state: string,
+    ): void => recorder.record?.(spec.from, spec.id);
     const a = buildEndpoint(
       nodeA,
       nodeB,
       new ManualScheduler(),
       link,
       () => refs.b as Endpoint,
-      { srej, k, t1Ms, n2, extended },
+      { srej, k, t1Ms, n2, extended, quirks },
+      onTransitionFired,
     );
     const b = buildEndpoint(
       nodeB,
@@ -258,13 +314,29 @@ export class TwoStationHarness {
       new ManualScheduler(),
       link,
       () => refs.a as Endpoint,
-      { srej, k, t1Ms, n2, extended },
+      { srej, k, t1Ms, n2, extended, quirks },
+      onTransitionFired,
     );
     refs.a = a;
     refs.b = b;
     a.driver.setState("Disconnected");
     b.driver.setState("Disconnected");
-    return new TwoStationHarness(a, b, link, t1Ms);
+    const harness = new TwoStationHarness(a, b, link, t1Ms);
+    recorder.record = (from, id) => harness.recordTransition(from, id);
+    return harness;
+  }
+
+  /** Build a harness whose sessions run the SDL figures exactly as drawn —
+   * every {@link Ax25SessionQuirks} off. Used to pin a figure defect's faithful
+   * (uncorrected) behaviour alongside the corrected default. Mirrors the C#
+   * `TwoStationHarness.BuildStrictlyFaithful`. */
+  static buildStrictlyFaithful(
+    opts: Omit<HarnessOptions, "quirks"> = {},
+  ): TwoStationHarness {
+    return TwoStationHarness.build({
+      ...opts,
+      quirks: strictlyFaithfulSessionQuirks,
+    });
   }
 
   // ─── Scenario actions ───────────────────────────────────────────────
@@ -326,6 +398,21 @@ export class TwoStationHarness {
   /** Disconnect from `from`; asserts both reach Disconnected. */
   disconnect(from: Endpoint): void {
     from.driver.postEvent({ name: "DL_DISCONNECT_request" });
+    this.pumpToQuiescence();
+    if (this.checkAfterEachStep) this.checkInvariants();
+  }
+
+  /**
+   * Inject a received-frame event straight into `target`'s driver, then pump +
+   * check. Models a frame arriving on `target`'s radio that the *peer session*
+   * would never emit on its own — so it reaches received-frame transitions the
+   * two well-behaved sessions can't drive between them (a FRMR, an unsolicited
+   * DM, a malformed frame). Bypasses the channel's drop/address filters: the
+   * frame is, by construction, "already at the receiver". Mirrors the C#
+   * `TwoStationHarness.Inject`.
+   */
+  inject(target: Endpoint, event: Ax25Event): void {
+    target.inbound.push(event);
     this.pumpToQuiescence();
     if (this.checkAfterEachStep) this.checkInvariants();
   }
@@ -457,13 +544,25 @@ function buildEndpoint(
   scheduler: ManualScheduler,
   link: Link,
   peer: () => Endpoint,
-  opts: { srej: boolean; k: number; t1Ms: number; n2: number; extended: boolean },
+  opts: {
+    srej: boolean;
+    k: number;
+    t1Ms: number;
+    n2: number;
+    extended: boolean;
+    quirks: Ax25SessionQuirks;
+  },
+  onTransitionFired: (
+    spec: { from: string; id: string },
+    state: string,
+  ) => void,
 ): Endpoint {
   const ctx = createSessionContext(local, remote);
   ctx.k = opts.k;
   ctx.n2 = opts.n2;
   ctx.srejEnabled = opts.srej;
   ctx.isExtended = opts.extended;
+  ctx.quirks = { ...opts.quirks };
 
   // The Endpoint is constructed last (it needs the driver), but the driver's
   // closures only *run* later, during postEvent — by which point `endpoint` is
@@ -490,12 +589,17 @@ function buildEndpoint(
     }
     const eventName = mapKindToEvent(classify(parsed));
     if (eventName === null) return;
+    // Delivered to the peer: record it on the peer's received log (the C#
+    // `peerLocal.RxLog.Add(parsed)` after the drop + address checks) and queue
+    // the classified event.
+    target.receivedFromPeer.push(parsed);
     target.inbound.push({ name: eventName, frame: parsed });
   };
 
   const driver = new SdlSessionDriver(ctx, scheduler, {
     sendFrame: send,
     emitUpward: (sig: DataLinkSignal) => {
+      endpoint.signals.push(sig);
       if (
         sig.type === "DL_DATA_indication" ||
         sig.type === "DL_UNIT_DATA_indication"
@@ -503,6 +607,7 @@ function buildEndpoint(
         endpoint.delivered.push(sig.data);
       }
     },
+    onTransitionFired,
     // Unhandled events are SDL no-ops (events in states that don't handle them
     // are ignored); the harness never wants a throw from an inbound stray.
     onUnhandledEvent: () => {},

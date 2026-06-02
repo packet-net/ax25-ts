@@ -29,10 +29,18 @@ import {
 } from "./subroutine-registry.js";
 import type { TimerName, TimerScheduler } from "./timer-scheduler.js";
 
+// Keyed by the SDL state name (the `state` field on each generated page, and
+// the `next` field every transition targets). The figc4.6 page's own name is
+// `AwaitingV22Connection`, and its transitions target `AwaitingV22Connection` /
+// `AwaitingConnection` / `Connected` / `Disconnected` — so the key MUST be the
+// SDL spelling for a `match.next` lookup to resolve once a session routes into
+// it (which the ax25Spec44 redirect below now makes reachable for the first
+// time). Mirrors the C# TransitionMap keying (`["AwaitingV22Connection"] =
+// DataLink_AwaitingV22Connection.Transitions`).
 const STATE_PAGES: Record<string, StatePage> = {
   Disconnected: DataLinkDisconnected,
   AwaitingConnection: DataLinkAwaitingConnection,
-  AwaitingConnection22: DataLinkAwaitingV22Connection,
+  AwaitingV22Connection: DataLinkAwaitingV22Connection,
   AwaitingRelease: DataLinkAwaitingRelease,
   Connected: DataLinkConnected,
   TimerRecovery: DataLinkTimerRecovery,
@@ -45,11 +53,23 @@ const STATE_PAGES: Record<string, StatePage> = {
  */
 export type UnhandledEventHook = (event: Ax25Event, state: string) => void;
 
+/**
+ * Optional hook fired when a transition matches and is about to execute,
+ * carrying the matched {@link TransitionSpec}. The TS analogue of the C#
+ * `Ax25Session.TransitionFired` event — lets the conformance harness build a
+ * behavioural transition-coverage ledger (`(spec.from, spec.id)`). Fired with
+ * the *real* matched spec (its figc4.x `from`/`id`), before any quirk rewrites
+ * the target state, so the ledger records the figure transition that actually
+ * fired. Default: nothing observes transitions.
+ */
+export type TransitionFiredHook = (spec: TransitionSpec, state: string) => void;
+
 /** Hooks the session driver into the surrounding stack. */
 export interface SessionDriverHooks {
   readonly sendFrame: (frame: Ax25Frame) => void;
   readonly emitUpward: (signal: DataLinkSignal) => void;
   readonly onUnhandledEvent?: UnhandledEventHook;
+  readonly onTransitionFired?: TransitionFiredHook;
   readonly subroutines?: SubroutineRegistry;
   /** Timer durations in milliseconds. */
   readonly t1Ms?: number;
@@ -178,6 +198,7 @@ export class SdlSessionDriver {
         this.hooks.onUnhandledEvent?.(event, this.state);
         return;
       }
+      this.hooks.onTransitionFired?.(match, this.state);
 
       const pending: PendingFrame = { nr: null, ns: null, pfBit: null };
       const tx: TransitionContext = {
@@ -190,6 +211,7 @@ export class SdlSessionDriver {
         subroutines: this.subroutines,
         postEvent: (evt) => this.pendingEvents.push(evt),
       };
+      this.applyPreExecutionQuirks(match);
       executeWithLoops(
         match.actions,
         match.loops,
@@ -198,10 +220,80 @@ export class SdlSessionDriver {
         tx,
         this.state,
       );
-      this.state = match.next;
+      this.state = this.resolveNextState(match);
     } finally {
       this.currentTrigger = null;
     }
+  }
+
+  /**
+   * Apply quirks that must take effect *before* a transition's actions run.
+   * Currently just the figc4.6 t14 FRMR-fallback ordering fix
+   * (`ax25Spec45FrmrFallbackReestablishesV20`).
+   *
+   * figc4.6's `FRMR received` handler (t14) draws `Establish Data Link`
+   * *before* `set_version_2_0`. The dispatcher's inlined `Establish_Data_Link`
+   * branches on `ctx.isExtended` (mirroring figc4.7's `mod_128` test), so while
+   * the link is still extended the §975 v2.0 fallback re-establishes with a
+   * *SABME* — the opposite of what a FRMR (which only a pre-v2.2 peer sends)
+   * calls for. Forcing version 2.0 (`isExtended = false`) up front — before the
+   * actions — makes `Establish_Data_Link` emit a *SABM*; the figure's own later
+   * `set_version_2_0` action then re-applies it as a no-op. Mirrors direwolf's
+   * FRMR handler, which calls `set_version_2_0` before `establish_data_link`
+   * ("Erratum: Need to force v2.0. This is not in flow chart."). Scoped to the
+   * `AwaitingV22Connection` `FRMR_received` transition; inert otherwise. Mirrors
+   * the C# `Ax25Session.ApplyPreExecutionQuirks` (m0lte/packet.net #269).
+   */
+  private applyPreExecutionQuirks(match: TransitionSpec): void {
+    if (
+      this.context.quirks.ax25Spec45FrmrFallbackReestablishesV20 &&
+      this.context.isExtended &&
+      match.from === "AwaitingV22Connection" &&
+      match.on === "FRMR_received"
+    ) {
+      this.context.isExtended = false;
+    }
+  }
+
+  /**
+   * Compute the state a just-committed transition advances to — normally
+   * `match.next`, but with the figc4.1/figc4.2 connect-routing defect corrected
+   * when `ax25Spec44Mod128ConnectRoutesToV22` is on.
+   *
+   * figc4.2 routes the `Disconnected` `DL_CONNECT_request`
+   * (`t03_dl_connect_request`) *unconditionally* to `AwaitingConnection`, with
+   * no version branch — so a v2.2-preferred connect (which the inlined
+   * `Establish_Data_Link` correctly sends as a *SABME*, branching on
+   * `ctx.isExtended`) ends up parked in the mod-8 establishment state. That
+   * state's T1 retry resends a hardcoded SABM (downgrading the link) and it has
+   * no FRMR handler (so the §975 v2.0 fallback can't fire). When the quirk is on
+   * (default) and the link is extended at dispatch time, the target is rewritten
+   * to `AwaitingV22Connection` (figc4.6), which resends SABME on retry and
+   * handles the FRMR/DM fallbacks. See {@link Ax25SessionQuirks} for the full
+   * rationale, the graphml citation, and the direwolf cross-reference.
+   *
+   * Scope is deliberately tight: only the exact `Disconnected` DL-CONNECT
+   * transition (matched on `from` + `on` + `next`, so it survives a transition-id
+   * renumber), only when `ctx.isExtended`. Every other transition is returned
+   * unchanged — a mod-8 connect keeps figc4.2's `AwaitingConnection` target, and
+   * the figc4.6 FRMR fallback (t14) — which forces version 2.0, clearing
+   * `isExtended` — routes to `AwaitingConnection` untouched, so the redirect is
+   * self-consistent with the fallback (a later connect from that mod-8 state
+   * stays mod-8). Unlike the guard-rewriting quirks (ax25Spec40/42/43) this
+   * rewrites a transition's *target state*. Mirrors the C#
+   * `Ax25Session.ResolveNextState` (m0lte/packet.net #268).
+   */
+  private resolveNextState(match: TransitionSpec): string {
+    if (
+      this.context.quirks.ax25Spec44Mod128ConnectRoutesToV22 &&
+      this.context.isExtended &&
+      match.from === "Disconnected" &&
+      match.on === "DL_CONNECT_request" &&
+      match.next === "AwaitingConnection"
+    ) {
+      return "AwaitingV22Connection";
+    }
+    return match.next;
   }
 
   private findMatchingTransition(

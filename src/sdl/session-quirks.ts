@@ -145,6 +145,80 @@ export interface Ax25SessionQuirks {
    * packethacking/ax25spec#43.
    */
   ax25Spec43DlFlowOffEntersBusy: boolean;
+
+  /**
+   * Work around `packethacking/ax25spec#44`: figc4.1/figc4.2 route the
+   * `Disconnected` `DL-CONNECT request` path *unconditionally* to
+   * `AwaitingConnection` — `Establish Data Link` → `Set Layer 3 Initiated` →
+   * Awaiting Connection — with **no version branch**, regardless of modulo.
+   * (Verified against the authoritative graphml `DataLink_Disconnected.graphml`
+   * in `m0lte/ax25sdl`: the initiator's DL-CONNECT edge has no modulo test;
+   * version routing exists only on the *responder* SABM/SABME-received side.)
+   * That is a faithful transcription of a defective figure: a v2.2-preferred
+   * connect sends a SABME (the figc4.7 `Establish_Data_Link` subroutine — inlined
+   * in the TS dispatcher — *does* branch on `mod_128`/`isExtended` and emits
+   * SABME), but then parks in `AwaitingConnection` (figc4.2) instead of
+   * `AwaitingV22Connection` (figc4.6).
+   *
+   * Two real bugs follow from the mis-routing — both fixed by this redirect:
+   * (1) `AwaitingConnection`'s T1-expiry retry sends a hardcoded `SABM (P==1)`
+   * (figc4.2 `t05_t1_expiry_no` → `SABMPEqEq1`), so a lost initial SABME
+   * *downgrades the link to mod-8* on the first retry; and (2)
+   * `AwaitingConnection` has *no `FRMR_received` handler at all*, so the §975
+   * fallback (a pre-v2.2 peer FRMRs our SABME → drop to v2.0/SABM) cannot fire.
+   * `AwaitingV22Connection` (figc4.6) handles both correctly: `t13_t1_expiry_no`
+   * resends `SABME (P=1)`; `t14_frmr_received` sets version 2.0, re-establishes,
+   * and moves to `AwaitingConnection`; `t11_dm_received_yes` tears down (§975 DM
+   * case); `t12_ua_received_*` completes the mod-128 connection.
+   *
+   * When `true` (default), a `DL_CONNECT_request` firing in `Disconnected` while
+   * the link is extended (`ctx.isExtended`) has its transition target rewritten
+   * from `AwaitingConnection` to `AwaitingV22Connection`; a mod-8 connect
+   * (`isExtended === false`) is unchanged. Keying on `isExtended` at dispatch
+   * time is self-consistent with the FRMR fallback: figc4.6 `t14` sets version
+   * 2.0 (`isExtended = false`) before re-establishing, so the subsequent SABM
+   * connect naturally stays mod-8. When `false`, the figure runs as drawn (a
+   * mod-128 connect parks in `AwaitingConnection` and downgrades on retry — for
+   * strict conformance study). Unlike the guard-rewriting quirks this rewrites a
+   * transition's *target state* (in {@link SdlSessionDriver}'s dispatch path,
+   * `resolveNextState`), scoped to the single `Disconnected` DL-CONNECT
+   * transition under `isExtended`. De-facto corroboration: direwolf's author hit
+   * the identical defect — `ax25_link.c` ~L1060 `enter_new_state(S, S->modulo ==
+   * 128 ? state_5_awaiting_v22_connection : state_1_awaiting_connection)` with
+   * the comment "Original always sent SABM and went to state 1 … my
+   * enhancement". Delete once `ax25sdl` ships a figc4.1/figc4.2 carrying the
+   * version branch. Mirrors `Ax25SessionQuirks.Ax25Spec44Mod128ConnectRoutesToV22`
+   * in m0lte/packet.net (PR #268).
+   */
+  ax25Spec44Mod128ConnectRoutesToV22: boolean;
+
+  /**
+   * Work around `packethacking/ax25spec#45`: figc4.6's `FRMR received` handler
+   * (t14) draws `Establish Data Link` *before* `set_version_2_0`. The inlined
+   * `Establish_Data_Link` branches on `ctx.isExtended` (mirroring figc4.7's
+   * `mod_128` test), so while the link is still extended the §975 v2.0 fallback
+   * re-establishes with a **SABME** — but a FRMR (which only a pre-v2.2 peer
+   * sends) is precisely the signal to drop to v2.0/SABM. So the fallback as drawn
+   * fails against a real v2.0 peer (it re-sends SABME → another FRMR/DM) and
+   * produces a modulo split against a v2.2 peer (re-establish SABME, but the
+   * initiator proceeds mod-8 via the later `set_version_2_0`).
+   *
+   * When `true` (default), the `AwaitingV22Connection` `FRMR_received` transition
+   * forces version 2.0 (`isExtended = false`) *before* its actions run (in
+   * {@link SdlSessionDriver}'s dispatch path, `applyPreExecutionQuirks`), so
+   * `Establish_Data_Link` emits a **SABM** and the fallback genuinely
+   * re-establishes as v2.0; the figure's own later `set_version_2_0` is then a
+   * no-op. When `false`, the figure runs as drawn (re-establish SABME). De-facto
+   * corroboration: direwolf's FRMR handler calls `set_version_2_0` before
+   * `establish_data_link` ("Erratum: Need to force v2.0. This is not in flow
+   * chart." — `ax25_link.c`, state_5). Only meaningful once
+   * {@link Ax25SessionQuirks.ax25Spec44Mod128ConnectRoutesToV22} makes figc4.6
+   * reachable by an initiator. Delete once `ax25sdl` ships a figc4.6 t14 with the
+   * actions reordered. Mirrors
+   * `Ax25SessionQuirks.Ax25Spec45FrmrFallbackReestablishesV20` in
+   * m0lte/packet.net (PR #269).
+   */
+  ax25Spec45FrmrFallbackReestablishesV20: boolean;
 }
 
 /**
@@ -158,6 +232,8 @@ export const defaultSessionQuirks: Ax25SessionQuirks = {
   ax25Spec41KarnSrtSampling: true,
   ax25Spec42SrejTargetsGap: true,
   ax25Spec43DlFlowOffEntersBusy: true,
+  ax25Spec44Mod128ConnectRoutesToV22: true,
+  ax25Spec45FrmrFallbackReestablishesV20: true,
 };
 
 /**
@@ -172,4 +248,6 @@ export const strictlyFaithfulSessionQuirks: Ax25SessionQuirks = {
   ax25Spec41KarnSrtSampling: false,
   ax25Spec42SrejTargetsGap: false,
   ax25Spec43DlFlowOffEntersBusy: false,
+  ax25Spec44Mod128ConnectRoutesToV22: false,
+  ax25Spec45FrmrFallbackReestablishesV20: false,
 };
