@@ -193,6 +193,24 @@ export class ActionDispatcher {
       }
     }
 
+    // Quirk ax25Spec42SrejTargetsGap (default on): figc4.4's out-of-sequence
+    // I_received SREJ path (with a selective-reject exception already
+    // outstanding) does `N(r) := N(s)` before SREJ — requesting the frame
+    // that just arrived rather than the missing gap, so multi-frame SREJ
+    // recovery livelocks (packethacking/ax25spec#42; direwolf flags the same
+    // erratum and requests the gap). Retarget the SREJ to V(R), the next
+    // still-missing frame. `N(r) := N(s)` appears only in this one I_received
+    // figure path, so gating on the I_received trigger scopes the rewrite
+    // precisely. Remove once ax25sdl ships a corrected figc4.4. Mirrors the
+    // C# ActionDispatcher.Execute interception (m0lte/packet.net#246).
+    if (
+      ctx.quirks.ax25Spec42SrejTargetsGap &&
+      tx.event.name === "I_received" &&
+      verb === "N(r) := N(s)"
+    ) {
+      verb = "N(r) := V(r)";
+    }
+
     switch (verb) {
       // ─── Flag mutations ────────────────────────────────────────────
       case "set_own_receiver_busy":
@@ -285,7 +303,14 @@ export class ActionDispatcher {
       case "set_version_2_0":           ctx.isExtended = false; return;
       case "set_version_2_2":
       case "Set Version 2.2":           ctx.isExtended = true;  return;
+      // The figc4.7 Set_Version_2_0 / Set_Version_2_2 subroutine bodies spell
+      // these as `:=`; the dispatcher historically carried only the `<-`
+      // forms (used by the state-page transitions). Same operation — list
+      // both spellings since ax25-ts has no ActionVerbAliases layer. Mirrors
+      // the C# alias map's `Modulo := 8 → Modulo <- 8` (etc.) entries.
+      case "Modulo := 8":
       case "Modulo <- 8":               ctx.isExtended = false; return;
+      case "Modulo := 128":
       case "Modulo <- 128":             ctx.isExtended = true;  return;
       case "Set Half Duplex":           ctx.halfDuplex = true; return;
       case "Set Implicit Reject":
@@ -296,10 +321,15 @@ export class ActionDispatcher {
         ctx.implicitReject = false;
         ctx.srejEnabled = true;
         return;
+      case "N1 := 2048":
       case "N1 <- 2048":                ctx.n1 = 2048; return;
+      case "k := 8":
       case "k <- 8":                    ctx.k = 8; return;
+      case "k := 32":
       case "k <- 32":                   ctx.k = 32; return;
+      case "T2 := 3000":
       case "T2 <- 3000":                ctx.t2Ms = 3000; return;
+      case "N2 := 10":
       case "N2 <- 10":                  ctx.n2 = 10; return;
 
       // ─── Link-parameter assignments ───────────────────────────────
@@ -311,17 +341,40 @@ export class ActionDispatcher {
       case "T1V := 2 * SRT":
         if (!this.freezeT1V) ctx.t1vMs = ctx.srtMs * 2;
         return;
+      // figc4.7 Select_T1 spells these `:=`; the dispatcher historically had
+      // the `<-` forms. Both listed (no alias layer in ax25-ts). Mirrors the
+      // C# alias map's `Next T1 := … → Next T1 <- …` / `SRT := … → SRT <- …`.
+      case "Next T1 := 2 * SRT":
       case "Next T1 <- 2 * SRT":
         if (!this.freezeT1V) ctx.t1vMs = ctx.srtMs * 2;
         return;
+      case "Next T1 := (RC*0.25)+SRT*2":
       case "Next T1 <- (RC*0.25)+SRT*2":
         if (!this.freezeT1V) ctx.t1vMs = ctx.rc * 250 + ctx.srtMs * 2;
         ctx.t1HadExpired = false;
         return;
+      case "SRT := 7(SRT)/8 + (T1)/8 - (Remaining Time on T1 When Last Stopped)/8":
       case "SRT <- 7(SRT)/8 + (T1)/8 - (Remaining Time on T1 When Last Stopped)/8": {
-        if (!this.freezeT1V) {
-          let sample = ctx.t1vMs - ctx.t1RemainingWhenLastStoppedMs;
-          if (sample < 0) sample = 0;
+        // The new-sample term is (T1V − remaining_when_stopped): the elapsed
+        // portion of T1 from arm to stop. It is a valid round-trip ONLY when
+        // T1 was stopped by an acknowledgement of the frame that armed it —
+        // i.e. it was running, so remaining > 0. On a timeout/retransmit (or
+        // any reach without a fresh ack-driven stop) remaining is 0, the
+        // sample degenerates to the full T1V (= 2·SRT), and since T1V derives
+        // from SRT the IIR self-amplifies (SRT' = 1.125·SRT) → unbounded
+        // growth → overflow. Karn's algorithm: skip the update when there is
+        // no clean measurement. figc4.7 omits the guard (packethacking/
+        // ax25spec#41); gated behind ax25Spec41KarnSrtSampling (default on),
+        // mirroring ActionDispatcher.cs (m0lte/packet.net#241). T1V still
+        // backs off via the RC term on the timeout path. `freezeT1V` (a
+        // TS-runtime convenience) suppresses the whole mutation independently.
+        let sample = ctx.t1vMs - ctx.t1RemainingWhenLastStoppedMs;
+        if (sample < 0) sample = 0;
+        const cleanMeasurement = ctx.t1RemainingWhenLastStoppedMs > 0;
+        if (
+          !this.freezeT1V &&
+          (!ctx.quirks.ax25Spec41KarnSrtSampling || cleanMeasurement)
+        ) {
           ctx.srtMs = 0.875 * ctx.srtMs + 0.125 * sample;
         }
         ctx.t1HadExpired = false;
@@ -346,7 +399,16 @@ export class ActionDispatcher {
       case "RC := RC + 1":              ctx.rc++; return;
       case "V(a) := N(r)":
       case "V(a) <- N(r)":              ctx.va = extractNr(tx); return;
+      // figc4.7 Invoke_Retransmission body. The walker emits the figure-
+      // verbatim `:=` spellings; ax25-ts has no alias-map layer (unlike
+      // packet.net's ActionVerbAliases), so the `:=` and `<-` forms are both
+      // listed here. `X := V(s)` snapshots the send variable so the do-while
+      // loop knows where to stop; `V(s) := N(r)` rewinds the send variable to
+      // the peer's N(r) so the loop re-emits from the first unacked frame.
+      // Mirrors ActionDispatcher.cs (`X <- V(s)` / `V(s) <- N(r)`).
+      case "V(s) := N(r)":
       case "V(s) <- N(r)":              ctx.vs = extractNr(tx); return;
+      case "X := V(s)":
       case "X <- V(s)":                 ctx.x = ctx.vs; return;
       case "Backtrack":                 return; // informational marker
 
@@ -361,6 +423,11 @@ export class ActionDispatcher {
       case "F := P":                   tx.pending.pfBit = extractPollFinal(tx); return;
       case "p := 0":
       case "P := 0":                   tx.pending.pfBit = false; return;
+      // figc4.5/figc4.7 spell the outbound poll-bit set as both `P := 1`
+      // (Transmit_Enquiry, Enquiry paths) and `P <- 1`. Same operation —
+      // the runtime stores the bit in PendingFrame.pfBit either way.
+      // Mirrors ActionDispatcher.cs (which has both `P := 1` and `P <- 1`).
+      case "P := 1":
       case "P <- 1":                   tx.pending.pfBit = true; return;
 
       // ─── Supervisory-frame transmissions ──────────────────────────
@@ -617,14 +684,51 @@ export class ActionDispatcher {
       case "Enquiry_Response_F_1":
       case "Set_Version_2_0":
       case "Set_Version_2_2":
-        // Route through the registry; default impl logs unknown and
-        // continues. Production users can register handlers per-name.
-        tx.subroutines.invoke(verb, tx);
+        // Route through the registry. The figc4.x state pages spell these
+        // subroutine calls in figure-verbatim form (e.g. "Invoke
+        // Retransmission" with a space), but the figc4.7 SubroutineSpec
+        // entries — and the registry's alias tables — key off the
+        // underscore-normalised name ("Invoke_Retransmission"). ax25-ts has
+        // no ActionVerbAliases layer (unlike packet.net), so normalise the
+        // spaced spelling to the canonical spec name here before invoking,
+        // else the registry lookup misses and the subroutine silently
+        // no-ops. Mirrors ActionDispatcher.cs, which passes the canonical
+        // underscore literal to subroutines.Invoke after its alias map has
+        // normalised `action`. The registry's own onUnknown handles any
+        // genuinely unregistered name.
+        tx.subroutines.invoke(normaliseSubroutineName(verb), tx);
         return;
 
       default:
         throw new UnknownActionError(verb, currentState);
     }
+  }
+}
+
+/**
+ * Normalise a figure-verbatim subroutine-call verb (as the figc4.x state
+ * pages spell it) to the underscore name the figc4.7 {@link SubroutineSpec}
+ * entries — and the {@link DefaultSubroutineRegistry} alias tables — key off.
+ * The registry resolves its own LEGACY/CONTEXT-binding aliases from there
+ * (e.g. `Select_T1_Value` → `Select_T1`, `Enquiry_Response_F_1` →
+ * `Enquiry_Response`), so this only needs to fold the spaced spellings the
+ * dispatcher's routing case-arm accepts into their canonical form.
+ *
+ * Mirrors the relevant subroutine entries of the C#
+ * `ActionDispatcher.ActionVerbAliases` map (packet.net normalises every
+ * action up-front; ax25-ts has no such layer, so we fold at the call site).
+ * Names that are already canonical pass through unchanged.
+ */
+function normaliseSubroutineName(verb: string): string {
+  switch (verb) {
+    case "Invoke Retransmission":   return "Invoke_Retransmission";
+    case "Transmit Enquiry":
+    case "Transmit Enquery":        return "Transmit_Enquiry";
+    case "Check Need For Response": return "Check_Need_For_Response";
+    case "N(r) Error Recovery":
+    case "N(r) Recovery":           return "N_r_Error_Recovery";
+    case "Enquiry Response (F = 0)": return "Enquiry_Response_F_0";
+    default:                        return verb;
   }
 }
 

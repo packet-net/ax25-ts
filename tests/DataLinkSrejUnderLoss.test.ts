@@ -168,7 +168,7 @@ describe("connected-mode retransmit preserves N(s) (packet.net#231 / #8)", () =>
     expect(ctx.vs).toBe(3); // window unchanged
   });
 
-  it("two real sessions recover a dropped frame selectively (end-to-end)", () => {
+  it("two real sessions recover a dropped frame (end-to-end, go-back-N)", () => {
     const rig = buildPair();
     connect(rig);
     rig.a.ctx.srejEnabled = true;
@@ -187,26 +187,29 @@ describe("connected-mode retransmit preserves N(s) (packet.net#231 / #8)", () =>
     };
 
     // A sends two payloads (k=4 window). Frame 0 is dropped; frame 1 arrives
-    // out of sequence at B, which SREJs N(r)=0. A retransmits frame 0 with its
-    // ORIGINAL N(s)=0; B fills the gap and delivers both payloads in order.
+    // out of sequence at B, which rejects asking to go back to N(r)=0 (the
+    // SREJ on the wire falls back to a REJ frame — there's no SREJ factory
+    // yet — so it lands on A as REJ_received). A's figc4.7 Invoke_Retransmission
+    // now runs the go-back-N loop for real (the subroutine used to no-op
+    // because the dispatcher passed the spaced verb the registry couldn't
+    // resolve): it resends frames 0 and 1, each with its ORIGINAL N(s), B fills
+    // the gap and delivers both payloads in order. This is the timeout-free
+    // analogue of the directed go-back-N test in RecoveryRuntimeQuirks; the
+    // crux of packet.net#231 is that the resends carry their original N(s).
     rig.a.driver.postEvent({ name: "DL_DATA_request", data: new Uint8Array([0xa0]), pid: PID });
     rig.a.driver.postEvent({ name: "DL_DATA_request", data: new Uint8Array([0xa1]), pid: PID });
     settle(rig);
 
-    // The SREJ falls back to a REJ frame on the wire (no SREJ factory yet), so
-    // B's selective-reject request lands on A as REJ_received → the go-back-N
-    // Invoke_Retransmission stub. To exercise the *live* selective-retransmit
-    // verb deterministically we hand A the SREJ trigger directly (what B's
-    // intent is), mirroring the directed tests above. This proves the resend
-    // carries N(s)=0 end-to-end and B delivers both payloads in order.
-    rig.a.driver.postEvent(srejEvent(rig.a.ctx.local, rig.a.ctx.remote, 0));
-    settle(rig);
-
-    // B must have delivered both payloads, in order, exactly once.
+    // B must have delivered both payloads, in order, exactly once — recovery
+    // completes through the natural REJ → Invoke_Retransmission path, no
+    // manual nudge needed.
     expect(rig.b.delivered.map((d) => d[0])).toEqual([0xa0, 0xa1]);
     // A's V(s) reflects exactly the two distinct frames it sent — a retransmit
-    // must not have minted a third sequence number.
+    // must not mint a fresh sequence number — and V(s) is restored to X after
+    // the go-back-N loop, with V(a) caught up to it (the link is fully acked).
     expect(rig.a.ctx.vs).toBe(2);
+    expect(rig.a.ctx.va).toBe(2);
+    expect(rig.b.ctx.vr).toBe(2);
   });
 });
 

@@ -110,10 +110,17 @@ export function createSessionBindings(
     "out_of_sequence_frames_in_receive_buffer",
     () => context.storedReceivedIFrames.size > 0,
   );
-  bindings.set(
-    "v_s_eq_x",
-    () => context.x !== null && context.vs === context.x,
-  );
+  // Invoke_Retransmission loop terminator: V(s) caught up to its
+  // saved-on-entry value X. Returns false if X hasn't been set (i.e. we're not
+  // inside an Invoke_Retransmission call). The figc4.7 subroutine's do-while
+  // loop predicate is emitted verbatim as `vs_eq_X` (the codegen does not
+  // normalise it to the `v_s_eq_x` spelling the historic bindings use), and
+  // ax25-ts's GuardEvaluator has no alias layer — so bind both spellings to
+  // the same closure, else the loop predicate is unbound and the subroutine
+  // walker throws mid-transition. Mirrors Ax25SessionBindings.cs (`v_s_eq_x`).
+  const vsEqX = (): boolean => context.x !== null && context.vs === context.x;
+  bindings.set("v_s_eq_x", vsEqX);
+  bindings.set("vs_eq_X", vsEqX);
 
   // ─── Frame-aware predicates ─────────────────────────────────────────
   // These all read off the current trigger's attached frame. When the
@@ -260,6 +267,36 @@ export function createSessionBindings(
     "F_eq_1_and_frame_eq_RR_or_frame_eq_RNR_or_frame_eq_I",
     fEq1AndSupervisoryOrI,
   );
+
+  // ─── ax25spec#40 receive-window discard guard ──────────────────────
+  // figc4.4's out-of-sequence I_received path has no window guard: any
+  // N(S) ≠ V(R) is SREJ'd/REJ'd, including a duplicate behind V(R) — which
+  // provokes a re-send that's again out-of-window, ad infinitum (the SREJ
+  // livelock). X.25 §2.4.6.4 discards any frame whose N(S) is outside the
+  // receive window [V(r), V(r)+k). The figure's `reject_exception` decision
+  // IS its discard-vs-reject switch in that region, so we OR the
+  // out-of-window condition into it (when ax25Spec40DiscardOutOfWindowIFrames
+  // is on): such a frame takes the figure's own discard path (process ack,
+  // discard data, RR(V(r)) only if P=1) ahead of the srej_enabled split,
+  // covering both REJ and SREJ modes. Scoped to the I_received trigger via the
+  // helper, so it's inert on every other trigger. See Ax25SessionQuirks.
+  // Mirrors the ax25spec#40 block in Ax25SessionBindings.cs (PR #242).
+  if (context.quirks.ax25Spec40DiscardOutOfWindowIFrames) {
+    const iFrameOutOfWindow = (): boolean => {
+      const trigger = currentTrigger();
+      if (trigger === null || trigger.name !== "I_received") return false;
+      const f = trigger.frame;
+      if (f == null) return false;
+      const m = ctxModulus(context);
+      const offset = (getNs(f) - context.vr + m) % m;
+      return offset >= context.k; // N(S) outside [V(r), V(r)+k)
+    };
+    const baseRejectException = bindings.get("reject_exception")!;
+    bindings.set(
+      "reject_exception",
+      () => baseRejectException() || iFrameOutOfWindow(),
+    );
+  }
 
   return bindings;
 }
