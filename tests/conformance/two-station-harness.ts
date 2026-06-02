@@ -41,6 +41,7 @@ import {
   classify,
   decodeFrame,
   encodeFrame,
+  getNs,
 } from "../../src/frame.js";
 import type { DataLinkSignal } from "../../src/sdl/action-dispatcher.js";
 import type { Ax25Event } from "../../src/sdl/events.js";
@@ -106,15 +107,18 @@ export class ManualScheduler implements TimerScheduler {
   }
 }
 
-/** The in-process medium. Phase H uses deliver-only; later (adversarial) phases
- * will set {@link drop} (and, eventually, delay / reorder / duplicate / corrupt
- * policies). */
+/** The in-process medium. Phase H used it deliver-only; the loss-recovery
+ * phase sets {@link drop} (and, eventually, delay / reorder / duplicate /
+ * corrupt policies). The TS analogue of packet.net's `TwoStationHarness.Channel`
+ * (its `Drop` predicate). */
 export interface Link {
   /** Return true to drop the frame at the link layer (it never reaches the
-   * peer). Undefined = clean channel. */
+   * peer — it is still recorded in {@link log}). Undefined = clean channel.
+   * Set it directly, or via {@link TwoStationHarness.dropWhen}. Mirrors
+   * `Channel.Drop` in packet.net. */
   drop?: (f: Ax25Frame) => boolean;
-  /** Every frame put on the wire (post round-trip through the codec), for
-   * assertions / debugging. */
+  /** Every frame put on the wire (post round-trip through the codec), whether
+   * or not it was dropped, for assertions / debugging. */
   readonly log: Ax25Frame[];
 }
 
@@ -286,8 +290,15 @@ export class TwoStationHarness {
     if (this.checkAfterEachStep) this.checkInvariants();
   }
 
-  /** Advance the clock past one T1 interval and pump to quiescence — fires any
-   * due timers and lets the resulting cascade settle. */
+  /**
+   * Advance the clock past one T1 interval and pump to quiescence — fires any
+   * due T1 timeout and lets the resulting recovery cascade settle. The TS
+   * analogue of packet.net's `TwoStationHarness.AdvanceT1`: this is how a
+   * loss-recovery scenario drives the timeout-driven recovery machinery
+   * (figc4.5 / figc4.7 `Transmit_Enquiry` → `Invoke_Retransmission`) after the
+   * channel has swallowed a frame. A loss test calls it repeatedly (see
+   * {@link recoverUntilConverged}) until the link reconverges.
+   */
   advanceT1(extraMs = 20): void {
     // Advance past whichever endpoint's live T1V is largest — T1V can grow
     // (figc4.7 SRT backoff), so a fixed advance could stop firing an armed T1
@@ -296,6 +307,53 @@ export class TwoStationHarness {
     this.scheduler.advance(t1 + extraMs);
     this.pumpToQuiescence();
     if (this.checkAfterEachStep) this.checkInvariants();
+  }
+
+  // ─── Loss-recovery driving (the adversarial-channel surface) ─────────
+
+  /**
+   * Install a link-layer drop filter — the frame-targeted analogue of setting
+   * {@link Link.drop} directly, kept symmetric with packet.net's `Link.Drop`.
+   * The predicate is evaluated for every frame put on the wire (post-codec, so
+   * it sees the real control byte); returning `true` drops that frame. The
+   * dropped frame is still recorded in {@link Link.log}, so a test can assert a
+   * targeted frame was actually dropped. Replaces any prior filter; pass
+   * `undefined` to restore a clean channel. See {@link iFrameFrom} for building
+   * a "drop the I-frame with N(s)=x from station Y" predicate.
+   */
+  dropWhen(predicate: ((f: Ax25Frame) => boolean) | undefined): void {
+    this.link.drop = predicate;
+  }
+
+  /**
+   * The convergence predicate — the TS analogue of packet.net
+   * `LossRecoveryProperties.Converged`: both windows empty (V(s)==V(a) on each
+   * side) and every submitted payload delivered in both directions. A
+   * loss-recovery run is "done" when this holds; {@link assertConverged} turns
+   * the same condition into a throwing assertion (with a precise message and the
+   * full safety re-check).
+   */
+  converged(): boolean {
+    return (
+      this.a.context.vs === this.a.context.va &&
+      this.b.context.vs === this.b.context.va &&
+      this.b.delivered.length === this.a.submitted.length &&
+      this.a.delivered.length === this.b.submitted.length
+    );
+  }
+
+  /**
+   * Drive timeout recovery to a fixed point: call {@link advanceT1} until the
+   * link {@link converged | converges} or `maxRounds` is exhausted. Mirrors the
+   * `for (r = 0; r < N && !Converged(h); r++) h.AdvanceT1();` loop the
+   * packet.net `LossRecoveryProperties` use after a finite loss prefix. The
+   * bound is the liveness watchdog — a run that does not converge within it is
+   * the non-recovery bug a loss property hunts (the caller then asserts via
+   * {@link assertConverged}). Returns whether it converged.
+   */
+  recoverUntilConverged(maxRounds: number): boolean {
+    for (let r = 0; r < maxRounds && !this.converged(); r++) this.advanceT1();
+    return this.converged();
   }
 
   /** Pump both inbound queues to quiescence (a logical "settle"), then run the
@@ -411,4 +469,20 @@ function buildEndpoint(
 export function outstanding(e: Endpoint): number {
   const m = modulus(e.context);
   return ((e.context.vs - e.context.va) % m + m) % m;
+}
+
+/**
+ * Predicate matching the I-frame with the given mod-8 `ns` sourced from
+ * `from` — the building block for a single-frame drop filter. Mirrors the
+ * inline `f.Source.Callsign.Equals(...) && Classify(f) is IFrameReceived &&
+ * f.GetIFrameNs(8) == dropPos` test in packet.net's
+ * `LossRecoveryProperties.A_single_dropped_iframe_always_recovers`. Stateless;
+ * compose with a `let dropped = false` latch in the caller to drop it once.
+ */
+export function iFrameFrom(from: Endpoint, ns: number): (f: Ax25Frame) => boolean {
+  const fromCall = from.context.local.toString();
+  return (f) =>
+    f.source.callsign.toString() === fromCall &&
+    classify(f) === "I" &&
+    getNs(f) === ns;
 }
