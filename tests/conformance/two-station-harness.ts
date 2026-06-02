@@ -22,20 +22,17 @@
  * (the #8 / packet.net#231 repro), which first established the
  * `ManualScheduler` + `buildPair` + drop-filter + `settle` shape.
  *
- * ## Contention-free medium (the delayed-ack gotcha)
+ * ## Contention-free medium (the delayed-ack flush)
  *
  * figc4.4's in-sequence receive does `Set Ack Pending` + `LM-SEIZE Request`
- * and flushes the pending RR on `LM_SEIZE_confirm`. packet.net's harness models
- * a contention-free medium by granting LM-SEIZE immediately (posting the
- * confirm back). We do the same here: {@link settle} injects an
- * `LM_SEIZE_confirm` into either station once its `acknowledge_pending` flag is
- * set and the link is otherwise quiescent. NB: in ax25-ts this still does not
- * flush the RR, because `Enquiry Response (F = 0)` is an unimplemented no-op
- * stub (M0LTE/ax25-ts#12) — so V(a) cannot advance on the happy path and the
- * convergence invariant is unreachable for data transfer. The injection is kept
- * so the harness is correct-by-construction the moment #12 lands; until then,
- * data-transfer tests assert reliable delivery (the safety invariant) rather
- * than convergence. See {@link assertConverged}.
+ * and flushes the pending RR on `LM_SEIZE_confirm`. The library models a
+ * contention-free single-session medium by granting LM-SEIZE immediately (the
+ * dispatcher posts `LM_SEIZE_confirm` straight back) and the figc4.7 subroutine
+ * walker makes `Enquiry Response (F = 0)` emit the acknowledging RR — so V(a)
+ * advances and data transfer converges (M0LTE/ax25-ts#12, fixed). The harness
+ * therefore drives the library's real ack path; data-transfer tests assert full
+ * {@link assertConverged} (windows empty + complete delivery), not just the
+ * reliable-delivery safety invariant.
  */
 import { expect } from "vitest";
 import { Callsign } from "../../src/callsign.js";
@@ -325,12 +322,12 @@ export class TwoStationHarness {
   // ─── Pump ───────────────────────────────────────────────────────────
 
   /**
-   * Drain both inbound queues to quiescence. Between drains, models a
-   * contention-free medium: if a station has `acknowledge_pending` set (it owes
-   * a delayed RR queued behind an `LM-SEIZE Request`), inject `LM_SEIZE_confirm`
-   * so the flush fires — exactly what packet.net's harness does by granting
-   * LM-SEIZE immediately. (See the class doc re #12: this is a no-op flush in
-   * ax25-ts today, but keeps the harness correct-by-construction.)
+   * Drain both inbound queues to quiescence. The library grants LM-SEIZE itself
+   * now (the dispatcher posts `LM_SEIZE_confirm` on an `LM-SEIZE Request` — the
+   * contention-free single-session model, ax25-ts#12), so the figc4.4 delayed-ack
+   * RR flushes during the pump. The harness therefore no longer needs to inject
+   * the confirm; if `acknowledge_pending` were ever left stuck, this loop's
+   * 256-round bound surfaces it rather than papering over it.
    */
   private pumpToQuiescence(): void {
     for (let i = 0; i < 256; i++) {
@@ -342,19 +339,6 @@ export class TwoStationHarness {
       while (this.b.inbound.length > 0) {
         this.b.driver.postEvent(this.b.inbound.shift() as Ax25Event);
         progress = true;
-      }
-      if (!progress) {
-        // Link is quiescent — grant any outstanding LM-SEIZE so delayed acks
-        // can flush. Done one station per outer pass so a flush that produces a
-        // frame is then pumped on the next iteration.
-        if (this.a.context.acknowledgePending) {
-          this.a.driver.postEvent({ name: "LM_SEIZE_confirm" });
-          progress = true;
-        }
-        if (this.b.context.acknowledgePending) {
-          this.b.driver.postEvent({ name: "LM_SEIZE_confirm" });
-          progress = true;
-        }
       }
       if (!progress) return;
     }

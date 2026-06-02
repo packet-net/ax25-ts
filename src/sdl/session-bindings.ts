@@ -240,7 +240,7 @@ export function createSessionBindings(
 
   // Enquiry_Response's compound: F=1 AND the triggering frame is an
   // RR / RNR / I (a poll-able shape). REJ/SREJ excluded per the figure.
-  bindings.set("f_eq_1_and_supervisory_or_i", () => {
+  const fEq1AndSupervisoryOrI = (): boolean => {
     const f = getFrame();
     if (f === null || !pollFinal(f)) return false;
     const ctrl = f.control;
@@ -249,7 +249,17 @@ export function createSessionBindings(
     const isRR = sBase === 0x01;
     const isRNR = sBase === 0x05;
     return isI || isRR || isRNR;
-  });
+  };
+  bindings.set("f_eq_1_and_supervisory_or_i", fEq1AndSupervisoryOrI);
+  // The figc4.7 Enquiry_Response paths reference this predicate under its
+  // figure-verbatim name. ax25-ts's GuardEvaluator has no alias layer (unlike
+  // packet.net's PredicateAliases), so bind the verbatim spelling directly —
+  // otherwise every Enquiry_Response path is "unbound" and the walker skips
+  // them all, so the delayed-ack RR never flushes (ax25-ts#12).
+  bindings.set(
+    "F_eq_1_and_frame_eq_RR_or_frame_eq_RNR_or_frame_eq_I",
+    fEq1AndSupervisoryOrI,
+  );
 
   return bindings;
 }

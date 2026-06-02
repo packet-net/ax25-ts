@@ -459,12 +459,23 @@ export class ActionDispatcher {
       case "DL-ERROR Indication (U)":   tx.emitUpward({ type: "DL_ERROR_indication", code: "U" }); return;
       case "DL-ERROR Indication (add)": tx.emitUpward({ type: "DL_ERROR_indication", code: "add" }); return;
 
-      // ─── Link-multiplexer signals (no-op in this transport model) ─
+      // ─── Link-multiplexer: seize request ─────────────────────────
+      // figc4.4's in-sequence receive defers the acknowledging RR to
+      // LM_SEIZE_confirm. ax25-ts has no channel-arbitration Link Multiplexer;
+      // for a single contention-free session we grant the seize immediately by
+      // posting LM_SEIZE_confirm straight back, which flushes the pending RR
+      // (the delayed ack) so V(a) advances on the happy path. A real shared-
+      // channel LM would arbitrate and pace this (T2 batching); future work.
+      // (ax25-ts#12)
       case "LM_seize_request":
-      case "LM_release_request":
-      case "LM_data_request":
       case "LM-SEIZE Request":
       case "LM-SIEZE Request":
+        tx.postEvent({ name: "LM_SEIZE_confirm" });
+        return;
+
+      // ─── Link-multiplexer: other signals (no-op in this transport model) ─
+      case "LM_release_request":
+      case "LM_data_request":
       case "LM-RELEASE Request":
       case "LM_RELEASE Request":
       case "LM-DATA Request":           return;

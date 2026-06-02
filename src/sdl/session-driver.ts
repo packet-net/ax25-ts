@@ -5,8 +5,6 @@ import {
   DataLinkConnected,
   DataLinkDisconnected,
   DataLinkTimerRecovery,
-  type ActionStep,
-  type LoopRange,
   type StatePage,
   type TransitionSpec,
 } from "ax25sdl";
@@ -24,6 +22,7 @@ import {
   type Ax25SessionContext,
   modulus as ctxModulus,
 } from "./session-context.js";
+import { executeWithLoops } from "./sdl-loop-executor.js";
 import {
   DefaultSubroutineRegistry,
   type SubroutineRegistry,
@@ -115,6 +114,15 @@ export class SdlSessionDriver {
     );
     if (hooks.freezeT1V) this.dispatcher.freezeT1V = true;
 
+    // Upgrade the default registry's no-op subroutine stubs to figc4.7 table
+    // walkers now that the dispatcher + guards exist. A caller-supplied
+    // registry is left as-is (the caller is responsible for wiring it). This is
+    // what makes Enquiry_Response / Select_T1 / Check_I_Frame_Acknowledged etc.
+    // actually run rather than no-op — ax25-ts#12.
+    if (this.subroutines instanceof DefaultSubroutineRegistry) {
+      this.subroutines.wire(this.dispatcher, this.guards);
+    }
+
     // Apply any caller-supplied T1 override to the context's T1V so
     // `start_T1` arms for the requested duration. The dispatcher reads
     // ctx.t1vMs each time it arms T1 — this gives tests a single knob.
@@ -182,72 +190,17 @@ export class SdlSessionDriver {
         subroutines: this.subroutines,
         postEvent: (evt) => this.pendingEvents.push(evt),
       };
-      this.executeWithLoops(match, tx);
+      executeWithLoops(
+        match.actions,
+        match.loops,
+        this.dispatcher,
+        this.guards,
+        tx,
+        this.state,
+      );
       this.state = match.next;
     } finally {
       this.currentTrigger = null;
-    }
-  }
-
-  /**
-   * Execute a transition's action chain, expanding any SDL loops
-   * (`loop_while`, from ax25sdl 0.7.0+). Each {@link LoopRange} marks a body
-   * slice over the flat `actions` list that re-runs while its continue
-   * predicate holds. Loops are non-overlapping and non-nested. A head-test
-   * (`while`) loop checks the predicate before each iteration (zero-or-more
-   * runs); a tail-test (`do-while`) after (one-or-more). Mirrors the C#
-   * `SdlLoopExecutor`. (Subroutine bodies aren't table-walked in this port,
-   * so only transition loops — the figc4.4/4.5 stored-frame drains — apply.)
-   */
-  private executeWithLoops(match: TransitionSpec, tx: TransitionContext): void {
-    const { actions, loops } = match;
-    if (loops.length === 0) {
-      this.dispatcher.execute(actions, tx, this.state);
-      return;
-    }
-    const ordered = [...loops].sort((a, b) => a.start - b.start);
-    let idx = 0;
-    for (const loop of ordered) {
-      if (idx < loop.start) {
-        this.dispatcher.execute(actions.slice(idx, loop.start), tx, this.state);
-      }
-      this.runLoop(loop, actions, tx);
-      idx = loop.start + loop.length;
-    }
-    if (idx < actions.length) {
-      this.dispatcher.execute(actions.slice(idx), tx, this.state);
-    }
-  }
-
-  private runLoop(
-    loop: LoopRange,
-    actions: readonly ActionStep[],
-    tx: TransitionContext,
-  ): void {
-    const body = actions.slice(loop.start, loop.start + loop.length);
-    // Bound: the legitimate maximum is the send window (k ≤ 128); beyond this
-    // the body isn't advancing the state its predicate reads — fail loudly
-    // rather than spin.
-    const maxIterations = 1024;
-    let iterations = 0;
-    const shouldContinue = (): boolean => this.guards.evaluate(loop.predicate);
-    const runBody = (): void => {
-      this.dispatcher.execute(body, tx, this.state);
-      if (++iterations > maxIterations) {
-        throw new Error(
-          `SDL loop (predicate '${loop.predicate}') exceeded ${maxIterations} ` +
-            `iterations without its continue predicate clearing`,
-        );
-      }
-    };
-    if (loop.testAtEnd) {
-      do {
-        runBody();
-      } while (shouldContinue());
-    } else {
-      while (shouldContinue()) {
-        runBody();
-      }
     }
   }
 

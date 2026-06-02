@@ -4,23 +4,19 @@
  * {@link InvariantChecker} oracle holds after every step. Proves both the stack
  * and the oracle on known-answer scenarios before any adversarial generation
  * (mirrors m0lte/packet.net `docs/conformance-harness-plan.md`, Phase H). The
- * harness runs the safety invariants automatically after each drive call, so
- * these tests assert the end-state delivery (and, where reachable, convergence).
+ * harness runs the safety invariants automatically after each drive call, and
+ * these tests additionally assert full convergence.
  *
- * ## ax25-ts vs packet.net: convergence is unreachable on the happy path
+ * ## Convergence (the delayed-ack flush — M0LTE/ax25-ts#12, fixed)
  *
- * In packet.net the equivalent suite asserts full `AssertConverged()` (V(s) ==
- * V(a) + everything delivered) for every transfer. ax25-ts cannot yet: the
- * figc4.4 delayed-ack flush is unwired end-to-end — `LM-SEIZE Request` is a
- * no-op (never posts `LM_SEIZE_confirm`) and `Enquiry Response (F = 0)` is a
- * no-op subroutine stub, so a receiver delivers the payload but never emits the
- * acknowledging RR, and the sender's V(a) is stuck (M0LTE/ax25-ts#12). The
- * harness still models a contention-free medium (granting LM-SEIZE), so the
- * moment #12 lands these tests upgrade to full convergence by swapping the
- * delivery assertion for {@link TwoStationHarness.assertConverged}. Until then
- * the data-transfer cases assert the safety invariant that *does* hold —
- * reliable, in-order, gap-free, duplicate-free delivery — and a `.skip` test
- * pins the convergence gap to the issue.
+ * These data-transfer cases assert full {@link TwoStationHarness.assertConverged}
+ * (V(s) == V(a) + everything delivered), matching packet.net's equivalent suite.
+ * That became reachable once #12 landed: the figc4.7 subroutine walker makes
+ * `Enquiry Response (F = 0)` emit the acknowledging RR, and the dispatcher grants
+ * LM-SEIZE immediately (posts `LM_SEIZE_confirm`) on the contention-free single-
+ * session model — so the receiver acks, the sender's V(a) advances, and windows
+ * reopen. The one remaining `.skip` is mod-128 connected-mode data (cf.
+ * packet.net#239), unrelated to the ack flush.
  */
 import { describe, expect, it } from "vitest";
 import { TwoStationHarness } from "./two-station-harness.js";
@@ -66,6 +62,7 @@ describe("Phase H — happy-path conformance", () => {
 
     expect(h.b.delivered.map((p) => p[0])).toEqual([0, 1, 2, 3]);
     expect(h.b.state).toBe("Connected");
+    h.assertConverged();
   });
 
   it("bidirectional simultaneous data delivers both ways", () => {
@@ -80,42 +77,37 @@ describe("Phase H — happy-path conformance", () => {
 
     expect(h.b.delivered.map((p) => p[0])).toEqual([0xa0, 0xa1]);
     expect(h.a.delivered.map((p) => p[0])).toEqual([0xb0, 0xb1]);
+    h.assertConverged();
   });
 
-  it("multi-window transfer wraps the modulus (V(s) 7->0)", () => {
+  it("multi-window transfer wraps the modulus (V(s) 7->0) and converges", () => {
     const h = TwoStationHarness.build({ k: 4 });
     h.connect();
 
-    // 12 frames > the mod-8 window. With delayed-ack working V(s) would wrap
-    // 7->0 as windows reopen; today V(a) never advances (#12), so all 12 sit in
-    // the send queue and only the first k=4 reach the wire. We therefore assert
-    // the in-order delivery that *is* observable and that no invariant is
-    // violated en route, rather than the post-wrap V(s).
+    // 12 frames > the mod-8 window: V(s) wraps 7->0 as the delayed-ack flush
+    // (#12) acknowledges each window and reopens it. All 12 are delivered in
+    // order and the link converges.
     for (let i = 0; i < 12; i++) h.submit(h.a, i);
     h.settle();
 
-    // Delivery is a gap-free in-order prefix of what was submitted (the oracle
-    // enforces this after every submit; assert it explicitly here too).
-    const delivered = h.b.delivered.map((p) => p[0]);
-    expect(delivered).toEqual([0, 1, 2, 3].slice(0, delivered.length));
-    expect(delivered.length).toBeGreaterThan(0);
-    expect(h.b.state).toBe("Connected");
+    expect(h.b.delivered.map((p) => p[0])).toEqual([
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+    ]);
+    h.assertConverged();
   });
 
   // ─── Pinned gaps (skipped, with issue refs) ──────────────────────────
 
-  it.skip(
-    "single I-frame A->B converges (V(s)==V(a)) — blocked on delayed-ack flush (M0LTE/ax25-ts#12)",
-    () => {
-      const h = TwoStationHarness.build();
-      h.connect();
-      h.submit(h.a, 0xaa);
-      h.settle();
-      // Unreachable until #12: Enquiry Response (F = 0) is a no-op stub, so B
-      // never sends the RR that would advance A's V(a). Un-skip when #12 lands.
-      h.assertConverged();
-    },
-  );
+  it("single I-frame A->B converges (V(s)==V(a))", () => {
+    const h = TwoStationHarness.build();
+    h.connect();
+    h.submit(h.a, 0xaa);
+    h.settle();
+    // #12 fixed: the figc4.7 subroutine walker makes Enquiry Response (F = 0)
+    // emit the acknowledging RR on LM_SEIZE_confirm, so B acks and A's V(a)
+    // advances. Converges.
+    h.assertConverged();
+  });
 
   it.skip(
     "mod-128 (extended) data transfer — connected-mode data is mod-8-only (README scope; cf. packet.net#239)",

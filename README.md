@@ -109,21 +109,21 @@ To roll your own, implement `Ax25Transport` and pass it to `new Ax25Stack(yourTr
 - Table-driven session machine walking the SDL transitions from [`ax25sdl`](https://www.npmjs.com/package/ax25sdl) — same architecture as the C# reference runtime in [`m0lte/packet.net`'s `Packet.Ax25`](https://github.com/m0lte/packet.net/tree/main/src/Packet.Ax25/Session).
 - SABM → UA → Connected, DISC → UA → Disconnected, I-frame TX/RX with V(s)/V(r)/V(a) bookkeeping, T1 retry capped at N2.
 - **Inbound listener** — `Ax25Listener` accepts inbound SABM, fires `sessionAccepted`, caches per-peer sessions with LRU eviction, mirrors AX.25 §C.2 path reversal on responses.
+- **figc4.7 subroutine walker** — `Enquiry_Response` / `Select_T1` / `Check_I_Frame_Acknowledged` etc. execute their SDL paths through the dispatcher. With LM-SEIZE granted immediately (contention-free single session), the figc4.4 delayed-ack RR flushes, so connected-mode data transfer **converges** (V(s) → V(a), windows reopen).
 
 ### Out (deliberate — planned for later)
 
 | Feature | Today | Tracked for |
 | --- | --- | --- |
 | mod-128 (SABME, extended sequence numbers) | SDL `version_2_2` / `mod_128` predicates return false; mod-128 branches route-around | post-v0.1 |
-| REJ / SREJ recovery loops | Wire frames emit, but `Invoke_Retransmission` / `N_r_Error_Recovery` subroutines are no-op stubs | post-v0.1 |
+| REJ / SREJ loss-recovery convergence | The subroutine walker runs `Invoke_Retransmission` / `Transmit_Enquiry` / `N_r_Error_Recovery`, but full convergence under loss + the SREJ recovery quirks (packet.net #40 / #41 / #42) aren't ported yet | post-v0.1 (ax25-ts#10) |
 | FRMR generation / handling | Inbound FRMR silently dropped | post-v0.1 |
-| figc4.7 subroutine walker | Most verbs route through no-op registry stubs | post-v0.1 |
 | Multi-frame TX window (k>1) | Hard-coded k=1 | post-v0.1 |
 | `via` digipeater paths | `stack.connect({ via: [...] })` throws | post-v0.1 |
 | AGW client / server | Not implemented (the [`Packet.Agw`](https://github.com/m0lte/packet.net/tree/main/src/Packet.Agw) .NET package has the working reference impl) | post-v0.1 |
 | Audio modem transport (browser-side AFSK) | Not implemented | post-v0.1 |
 | XID negotiation | Not implemented — defaults used (mod-8, no SREJ) | post-v0.1 |
-| Dynamic T1 (`Select_T1_Value`) | Stub; caller-supplied `t1Ms` is honoured for the lifetime of the session | post-v0.1 |
+| Dynamic T1 (`Select_T1_Value`) | The walker runs `Select_T1`, but the Karn's-algorithm SRT guard (packet.net#41) isn't ported, so under sustained loss SRT/T1V can grow unbounded — use `freezeT1V` (honours caller-supplied `t1Ms`) until #41 ports | post-v0.1 |
 
 ## Browser compatibility
 
@@ -151,7 +151,8 @@ src/
     ├── guard-evaluator.ts         Parses `"a and not b or c"` guards
     ├── session-bindings.ts        Predicate name → closure
     ├── action-dispatcher.ts       Switch over ~140 SDL action verbs
-    ├── subroutine-registry.ts     figc4.7 subroutine stub registry
+    ├── subroutine-registry.ts     figc4.7 subroutine table walker
+    ├── sdl-loop-executor.ts       shared SDL loop expansion (driver + walker)
     └── session-driver.ts          PostEvent → find transition → execute → advance
 ```
 
