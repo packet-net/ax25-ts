@@ -126,14 +126,12 @@ describe.skipIf(!stackReachable)(
       30_000,
     );
 
-    // TODO(#153): skip pending investigation. Connect_Then_Disconnect (above)
-    // passes against the same docker stack, so the wire-up works, but the
-    // CTEXT banner that this test waits for never arrives on the second L2
-    // session within the same vitest file. Reproduces consistently — not a
-    // budget flake (bumped to 30s and still fails). Suspected state leak,
-    // session-reuse limit, or BPQ-side config quirk. Unskip once root cause
-    // is understood.
-    it.skip(
+    // #153 was #12 misdiagnosed: the CTEXT banner "never arrived" because
+    // ax25-ts couldn't acknowledge the inbound I-frames (the figc4.7 subroutine
+    // walker / delayed-ack flush was unwired), so BPQ's send window stalled
+    // after the first frames. With #12 fixed this round-trips against LinBPQ:
+    // receive the banner, send `P\r`, receive the response. (Closes #153.)
+    it(
       "IFrame_RoundTrip_Against_Linbpq_Node_Prompt",
       async () => {
         await stack!.start();
