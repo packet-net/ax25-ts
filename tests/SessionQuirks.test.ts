@@ -11,7 +11,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { Callsign } from "../src/callsign.js";
-import { type Ax25Frame, rej } from "../src/frame.js";
+import { type Ax25Frame, classify, getNs, rej } from "../src/frame.js";
 import {
   ActionDispatcher,
   type DataLinkSignal,
@@ -36,6 +36,7 @@ const PID = 0xf0;
 function newRig(quirks: Ax25SessionQuirks): {
   dispatcher: ActionDispatcher;
   ctx: Ax25SessionContext;
+  wire: Ax25Frame[];
   makeTx: (event: Ax25Event) => TransitionContext;
 } {
   const local = Callsign.parse("M0LTEA");
@@ -52,6 +53,7 @@ function newRig(quirks: Ax25SessionQuirks): {
 
   const scheduler = new RealTimerScheduler();
   const dispatcher = new ActionDispatcher(6000, 1500, 30000, () => {});
+  const wire: Ax25Frame[] = [];
 
   const makeTx = (event: Ax25Event): TransitionContext => {
     const pending: PendingFrame = { nr: null, ns: null, pfBit: null };
@@ -60,14 +62,14 @@ function newRig(quirks: Ax25SessionQuirks): {
       scheduler,
       event,
       pending,
-      sendFrame: (_f: Ax25Frame) => {},
+      sendFrame: (f: Ax25Frame) => wire.push(f),
       emitUpward: (_s: DataLinkSignal) => {},
       subroutines: new DefaultSubroutineRegistry(),
       postEvent: () => {},
     };
   };
 
-  return { dispatcher, ctx, makeTx };
+  return { dispatcher, ctx, wire, makeTx };
 }
 
 // figc4.5 draws the SREJ trigger as an `SREJ_received` event carrying the
@@ -87,7 +89,7 @@ function srejEvent(local: Callsign, remote: Callsign, nr: number): Ax25Event {
 
 describe("Ax25Spec38 SREJ selective-retransmit quirk", () => {
   it("quirk on does single-frame selective retransmit, not go-back-N", () => {
-    const { dispatcher, ctx, makeTx } = newRig(defaultSessionQuirks); // on (default)
+    const { dispatcher, ctx, wire, makeTx } = newRig(defaultSessionQuirks); // on (default)
     const tx = makeTx(srejEvent(ctx.local, ctx.remote, 1));
 
     // The figc4.5 SREJ-received retransmit verbs as the table draws them.
@@ -101,10 +103,17 @@ describe("Ax25Spec38 SREJ selective-retransmit quirk", () => {
     );
 
     // SREJ must selectively retransmit only the single N(r) frame, not
-    // go-back-N the whole window.
-    expect(ctx.iFrameQueue.length).toBe(1);
-    // The re-queued frame is the requested N(r)=1.
-    expect(Array.from(ctx.iFrameQueue[0]!.data)).toEqual([1]);
+    // go-back-N the whole window. The retransmit emits DIRECTLY on the wire
+    // (not via the fresh-frame queue) carrying its ORIGINAL N(s)=1 — the
+    // packet.net#231 fix; a queued retransmit would be renumbered to V(s)=3.
+    const iframes = wire.filter((f) => classify(f) === "I");
+    expect(iframes.length).toBe(1);
+    expect(getNs(iframes[0]!)).toBe(1);
+    expect(Array.from(iframes[0]!.info)).toEqual([1]);
+    // Nothing parked on the fresh-frame queue; V(s) unchanged (retransmit is
+    // a replay, not a new transmission).
+    expect(ctx.iFrameQueue.length).toBe(0);
+    expect(ctx.vs).toBe(3);
   });
 
   it("quirk off runs the figure as drawn and throws on the payload-less push", () => {

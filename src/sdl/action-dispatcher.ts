@@ -482,15 +482,12 @@ export class ActionDispatcher {
       case "Push Old I Frame N(r) on Queue":
                                         pushOldIFrameNrOnQueue(tx); return;
       case "Push Old I Frame onto Queue":
-        // figc4.7 Invoke_Retransmission body — push the I-frame whose
-        // N(S) == V(s) (Invoke_Retransmission has just backtracked V(s)
-        // to N(r) and is iterating up to the original).
-        {
-          const stash = ctx.sentIFrames.get(ctx.vs);
-          if (stash) {
-            ctx.iFrameQueue.push({ data: stash.data, pid: stash.pid });
-          }
-        }
+        // figc4.7 Invoke_Retransmission body — re-send the I-frame whose
+        // N(S) == V(s) (Invoke_Retransmission has just backtracked V(s) to
+        // N(r) and iterates up to the original). Emit it DIRECTLY with its
+        // original N(s) rather than enqueue — the fresh-frame drain would
+        // renumber it to the post-loop V(s). See emitOldIFrame / #231.
+        emitOldIFrame(tx, ctx.vs);
         return;
 
       // ─── Save / retrieve out-of-sequence I-frames ─────────────────
@@ -740,12 +737,53 @@ function pushOnIFrameQueue(tx: TransitionContext): void {
   });
 }
 
+/**
+ * Implements `Push Old I Frame N(r) on Queue` (figc4.4's selective SREJ/REJ
+ * retransmit): re-send the previously-sent I-frame whose N(S) equals the
+ * incoming frame's N(R). Emits directly via {@link emitOldIFrame} — see the
+ * note there for why a retransmit must NOT be routed through the fresh-frame
+ * queue. Also the figc4.4/figc4.5 SREJ-quirk redirect target.
+ */
 function pushOldIFrameNrOnQueue(tx: TransitionContext): void {
+  emitOldIFrame(tx, extractNr(tx));
+}
+
+/**
+ * Re-transmit a previously-sent I-frame, preserving its ORIGINAL N(s).
+ * Shared by figc4.4's selective SREJ/REJ recovery
+ * (`Push Old I Frame N(r) on Queue`) and figc4.7's go-back-N
+ * `Invoke_Retransmission` loop (`Push Old I Frame onto Queue`).
+ *
+ * Emits directly via `tx.sendFrame` rather than via
+ * {@link Ax25SessionContext.iFrameQueue}: the queue + fresh-frame drain
+ * (figc4.4 t03 "I frame pops off queue") assigns `N(s) := V(s)` and increments
+ * V(s) — correct for a *fresh* frame, but it renumbers a *retransmitted* one to
+ * the current V(s), so the peer never sees the missing sequence number and the
+ * gap never fills (the figure assumes push + transmit interleave; the runtime
+ * decoupled them into push-now / drain-later, losing the N(s) semantics). This
+ * is M0LTE/packet.net#231; the fix mirrors `ActionDispatcher.EmitOldIFrame`
+ * (PR M0LTE/packet.net#232). Retransmits also go out unconditionally — they are
+ * already-counted frames being replayed, not new transmissions subject to the
+ * send window. N(s) is the supplied original sequence; N(r) piggybacks the
+ * current V(r); P=0 (the poll, when needed, is a separate enquiry). Silently
+ * skips if the frame has been evicted from storage — matches linbpq/direwolf.
+ */
+function emitOldIFrame(tx: TransitionContext, ns: number): void {
   const ctx = tx.context;
-  const nr = extractNr(tx);
-  const entry = ctx.sentIFrames.get(nr);
+  const entry = ctx.sentIFrames.get(ns);
   if (!entry) return;
-  ctx.iFrameQueue.push({ data: entry.data, pid: entry.pid });
+  tx.sendFrame(
+    iFrame({
+      destination: ctx.remote,
+      source: ctx.local,
+      digipeaters: reversedTriggerPath(tx),
+      nr: ctx.vr,
+      ns,
+      info: entry.data,
+      pid: entry.pid,
+      pollBit: false,
+    }),
+  );
 }
 
 function saveIncomingIFrame(tx: TransitionContext): void {

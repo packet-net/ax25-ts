@@ -4,6 +4,12 @@ All notable changes to `@packet-net/ax25` will be documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Subject lines stay short by convention; bodies wrap to the GitHub viewer's viewport.
 
+## [Unreleased]
+
+### Fixed
+
+- Connected-mode retransmitted I-frames now keep their **original N(s)** instead of being renumbered with a fresh one. The I-frame transmit queue holds `(data, pid)` with no N(s); the drain that pops it fires `I_frame_pops_off_queue`, which assigns `N(s) := V(s)` + increments V(s) — correct for a *fresh* frame, but it renumbered *retransmitted* frames that the recovery verbs re-queued onto the same queue, so the peer never recognised a resend as the missing frame and no single lost I-frame was recoverable (the link stormed, then disconnected on N2). The retransmit verbs (`Push Old I Frame N(r) on Queue` — figc4.4 selective SREJ/REJ, plus its Ax25Spec38-quirk redirect target — and figc4.7's `Push Old I Frame onto Queue`) now emit directly with their original N(s) (`N(r) := V(r)`, P=0), unconditionally, bypassing the fresh-frame drain. Mirrors the C# fix in `ActionDispatcher.EmitOldIFrame` (M0LTE/packet.net#231 / #232). New `tests/DataLinkSrejUnderLoss.test.ts` reproduces the renumbering and proves selective recovery.
+
 ## [0.4.1] — 2026-05-28
 
 Consumes `ax25sdl` 0.7.1, which fixes the figc4.5 Timer-Recovery recovery-complete guard (ax25sdl#53) — found on-air via packet.net#214. The decision is drawn after `V(a) := N(r)`, so it tests `V(s) = N(r)`; the table had flattened it to a pre-action guard reading the stale `V(a)`, so a poll response that acked everything (`N(r) = V(s)`) mis-routed to retransmission and recovery never completed. The canonical behavioral regression lives in the C# reference runtime (packet.net).
