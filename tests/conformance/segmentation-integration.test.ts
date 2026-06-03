@@ -8,7 +8,8 @@
  * logical submission to one logical delivery.
  */
 import { describe, expect, it } from "vitest";
-import { classify, type Ax25Frame } from "../../src/frame.js";
+import { classify, type Ax25Frame, PID_NET_ROM, PID_NO_LAYER_3 } from "../../src/frame.js";
+import { strictlyFaithfulSessionQuirks } from "../../src/sdl/session-quirks.js";
 import { iFrameFrom, TwoStationHarness } from "./two-station-harness.js";
 
 /** One-shot drop latch (mirrors the C# `dropped` flag). */
@@ -127,5 +128,52 @@ describe("wired segmentation integration (V4b)", () => {
     expect(() => h.submitLarge(h.a, payload)).toThrow(
       /segmenter\/reassembler has not been negotiated/,
     );
+  });
+
+  // Default format (segmentFirstCarriesL3Pid on) — the wired round-trip must
+  // PRESERVE the original L3 PID through the segmented series (Dire Wolf's
+  // first-segment inner-PID format), not flatten it to PID_NO_LAYER_3.
+  it("default wired segmentation preserves the original L3 PID", () => {
+    const h = TwoStationHarness.build({ k: 8, segmenter: true, n1: 64 }); // default quirks
+    h.connect();
+
+    const payload = Uint8Array.from({ length: 300 }, (_, i) => i & 0xff);
+    h.submitLarge(h.a, payload, PID_NET_ROM); // a non-default L3 PID
+    h.flushAcks();
+
+    // The segments reassemble into ONE upper-layer payload …
+    expect(h.b.delivered.length).toBe(1);
+    expect(Array.from(h.b.delivered[0])).toEqual(Array.from(payload));
+    // … and the default inner-PID format carries + recovers the original L3 PID.
+    expect(h.b.deliveredPids.length).toBe(1);
+    expect(h.b.deliveredPids[0]).toBe(PID_NET_ROM);
+    h.assertConverged();
+  });
+
+  // strictlyFaithful (segmentFirstCarriesL3Pid off) — the wired round-trip uses
+  // the figure-literal format: payload still reassembles intact, but the L3 PID
+  // is NOT recovered and the reassembled payload is delivered as PID_NO_LAYER_3.
+  // Pins Figure 6.2 exactly as drawn alongside the default.
+  it("strictlyFaithful wired segmentation is figure-literal and delivers PID_NO_LAYER_3", () => {
+    const h = TwoStationHarness.build({
+      k: 8,
+      segmenter: true,
+      n1: 64,
+      quirks: strictlyFaithfulSessionQuirks,
+    });
+    h.connect();
+
+    const payload = Uint8Array.from({ length: 300 }, (_, i) => (i * 5 + 2) & 0xff);
+    h.submitLarge(h.a, payload, PID_NET_ROM); // send a non-default L3 PID …
+    h.flushAcks();
+
+    // The figure-literal segments still reassemble into ONE payload …
+    expect(h.b.delivered.length).toBe(1);
+    expect(Array.from(h.b.delivered[0])).toEqual(Array.from(payload));
+    // … but the figure-literal format carries no inner PID, so it is lost and
+    // the payload is delivered as PID_NO_LAYER_3.
+    expect(h.b.deliveredPids.length).toBe(1);
+    expect(h.b.deliveredPids[0]).toBe(PID_NO_LAYER_3);
+    h.assertConverged();
   });
 });

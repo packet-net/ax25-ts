@@ -12,15 +12,26 @@ import {
   type DataLinkDataIndication,
   SegmentationLayer,
 } from "../src/sdl/segmentation-layer.js";
+import { SEGMENT_FIRST_BIT } from "../src/sdl/segmenter.js";
 import { createSessionContext } from "../src/sdl/session-context.js";
+import {
+  type Ax25SessionQuirks,
+  defaultSessionQuirks,
+  strictlyFaithfulSessionQuirks,
+} from "../src/sdl/session-quirks.js";
 
-function ctx(n1: number, segmenterEnabled: boolean) {
+function ctx(
+  n1: number,
+  segmenterEnabled: boolean,
+  quirks: Ax25SessionQuirks = defaultSessionQuirks,
+) {
   const c = createSessionContext(
     Callsign.parse("M0LTEA-1"),
     Callsign.parse("M0LTEB-2"),
   );
   c.n1 = n1;
   c.segmenterReassemblerEnabled = segmenterEnabled;
+  c.quirks = { ...quirks };
   return c;
 }
 
@@ -117,16 +128,17 @@ describe("SegmentationLayer — receive", () => {
     );
   });
 
-  it("delivers the reassembled payload with PID_NO_LAYER_3 (inner L3 PID is not carried)", () => {
-    // §6.6 / Figure 6.2: the segment header carries the 0x08 PID + the F/X byte
-    // — no field carries the original L3 PID through a segmented series. So
-    // reassembled data is delivered as PID_NO_LAYER_3. Pin that contract.
+  it("default quirk preserves the original L3 PID through a segmented series", () => {
+    // Default (segmentFirstCarriesL3Pid on): the first segment carries the
+    // original L3 PID after the F/X byte (Dire Wolf's format), so the
+    // reassembler recovers it and delivers the reassembled payload with that
+    // ORIGINAL PID — not PID_NO_LAYER_3. This both interoperates with Dire Wolf
+    // and fixes the figure-literal PID-loss limitation. Pin that contract.
     const n1 = 16;
-    const send = new SegmentationLayer(ctx(n1, true));
+    const send = new SegmentationLayer(ctx(n1, true)); // default quirks
     const recv = new SegmentationLayer(ctx(n1, true));
     const payload = new Uint8Array(40);
 
-    // Send with a non-default L3 PID to show it is NOT recovered on reassembly.
     const segments = send.buildSendRequests(payload, PID_NET_ROM);
     let final: DataLinkDataIndication | null = null;
     for (const s of segments) {
@@ -136,8 +148,45 @@ describe("SegmentationLayer — receive", () => {
       if (r !== null) final = r;
     }
 
-    expect(SegmentationLayer.reassembledPid).toBe(PID_NO_LAYER_3);
+    expect(final).not.toBeNull();
+    expect((final as DataLinkDataIndication).pid).toBe(PID_NET_ROM); // recovered original L3 PID
+    expect(Array.from((final as DataLinkDataIndication).data)).toEqual(
+      Array.from(payload),
+    );
+  });
+
+  it("strictlyFaithful uses the figure-literal format and delivers PID_NO_LAYER_3", () => {
+    // strictlyFaithful (segmentFirstCarriesL3Pid off): Figure 6.2 literally —
+    // no inner-PID octet, so the original L3 PID cannot be recovered and the
+    // reassembled payload is delivered as PID_NO_LAYER_3. The first segment's
+    // info field is [F/X][data] (no inner-PID octet between them). Pin the
+    // strict figure-literal contract alongside the default.
+    const n1 = 16;
+    const quirks = strictlyFaithfulSessionQuirks;
+    const send = new SegmentationLayer(ctx(n1, true, quirks));
+    const recv = new SegmentationLayer(ctx(n1, true, quirks));
+    const payload = new Uint8Array(40); // payload[0] === 0, distinct from PID_NET_ROM (0xCF)
+
+    const segments = send.buildSendRequests(payload, PID_NET_ROM);
+
+    // The first segment's second byte is the start of PAYLOAD (figure-literal),
+    // NOT the inner PID. (payload[0] === 0, distinct from PID_NET_ROM 0xCF.)
+    expect((segments[0].data as Uint8Array)[0] & SEGMENT_FIRST_BIT).not.toBe(0);
+    expect((segments[0].data as Uint8Array)[1]).toBe(0); // first payload byte, not an inner PID
+
+    let final: DataLinkDataIndication | null = null;
+    for (const s of segments) {
+      const r = recv.onDataIndication(
+        indication(s.data as Uint8Array, s.pid as number),
+      );
+      if (r !== null) final = r;
+    }
+
+    expect(SegmentationLayer.figureLiteralReassembledPid).toBe(PID_NO_LAYER_3);
     expect(final).not.toBeNull();
     expect((final as DataLinkDataIndication).pid).toBe(PID_NO_LAYER_3);
+    expect(Array.from((final as DataLinkDataIndication).data)).toEqual(
+      Array.from(payload),
+    );
   });
 });
