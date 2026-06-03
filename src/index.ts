@@ -73,12 +73,15 @@ export {
 } from "./address.js";
 export {
   type Ax25Frame,
+  type Ax25ParseOptions,
   type FrameFactoryOpts,
   type FrameKind,
+  LENIENT_PARSE,
   MAX_DIGIPEATERS,
   PID_NET_ROM,
   PID_NO_LAYER_3,
   PID_SEGMENTED,
+  STRICT_PARSE,
   classify,
   decodeFrame,
   disc,
@@ -132,6 +135,7 @@ export {
   type FrameDirection,
 } from "./listener.js";
 export type { Ax25Event } from "./sdl/events.js";
+export { classifyFrame } from "./sdl/frame-classifier.js";
 export {
   type Ax25SessionQuirks,
   defaultSessionQuirks,

@@ -53,6 +53,61 @@ const CONTROL_RNR = 0x05;
 const CONTROL_REJ = 0x09;
 const CONTROL_SREJ = 0x0d;
 
+// U-frame control-byte bases that legitimately carry an information field
+// (§3.5): Frame Reject (FRMR), Exchange Identification (XID), and TEST. UI also
+// carries info but is handled via the I/UI PID-bearing branch in decodeFrame.
+const CONTROL_TEST = 0xe3;
+
+/**
+ * Per-call configuration for the AX.25 wire-parse path ({@link decodeFrame}).
+ * Each pragmatic accommodation beyond strict AX.25 v2.2 compliance is a named,
+ * individually-toggleable flag. Mirrors the C# `Ax25ParseOptions` record
+ * (`Packet.Core`); runtime behaviour defers to that reference.
+ *
+ * Spec philosophy: the *strict* preset accepts exactly what AX.25 v2.2
+ * describes, but {@link decodeFrame} defaults to {@link LENIENT_PARSE} (the C#
+ * parameterless decoder's default), so a spec-violating frame is *accepted at
+ * decode* and then surfaced as the matching SDL error event by
+ * {@link classifyFrame} (DL-ERROR M) rather than rejected silently at the wire.
+ * Pass {@link STRICT_PARSE} to reject the violation at decode instead.
+ */
+export interface Ax25ParseOptions {
+  /**
+   * Capture trailing bytes as the frame's {@link Ax25Frame.info} on S frames
+   * and on the no-info U frames (SABM/SABME/DISC/UA/DM). Strict §3.5: only I,
+   * UI, FRMR, XID and TEST carry information fields; S frames and the other U
+   * frames do not. Mirrors C# `Ax25ParseOptions.AllowInfoOnSupervisoryFrames`.
+   *
+   * When `true` (lenient), {@link decodeFrame} keeps the trailing bytes so the
+   * data-link layer's {@link classifyFrame} can raise
+   * `info_not_permitted_in_frame` (DL-ERROR M). When `false` (strict),
+   * {@link decodeFrame} throws — the violation is rejected at the wire, matching
+   * the C# strict `TryParse` returning `false`. The info-bearing U frames
+   * (FRMR/XID/TEST) and the PID-bearing I/UI frames are unaffected either way.
+   */
+  readonly allowInfoOnSupervisoryFrames: boolean;
+}
+
+/**
+ * Strict AX.25 v2.2 parse — all pragmatic accommodations disabled. Mirrors the
+ * C# `Ax25ParseOptions.Strict`. An information field on an S frame or a no-info
+ * U frame is rejected at decode ({@link decodeFrame} throws).
+ */
+export const STRICT_PARSE: Ax25ParseOptions = {
+  allowInfoOnSupervisoryFrames: false,
+};
+
+/**
+ * Lenient ("kitchen sink") parse — all currently known pragmatic flags enabled.
+ * Mirrors the C# `Ax25ParseOptions.Lenient`, which the C# parameterless decoder
+ * overloads use. This is {@link decodeFrame}'s default: trailing bytes on an S
+ * frame or a no-info U frame are *captured* (not rejected), to be surfaced as a
+ * data-link error by {@link classifyFrame} rather than dropped at the wire.
+ */
+export const LENIENT_PARSE: Ax25ParseOptions = {
+  allowInfoOnSupervisoryFrames: true,
+};
+
 /**
  * The high-level frame kind, after classification of the (first) control
  * octet. Modulo-independent: the I/S/U discriminator and the S-frame subtype
@@ -261,8 +316,19 @@ export function encodeFrame(frame: Ax25Frame): Uint8Array {
  * both modes, so `extended` only affects I and S frames. Defaults to mod-8;
  * the addresses precede the control field and are modulo-independent, so a
  * mod-8 decode is always valid for routing.
+ *
+ * `options` selects the strict/lenient parse (see {@link Ax25ParseOptions}).
+ * Defaults to {@link LENIENT_PARSE} — matching the C# parameterless decoder —
+ * which captures trailing bytes on an S frame or a no-info U frame as `info` so
+ * {@link classifyFrame} can raise the data-link error rather than the frame
+ * being dropped at the wire. {@link STRICT_PARSE} throws on that violation
+ * instead (mirroring the C# strict `TryParse` returning `false`).
  */
-export function decodeFrame(bytes: Uint8Array, extended = false): Ax25Frame {
+export function decodeFrame(
+  bytes: Uint8Array,
+  extended = false,
+  options: Ax25ParseOptions = LENIENT_PARSE,
+): Ax25Frame {
   if (bytes.length < 2 * ADDRESS_ENCODED_LENGTH + 1) {
     throw new Error(`frame too short: ${bytes.length} bytes`);
   }
@@ -322,7 +388,21 @@ export function decodeFrame(bytes: Uint8Array, extended = false): Ax25Frame {
     pid = bytes[offset++]!;
     info = bytes.slice(offset);
   } else if (offset < bytes.length) {
-    // S-frames / non-info U-frames: be lenient and capture trailing bytes.
+    // Trailing bytes after the control field of a non-PID-bearing frame. Per
+    // §3.5 the information field appears on I, UI, FRMR, XID and TEST frames
+    // only; other S frames (RR/RNR/REJ/SREJ) and the no-info U frames
+    // (SABM/SABME/DISC/UA/DM) must have none. FRMR/XID/TEST legitimately carry
+    // info, so they always pass; the rest are a violation that STRICT_PARSE
+    // rejects here (mirroring the C# strict `TryParse` returning false) and
+    // LENIENT_PARSE captures so {@link classifyFrame} can raise DL-ERROR M.
+    const uBase = control & 0xef;
+    const isInfoAllowedUFrame =
+      uBase === CONTROL_FRMR || uBase === CONTROL_XID || uBase === CONTROL_TEST;
+    if (!isInfoAllowedUFrame && !options.allowInfoOnSupervisoryFrames) {
+      throw new Error(
+        "information field not permitted on this frame type (§3.5)",
+      );
+    }
     info = bytes.slice(offset);
   }
 

@@ -5,6 +5,7 @@ import {
   classify,
   decodeFrame,
   disc,
+  dm,
   encodeFrame,
   getNr,
   getNs,
@@ -196,6 +197,42 @@ describe("Ax25Session — I-frame TX/RX", () => {
     const rrs = peer.frames.filter((f) => classify(f) === "RR");
     expect(rrs.length).toBeGreaterThanOrEqual(1);
     expect(getNr(rrs[rrs.length - 1]!)).toBe(1);
+    await stack.stop();
+  });
+
+  it("re-establishes on a spec-violating info-bearing DM (DL-ERROR M, classifier parity)", async () => {
+    // The Ax25Stack/Ax25Session receive path runs every inbound frame through
+    // classifyFrame (mirroring the C# Ax25Adapter). A DM carrying a trailing
+    // info byte is malformed (§3.5): the classifier maps it to
+    // info_not_permitted_in_frame, and Connected t10 raises DL-ERROR (M) and
+    // re-establishes — rather than the malformed DM being processed as a plain
+    // DM (which would silently tear the link down).
+    const { a, b } = pair();
+    const stack = new Ax25Stack(a);
+    await stack.start();
+    const peer = setupPeer(b);
+
+    const local = Callsign.parse("M0LTE-2");
+    const remote = Callsign.parse("G7XYZ-1");
+    const cp = stack.connect({ from: local, to: remote, options: { t1Ms: 1000 } });
+    await peer.flush();
+    await peerSend(b, ua({ destination: local, source: remote, finalBit: true }));
+    await cp;
+    peer.frames.length = 0;
+
+    // Peer sends a DM with a trailing (illegal) info octet — raw bytes so the
+    // lenient decode keeps the info field for the classifier.
+    const dmBytes = encodeFrame(dm({ destination: local, source: remote }));
+    const malformed = new Uint8Array(dmBytes.length + 1);
+    malformed.set(dmBytes, 0);
+    malformed[dmBytes.length] = 0x99;
+    await b.send(malformed);
+    await peer.flush();
+    await peer.flush();
+
+    // The error path re-establishes: a fresh SABM goes out (Establish_Data_Link).
+    const sabms = peer.frames.filter((f) => classify(f) === "SABM");
+    expect(sabms.length).toBeGreaterThanOrEqual(1);
     await stack.stop();
   });
 

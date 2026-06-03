@@ -1,13 +1,11 @@
 import { Callsign } from "./callsign.js";
 import {
   type Ax25Frame,
-  classify,
   decodeFrame,
   encodeFrame,
 } from "./frame.js";
 import type { DataLinkSignal } from "./sdl/action-dispatcher.js";
-import type { Ax25Event as Ax25EventName } from "ax25sdl";
-import type { Ax25Event } from "./sdl/events.js";
+import { classifyFrame } from "./sdl/frame-classifier.js";
 import {
   type Ax25SessionContext,
   createSessionContext,
@@ -224,11 +222,13 @@ export class Ax25Session {
         f = frame;
       }
     }
-    const kind = classify(f);
-    const eventName = mapKindToEvent(kind);
-    if (eventName === null) return; // unknown frame; drop
-    const event: Ax25Event = { name: eventName, frame: f };
-    this.driver.postEvent(event);
+    // Classify the frame into the SDL event the dispatcher should receive. A
+    // spec-violating frame (info on an S / no-info U frame; unknown U control
+    // byte) maps to the matching error event so the figc4.x error-input
+    // transition fires (DL-ERROR + re-establish) instead of the frame being
+    // silently processed. Mirrors the C# `Ax25Adapter`, which posts
+    // `Ax25FrameClassifier.Classify(frame)`.
+    this.driver.postEvent(classifyFrame(f));
   }
 
   /** @internal — called by Ax25Stack when transport stops. */
@@ -323,36 +323,6 @@ export class Ax25Session {
     return new Error(
       disconnectReason ?? "peer refused connection (DM received)",
     );
-  }
-}
-
-/**
- * Map a wire-frame {@link FrameKind} to the SDL event name in the
- * transition tables. Returns null for frames the SDL doesn't model
- * (UI in a v1-restricted runtime, SREJ, FRMR, XID, TEST, etc.).
- */
-function mapKindToEvent(kind: string): Ax25EventName | null {
-  switch (kind) {
-    case "I":
-      return "I_received";
-    case "RR":
-      return "RR_received";
-    case "RNR":
-      return "RNR_received";
-    case "REJ":
-      return "REJ_received";
-    case "SABM":
-      return "SABM_received";
-    case "DISC":
-      return "DISC_received";
-    case "UA":
-      return "UA_received";
-    case "DM":
-      return "DM_received";
-    case "UI":
-      return "UI_received";
-    default:
-      return null;
   }
 }
 

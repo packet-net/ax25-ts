@@ -2,13 +2,13 @@ import { Callsign } from "./callsign.js";
 import {
   type Ax25Frame,
   PID_NO_LAYER_3,
-  classify,
   decodeFrame,
   encodeFrame,
   isCommand as frameIsCommand,
 } from "./frame.js";
 import type { DataLinkSignal } from "./sdl/action-dispatcher.js";
 import type { Ax25Event } from "./sdl/events.js";
+import { classifyFrame } from "./sdl/frame-classifier.js";
 import { Ax25ManagementDataLink } from "./sdl/management-data-link.js";
 import {
   type Ax25SessionContext,
@@ -554,7 +554,12 @@ export class Ax25Listener {
       // frame's N(S)/N(R)/PID/info land correctly (mirrors the C# listener's
       // ReparseAtSessionModulo).
       const parsed = reparseAtSessionModulo(routed, bytes, cached.session.context);
-      const kind = classify(parsed);
+      // Classify the frame into the SDL event the dispatcher should receive. A
+      // spec-violating frame (info on an S / no-info U frame; unknown U control
+      // byte) maps to the matching error event here — so the figc4.x error-input
+      // transition (DL-ERROR + re-establish) fires instead of the frame being
+      // silently processed. Mirrors C#'s `Ax25FrameClassifier.Classify`.
+      const event = classifyFrame(parsed);
 
       // XID / FRMR-of-XID routing — these belong to the MDL machine, not the
       // data-link session (the data-link Connected state has no XID handler,
@@ -570,25 +575,24 @@ export class Ax25Listener {
       // (e.g. a stray XID response with no negotiation → the data-link
       // catch-all; a real FRMR on an established link → data-link FRMR
       // handling). C/R-bit disambiguated. Mirrors C#'s DispatchInbound routing.
-      if (kind === "XID" && frameIsCommand(parsed)) {
+      if (event.name === "XID_received" && frameIsCommand(parsed)) {
         cached.mdl.respondToXidCommand(parsed);
         return;
       }
-      if (cached.mdl.isNegotiating && kind === "XID") {
+      if (cached.mdl.isNegotiating && event.name === "XID_received") {
         cached.mdl.onXidReceived(parsed);
         return;
       }
-      if (cached.mdl.isNegotiating && kind === "FRMR") {
+      if (cached.mdl.isNegotiating && event.name === "FRMR_received") {
         cached.mdl.onFrmrReceived(parsed);
         return;
       }
 
-      const event = mapKindToEvent(parsed, kind);
-      if (event === null) return; // unknown — drop
       const stateBefore: string = cached.session.state;
       const wasDisconnected = stateBefore === "Disconnected";
       const isReconnectSabm =
-        wasDisconnected && (kind === "SABM" || kind === "SABME");
+        wasDisconnected &&
+        (event.name === "SABM_received" || event.name === "SABME_received");
       cached.session.postEvent(event);
       const stateAfter: string = cached.session.state;
       if (isReconnectSabm && stateAfter === "Connected") {
@@ -602,13 +606,15 @@ export class Ax25Listener {
     // correctly decoded at mod-8: an unknown peer can't already have an
     // extended link with us, so no second pass is needed here.
     const parsed = routed;
-    const kind = classify(parsed);
-    const event = mapKindToEvent(parsed, kind);
-    if (event === null) return; // unknown — drop
+    // Classify into the SDL event (spec-violating frames → the matching error
+    // event; see the cached-session branch above). Mirrors C#'s
+    // `Ax25FrameClassifier.Classify` on the cache-miss path.
+    const event = classifyFrame(parsed);
 
     // Cache miss path. See C# DispatchInbound for the rationale block;
     // mirrored here.
-    const isSabmShaped = kind === "SABM" || kind === "SABME";
+    const isSabmShaped =
+      event.name === "SABM_received" || event.name === "SABME_received";
 
     if (isSabmShaped && this.acceptIncoming) {
       // Accept path: build the session, cache it, fire consumer hook
@@ -632,7 +638,7 @@ export class Ax25Listener {
     const transient = this.buildSession(peer, this.acceptIncoming);
     const transientEvent = isSabmShaped
       ? event
-      : reclassifyForDisconnectedCatchAll(kind, event, parsed);
+      : reclassifyForDisconnectedCatchAll(event, parsed);
     transient.session.postEvent(transientEvent);
     // Cancel any timers the SDL armed.
     transient.scheduler.cancel("T1");
@@ -823,58 +829,24 @@ function reparseAtSessionModulo(
 }
 
 /**
- * Map a wire-frame {@link FrameKind} to the matching SDL event. Returns
- * null for frames the SDL doesn't model. The returned event carries the
- * triggering frame so frame-aware guard predicates can read fields from
- * it (`P_eq_1`, `command`, `N_s_eq_V_r`, …).
- */
-function mapKindToEvent(frame: Ax25Frame, kind: string): Ax25Event | null {
-  switch (kind) {
-    case "SABM":
-      return { name: "SABM_received", frame };
-    case "SABME":
-      return { name: "SABME_received", frame };
-    case "DISC":
-      return { name: "DISC_received", frame };
-    case "UA":
-      return { name: "UA_received", frame };
-    case "DM":
-      return { name: "DM_received", frame };
-    case "UI":
-      return { name: "UI_received", frame };
-    case "RR":
-      return { name: "RR_received", frame };
-    case "RNR":
-      return { name: "RNR_received", frame };
-    case "REJ":
-      return { name: "REJ_received", frame };
-    case "I":
-      return { name: "I_received", frame };
-    default:
-      return null;
-  }
-}
-
-/**
  * Map an inbound classified event to the event the Disconnected SDL knows
  * how to handle. Specific events handled in Disconnected (DISC/UI/UA/SABM/SABME)
- * pass through unchanged; everything else (RR/RNR/REJ/SREJ/I/FRMR/XID/TEST)
- * becomes `all_other_commands` so the SDL's t05 catch-all emits DM. See
- * figc4.1 — the catch-all is named "all other commands" precisely for
- * this case. Mirrors the C# `ReclassifyForDisconnectedCatchAll` helper
- * (#143 carry-over).
+ * pass through unchanged; everything else (RR/RNR/REJ/SREJ/I/FRMR/XID/TEST, plus
+ * the spec-violation error events) becomes `all_other_commands` so the SDL's t05
+ * catch-all emits DM. See figc4.1 — the catch-all is named "all other commands"
+ * precisely for this case. Mirrors the C# `ReclassifyForDisconnectedCatchAll`
+ * helper, which switches on the classified event type (#143 carry-over).
  */
 function reclassifyForDisconnectedCatchAll(
-  kind: string,
   event: Ax25Event,
   frame: Ax25Frame,
 ): Ax25Event {
-  switch (kind) {
-    case "SABM":
-    case "SABME":
-    case "DISC":
-    case "UI":
-    case "UA":
+  switch (event.name) {
+    case "SABM_received":
+    case "SABME_received":
+    case "DISC_received":
+    case "UI_received":
+    case "UA_received":
       return event;
     default:
       return { name: "all_other_commands", frame };
