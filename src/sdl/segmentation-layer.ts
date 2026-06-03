@@ -51,7 +51,7 @@
 import { PID_NO_LAYER_3, PID_SEGMENTED } from "../frame.js";
 import { type Ax25Event, dlDataRequestEvent } from "./events.js";
 import type { Ax25SessionContext } from "./session-context.js";
-import { Reassembler, segment } from "./segmenter.js";
+import { Reassembler, SegmentReassemblyError, segment } from "./segmenter.js";
 
 /**
  * A DL-DATA-indication {@link DataLinkSignal} — the narrowed shape the receive
@@ -157,8 +157,35 @@ export class SegmentationLayer {
    *    while more segments are expected (nothing to deliver yet).
    *  - Otherwise return the indication unchanged (pass-through).
    *
+   * **Malformed / protocol-violating segments are dropped cleanly at this
+   * seam.** The wire is untrusted: a hostile peer or RF corruption can deliver
+   * a PID-0x08 indication that is empty, a non-First segment with no prior
+   * First, an inner-PID First missing its PID octet, or an out-of-sequence
+   * continuation. {@link Reassembler.push} rejects each of these by throwing a
+   * {@link SegmentReassemblyError} (its strict, documented contract). This
+   * boundary process is the right place to turn that strict contract into a
+   * graceful drop: it catches the {@link SegmentReassemblyError}, **resets any
+   * in-progress reassembly** (so a corrupt series can't poison the next valid
+   * one — the discarded reassembler is rebuilt lazily on the next segment, back
+   * in the "waiting for a First" state), and returns `null` — the same "nothing
+   * to deliver yet" signal as a legitimate mid-series segment. Nothing
+   * propagates to the caller and nothing relies on {@link Ax25Listener}'s
+   * inbound catch-all. This matches the §6.6 / Fig C5.2 reassembler treating a
+   * bad segment as a discardable error, and Dire Wolf (the only known v2.2
+   * segmenter), whose reassembler logs a "Reassembler Protocol Error" and
+   * drops. Only `push`'s documented {@link SegmentReassemblyError} is caught —
+   * any other (crash-class) error is deliberately left to surface. The clean
+   * drop is **unconditional**, not quirk-gated: the strict/faithful quirk
+   * governs the segment *wire format*, not hostile-input tolerance. Mirrors
+   * packet.net#284.
+   *
+   * The low-level {@link Reassembler.push} contract is deliberately *unchanged*
+   * — direct callers still get the strict throw; only this wire-facing seam
+   * softens it to a drop.
+   *
    * @returns The indication to deliver upward, or `null` when a segment was
-   *   consumed but the series is incomplete. Mirrors the C#
+   *   consumed but the series is incomplete — or when a malformed segment was
+   *   dropped (and the reassembler reset). Mirrors the C#
    *   `SegmentationLayer.OnDataIndication`.
    */
   onDataIndication(
@@ -173,7 +200,22 @@ export class SegmentationLayer {
     // a configureSession hook that ran after this shim was constructed).
     this.reassembler ??= new Reassembler(this.innerPidFormat);
 
-    const completed = this.reassembler.push(indication.data);
+    let completed: Uint8Array | null;
+    try {
+      completed = this.reassembler.push(indication.data);
+    } catch (err) {
+      if (err instanceof SegmentReassemblyError) {
+        // Malformed / protocol-violating segment off the wire. Drop it cleanly
+        // and discard any partially-accumulated series so a corrupt run can't
+        // poison the next valid one — the dropped reassembler is replaced lazily
+        // on the next segment, back in the "waiting for a First" state. We
+        // swallow *only* push's documented contract error; any other
+        // (crash-class) error would be a genuine bug and is left to surface.
+        this.reassembler = null;
+        return null;
+      }
+      throw err;
+    }
     if (completed === null) return null; // mid-series segment — nothing to deliver yet
 
     // With the inner-PID quirk on, the reassembler recovered the original L3 PID

@@ -49,6 +49,29 @@ export const SEGMENT_COUNT_MASK = 0x7f;
 /** Maximum number of segments a single upper-layer payload may span (7-bit count → 128). */
 export const SEGMENT_MAX_SEGMENTS = 128;
 
+/**
+ * The error {@link Reassembler.push} throws when a *segment* it is handed
+ * violates the reassembly contract — an empty info field, an inner-PID first
+ * segment with no PID octet, a non-First segment with no prior First, or an
+ * out-of-sequence continuation. It is a dedicated subclass (rather than a bare
+ * `Error` / `RangeError`) so a wire-facing caller can catch *exactly* these
+ * protocol violations and let any other (crash-class) error surface
+ * unmasked — the TS analogue of the C# reassembler's documented
+ * `ArgumentException` / `InvalidOperationException` contract, which
+ * {@link SegmentationLayer} catches narrowly at the receive seam
+ * (packet.net#284).
+ *
+ * `push`'s throw contract is unchanged in substance: it still throws on every
+ * one of these cases, with the same human-readable messages — only the concrete
+ * error type is narrowed from the JS built-ins to this subclass.
+ */
+export class SegmentReassemblyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SegmentReassemblyError";
+  }
+}
+
 // Re-export so callers segmenting can reach the PID from one place.
 export { PID_SEGMENTED };
 
@@ -232,14 +255,16 @@ export class Reassembler {
    * {@link Reassembler.lastRecoveredPid} holds the inner PID (inner-PID format)
    * or `null` (figure-literal format).
    *
-   * @throws RangeError if `infoField` is empty, or — for the inner-PID format —
-   *   a first segment lacks the inner-PID octet.
-   * @throws Error if a non-First segment arrives without a prior First, or if
-   *   the remaining count is out of sequence vs. the prior segment.
+   * @throws {SegmentReassemblyError} if `infoField` is empty, or — for the
+   *   inner-PID format — a first segment lacks the inner-PID octet, or a
+   *   non-First segment arrives without a prior First, or the remaining count
+   *   is out of sequence vs. the prior segment. This is the reassembler's
+   *   strict, documented contract; the wire-facing {@link SegmentationLayer}
+   *   catches it narrowly and drops the bad segment cleanly.
    */
   push(infoField: Uint8Array): Uint8Array | null {
     if (infoField.length < 1) {
-      throw new RangeError(
+      throw new SegmentReassemblyError(
         "segment info field must be at least 1 byte (the control byte)",
       );
     }
@@ -251,7 +276,7 @@ export class Reassembler {
     let data: Uint8Array;
     if (isFirst && this.expectInnerPid) {
       if (infoField.length < 2) {
-        throw new RangeError(
+        throw new SegmentReassemblyError(
           "first segment of an inner-PID series must be at least 2 bytes (the F/X control byte + the inner-PID octet)",
         );
       }
@@ -266,11 +291,11 @@ export class Reassembler {
       this.expectedRemaining = remaining;
       if (!this.expectInnerPid) this.pendingPid = null;
     } else if (this.expectedRemaining < 0) {
-      throw new Error(
+      throw new SegmentReassemblyError(
         "non-First segment received before any First segment — no in-progress reassembly to attach to",
       );
     } else if (remaining !== this.expectedRemaining - 1) {
-      throw new Error(
+      throw new SegmentReassemblyError(
         `segment count out of sequence: expected ${this.expectedRemaining - 1}, got ${remaining}`,
       );
     } else {

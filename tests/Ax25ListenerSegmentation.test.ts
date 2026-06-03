@@ -15,13 +15,16 @@ import {
   PID_NO_LAYER_3,
   PID_SEGMENTED,
   classify,
+  iFrame,
   sabm,
 } from "../src/frame.js";
 import {
   Ax25Listener,
   type Ax25ListenerSession,
 } from "../src/listener.js";
+import type { DataLinkSignal } from "../src/sdl/action-dispatcher.js";
 import { SEGMENT_FIRST_BIT } from "../src/sdl/segmenter.js";
+import { SegmentationLayer } from "../src/sdl/segmentation-layer.js";
 import type { Ax25SessionContext } from "../src/sdl/session-context.js";
 import { strictlyFaithfulSessionQuirks } from "../src/sdl/session-quirks.js";
 import {
@@ -58,6 +61,43 @@ async function acceptedSession(
   await transport.sentFrames.waitForCount(1, 2000); // the UA
   expect(session.state).toBe("Connected");
   return { listener, transport, session };
+}
+
+/**
+ * As {@link acceptedSession}, but also wires a DL-DATA-indication observer onto
+ * the session's signal stream (in `configureSession`, before any events flow)
+ * so a test can see exactly what the receive-side segmentation seam delivers
+ * upward. Mirrors C#'s `AcceptedSessionObservingData` (packet.net#284).
+ */
+async function acceptedSessionObservingData(
+  configure: (ctx: Ax25SessionContext) => void,
+): Promise<{
+  listener: Ax25Listener;
+  transport: LoopbackTransport;
+  session: Ax25ListenerSession;
+  delivered: DataLinkSignal[];
+}> {
+  const delivered: DataLinkSignal[] = [];
+  const transport = new LoopbackTransport();
+  const listener = new Ax25Listener(transport, {
+    myCall: LocalCall,
+    configureSession: (s) => {
+      configure(s.context);
+      s.onDataLinkSignal((sig) => {
+        if (sig.type === "DL_DATA_indication") delivered.push(sig);
+      });
+    },
+  });
+  const accepted = new Promise<Ax25ListenerSession>((resolve) => {
+    listener.onSessionAccepted((s) => resolve(s));
+  });
+
+  await listener.start();
+  transport.injectInbound(sabm({ destination: LocalCall, source: PeerCall }));
+  const session = await withTimeout(accepted, 2000, "sessionAccepted");
+  await transport.sentFrames.waitForCount(1, 2000); // the UA
+  expect(session.state).toBe("Connected");
+  return { listener, transport, session, delivered };
 }
 
 describe("Ax25Listener — segmentation seam", () => {
@@ -178,5 +218,66 @@ describe("Ax25Listener — segmentation seam", () => {
 
     await listener.dispose();
     await otherListener.dispose();
+  });
+
+  it("drops a malformed segment off the wire, then reassembles a following valid series", async () => {
+    // The receive-path hardening (TS parity with packet.net#284): a malformed
+    // PID-0x08 segment arriving off the wire through the real Ax25Listener pump
+    // (emitUpward) is dropped cleanly at the SegmentationLayer seam — no DL-DATA
+    // indication surfaces, the pump survives, and (the reset half) a valid
+    // segmented series delivered immediately afterwards still reassembles intact.
+    // This proves the fix does not lean on the listener's inbound catch-all.
+    const { listener, transport, delivered } = await acceptedSessionObservingData(
+      (ctx) => {
+        ctx.n1 = 16;
+        ctx.segmenterReassemblerEnabled = true;
+        ctx.quirks = strictlyFaithfulSessionQuirks; // figure-literal: no inner-PID octet
+      },
+    );
+
+    // A malformed segment off the wire: a non-First (First bit clear) segment
+    // with no in-progress series, carried as a normal I-frame, PID 0x08, N(S)=0.
+    // The I-frame is sequence-valid (so V(R) advances), but its info field is a
+    // protocol-violating segment — it must be dropped at the seam, delivering
+    // nothing upward, without throwing through the pump.
+    transport.injectInbound(
+      iFrame({
+        destination: LocalCall,
+        source: PeerCall,
+        nr: 0,
+        ns: 0,
+        info: Uint8Array.from([0x05, 0xaa, 0xbb]),
+        pid: PID_SEGMENTED,
+      }),
+    );
+
+    // A valid single-segment series immediately afterwards (N(S)=1): First bit
+    // set, remaining 0, one data byte 0x42. If the malformed segment had poisoned
+    // the reassembler — or thrown through the pump and wedged it — this would not
+    // reassemble.
+    transport.injectInbound(
+      iFrame({
+        destination: LocalCall,
+        source: PeerCall,
+        nr: 0,
+        ns: 1,
+        info: Uint8Array.from([SEGMENT_FIRST_BIT | 0, 0x42]),
+        pid: PID_SEGMENTED,
+      }),
+    );
+
+    await waitFor(
+      () => delivered.length > 0,
+      2000,
+      "the valid series after the dropped malformed segment must reassemble and surface",
+    );
+
+    expect(delivered.length).toBe(1); // only the valid series — the malformed segment surfaced nothing
+    const ind = delivered[0];
+    expect(ind.type).toBe("DL_DATA_indication");
+    expect(Array.from((ind as { data: Uint8Array }).data)).toEqual([0x42]); // no leakage from the malformed one
+    expect((ind as { pid: number }).pid).toBe(SegmentationLayer.figureLiteralReassembledPid);
+
+    await listener.dispose();
   });
 });

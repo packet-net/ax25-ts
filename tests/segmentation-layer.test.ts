@@ -190,3 +190,85 @@ describe("SegmentationLayer — receive", () => {
     );
   });
 });
+
+describe("SegmentationLayer — receive: malformed segments are dropped cleanly at the wire seam", () => {
+  // The TS port of packet.net's SegmentReassemblerThrowOnWireFindingTests
+  // (packet.net#284). A hostile / malformed PID-0x08 segment off the wire reaches
+  // SegmentationLayer.onDataIndication (mirrors C#'s OnDataIndication). The seam
+  // now catches Reassembler.push's documented SegmentReassemblyError, drops the
+  // bad segment cleanly (returns null — the same "nothing to deliver yet" signal
+  // as a legitimate mid-series segment), and resets any in-progress reassembly,
+  // WITHOUT relying on the listener's catch-all. The four finding inputs are the
+  // analogues of C#'s `05 AA BB`, empty, `80`, and the `85 CC` → `03 DD`
+  // out-of-sequence pair. The low-level Reassembler.push contract is unchanged —
+  // its direct-call tests in segmenter.test.ts still pin the strict throw.
+
+  it("case 1 — a non-First segment with no prior First is dropped cleanly", () => {
+    // Hex input (segment info field): 05 AA BB (First bit clear, remaining = 5).
+    const layer = new SegmentationLayer(ctx(256, true, strictlyFaithfulSessionQuirks));
+    expect(() => layer.onDataIndication(indication(Uint8Array.from([0x05, 0xaa, 0xbb]), PID_SEGMENTED))).not.toThrow();
+    // A second identical malformed segment still delivers nothing upward.
+    expect(layer.onDataIndication(indication(Uint8Array.from([0x05, 0xaa, 0xbb]), PID_SEGMENTED))).toBeNull();
+  });
+
+  it("case 2 — an empty 0x08-PID info field is dropped cleanly", () => {
+    // Hex input (segment info field): (empty).
+    const layer = new SegmentationLayer(ctx(256, true, strictlyFaithfulSessionQuirks));
+    expect(() => layer.onDataIndication(indication(new Uint8Array(0), PID_SEGMENTED))).not.toThrow();
+    expect(layer.onDataIndication(indication(new Uint8Array(0), PID_SEGMENTED))).toBeNull();
+  });
+
+  it("case 3 — under the inner-PID quirk, a First carrying only the F/X octet (no inner PID) is dropped cleanly", () => {
+    // Hex input: 80 (First bit set, remaining = 0, no inner-PID octet). Uses the
+    // DEFAULT quirk (segmentFirstCarriesL3Pid on) so the reassembler expects the
+    // inner-PID octet — matching C#'s NewWireLayer(Ax25SessionQuirks.Default).
+    const layer = new SegmentationLayer(ctx(256, true, defaultSessionQuirks));
+    expect(() => layer.onDataIndication(indication(Uint8Array.from([0x80]), PID_SEGMENTED))).not.toThrow();
+    expect(layer.onDataIndication(indication(Uint8Array.from([0x80]), PID_SEGMENTED))).toBeNull();
+  });
+
+  it("case 4 — an out-of-sequence continuation is dropped cleanly", () => {
+    // strictlyFaithful so the first segment isn't consumed as inner-PID.
+    // First 85 CC (First bit + remaining 5), then 03 DD (remaining 3 where 4 expected).
+    const layer = new SegmentationLayer(ctx(256, true, strictlyFaithfulSessionQuirks));
+    expect(layer.onDataIndication(indication(Uint8Array.from([SEGMENT_FIRST_BIT | 5, 0xcc]), PID_SEGMENTED))).toBeNull();
+    expect(() => layer.onDataIndication(indication(Uint8Array.from([3, 0xdd]), PID_SEGMENTED))).not.toThrow();
+  });
+
+  it("reset half — a valid series after a dropped out-of-sequence continuation still reassembles intact", () => {
+    const layer = new SegmentationLayer(ctx(256, true, strictlyFaithfulSessionQuirks)); // figure-literal: no inner PID
+
+    // Start a series, then break it with an out-of-sequence continuation (dropped + resets).
+    expect(layer.onDataIndication(indication(Uint8Array.from([SEGMENT_FIRST_BIT | 5, 0xcc]), PID_SEGMENTED))).toBeNull();
+    expect(layer.onDataIndication(indication(Uint8Array.from([3, 0xdd]), PID_SEGMENTED))).toBeNull();
+
+    // A fresh, well-formed two-segment series. If the reset worked, the stale
+    // partial state is gone and this reassembles cleanly with no leakage.
+    expect(layer.onDataIndication(indication(Uint8Array.from([SEGMENT_FIRST_BIT | 1, 0xaa]), PID_SEGMENTED))).toBeNull();
+    const delivered = layer.onDataIndication(indication(Uint8Array.from([0, 0xbb]), PID_SEGMENTED));
+
+    expect(delivered).not.toBeNull();
+    expect(Array.from((delivered as DataLinkDataIndication).data)).toEqual([0xaa, 0xbb]);
+    expect((delivered as DataLinkDataIndication).pid).toBe(SegmentationLayer.figureLiteralReassembledPid);
+  });
+
+  it("reset half — a valid series after a dropped stray non-First still reassembles", () => {
+    const layer = new SegmentationLayer(ctx(256, true, strictlyFaithfulSessionQuirks));
+
+    // Stray non-First with no prior First — dropped.
+    expect(layer.onDataIndication(indication(Uint8Array.from([0x05, 0xaa, 0xbb]), PID_SEGMENTED))).toBeNull();
+
+    // A well-formed single-segment series then arrives and is delivered.
+    const delivered = layer.onDataIndication(indication(Uint8Array.from([SEGMENT_FIRST_BIT | 0, 0x42]), PID_SEGMENTED));
+    expect(delivered).not.toBeNull();
+    expect(Array.from((delivered as DataLinkDataIndication).data)).toEqual([0x42]);
+  });
+
+  it("happy-path counterpart — a clean two-segment series with no preceding malformed input reassembles", () => {
+    const layer = new SegmentationLayer(ctx(256, true, strictlyFaithfulSessionQuirks));
+    expect(layer.onDataIndication(indication(Uint8Array.from([SEGMENT_FIRST_BIT | 1, 0x01]), PID_SEGMENTED))).toBeNull();
+    const delivered = layer.onDataIndication(indication(Uint8Array.from([0, 0x02]), PID_SEGMENTED));
+    expect(delivered).not.toBeNull();
+    expect(Array.from((delivered as DataLinkDataIndication).data)).toEqual([0x01, 0x02]);
+  });
+});

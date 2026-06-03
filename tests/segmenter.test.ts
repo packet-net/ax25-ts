@@ -19,6 +19,7 @@ import {
   SEGMENT_COUNT_MASK,
   SEGMENT_FIRST_BIT,
   SEGMENT_MAX_SEGMENTS,
+  SegmentReassemblyError,
   segment,
 } from "../src/sdl/segmenter.js";
 
@@ -163,5 +164,21 @@ describe("Reassembler — rejects + restart", () => {
       Uint8Array.from([SEGMENT_FIRST_BIT | 0, 0xde, 0xad]),
     );
     expect(Array.from(completed as Uint8Array)).toEqual([0xde, 0xad]);
+  });
+
+  it("every contract violation throws the dedicated SegmentReassemblyError type", () => {
+    // The seam (SegmentationLayer.onDataIndication) catches *exactly* this
+    // subclass to drop a malformed segment while letting crash-class errors
+    // surface, so pin that all four documented violations throw it (not a bare
+    // Error / RangeError). Mirrors the C# reassembler's documented
+    // ArgumentException / InvalidOperationException contract.
+    expect(() => new Reassembler().push(new Uint8Array(0))).toThrow(SegmentReassemblyError); // empty
+    expect(() => new Reassembler().push(Uint8Array.from([0x05, 1, 2]))).toThrow(SegmentReassemblyError); // non-First w/o First
+    const oos = new Reassembler();
+    oos.push(Uint8Array.from([SEGMENT_FIRST_BIT | 5, 0xaa]));
+    expect(() => oos.push(Uint8Array.from([3, 0xbb]))).toThrow(SegmentReassemblyError); // out of sequence
+    expect(() => new Reassembler(true).push(Uint8Array.from([SEGMENT_FIRST_BIT | 0]))).toThrow(
+      SegmentReassemblyError,
+    ); // inner-PID First missing PID octet
   });
 });
