@@ -1,9 +1,13 @@
 /**
  * Names of timers the SDL refers to. AX.25 v2.2 defines T1 (acknowledge),
- * T2 (response delay), and T3 (inactive-link). The action dispatcher's
- * `start_T1` / `stop_T1` etc. verbs route through a {@link TimerScheduler}.
+ * T2 (response delay), and T3 (inactive-link) for the data-link machine, and
+ * TM201 (the management retry timer, §C5.3) for the management data-link (MDL)
+ * machine. The action dispatcher's `Start T1` / `Stop T1` / `Start TM201` etc.
+ * verbs route through a {@link TimerScheduler}. TM201 is a distinct timer name,
+ * so an MDL driver sharing a scheduler with its data-link session never
+ * collides with T1/T2/T3.
  */
-export type TimerName = "T1" | "T2" | "T3";
+export type TimerName = "T1" | "T2" | "T3" | "TM201";
 
 /**
  * Arms / cancels / queries one of the three named SDL timers. The C# runtime

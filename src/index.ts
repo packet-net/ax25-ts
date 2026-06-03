@@ -83,6 +83,7 @@ export {
   disc,
   dm,
   encodeFrame,
+  frmr,
   getNr,
   getNs,
   iFrame,
@@ -98,6 +99,7 @@ export {
   srej,
   ua,
   ui,
+  xid,
 } from "./frame.js";
 export {
   FEND,
@@ -134,7 +136,12 @@ export {
   defaultSessionQuirks,
   strictlyFaithfulSessionQuirks,
 } from "./sdl/session-quirks.js";
-export type { DataLinkSignal } from "./sdl/action-dispatcher.js";
+export type { DataLinkSignal, MdlSignal } from "./sdl/action-dispatcher.js";
+export { Ax25ManagementDataLink } from "./sdl/management-data-link.js";
+export {
+  applyNegotiated,
+  applyVersion20Defaults,
+} from "./sdl/xid-negotiator.js";
 export { sabme } from "./frame.js";
 export {
   // header constants

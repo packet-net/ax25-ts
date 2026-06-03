@@ -36,6 +36,8 @@ const CONTROL_DISC = 0x43;
 const CONTROL_UA = 0x63;
 const CONTROL_DM = 0x0f;
 const CONTROL_UI = 0x03;
+const CONTROL_FRMR = 0x87; // Frame Reject (§4.3.3.9) — response only.
+const CONTROL_XID = 0xaf; // Exchange Identification (§4.3.3.7) — command or response.
 
 // S-frame control-byte bases (§4.3.2).
 const CONTROL_RR = 0x01;
@@ -63,6 +65,8 @@ export type FrameKind =
   | "REJ"
   | "SREJ"
   | "I"
+  | "FRMR"
+  | "XID"
   | "UNKNOWN";
 
 /**
@@ -164,6 +168,10 @@ export function classify(frame: Ax25Frame): FrameKind {
       return "DM";
     case CONTROL_UI:
       return "UI";
+    case CONTROL_FRMR:
+      return "FRMR";
+    case CONTROL_XID:
+      return "XID";
     default:
       return "UNKNOWN";
   }
@@ -445,6 +453,57 @@ export function ui(
     control: (CONTROL_UI | (opts.pollFinal ? CONTROL_PF_BIT : 0)) & 0xff,
     controlExtension: null,
     pid: opts.pid ?? PID_NO_LAYER_3,
+    info,
+  };
+}
+
+/**
+ * Build an Exchange Identification (XID) frame per §4.3.3.7 — the U-frame that
+ * carries an XID parameter-negotiation information field (built by
+ * {@link encodeXid}). XID may be sent as a command (the initiator's offer) or a
+ * response (the responder's agreed set); the C/R bit is set per `isCommand`.
+ * The MDL (Management Data-Link, App. C5) exchange drives this. Mirrors the C#
+ * `Ax25Frame.Xid`. XID carries no PID (§3.5 lists the info-bearing U frames —
+ * FRMR / XID / TEST — none of which carry a PID octet).
+ */
+export function xid(
+  opts: FrameFactoryOpts & {
+    info: Uint8Array;
+    isCommand: boolean;
+    pollFinal?: boolean;
+  },
+): Ax25Frame {
+  const { destination, source, digipeaters = [], info } = opts;
+  const chain = makeAddressChain(destination, source, digipeaters, opts.isCommand);
+  return {
+    ...chain,
+    control: (CONTROL_XID | (opts.pollFinal ? CONTROL_PF_BIT : 0)) & 0xff,
+    controlExtension: null,
+    pid: null,
+    info,
+  };
+}
+
+/**
+ * Build a Frame Reject (FRMR) response frame per §4.3.3.9. The 3-octet info
+ * field carrying the rejection cause is supplied by the caller — this factory
+ * does not construct it. A pre-v2.2 peer answers an XID command with FRMR
+ * (§6.3.2 ¶1), which the MDL maps onto the version-2.0 fallback. Mirrors the C#
+ * `Ax25Frame.Frmr` (response only — FRMR is never a command). Carries no PID.
+ */
+export function frmr(
+  opts: FrameFactoryOpts & {
+    info: Uint8Array;
+    finalBit?: boolean;
+  },
+): Ax25Frame {
+  const { destination, source, digipeaters = [], info } = opts;
+  const chain = makeAddressChain(destination, source, digipeaters, false);
+  return {
+    ...chain,
+    control: (CONTROL_FRMR | (opts.finalBit ? CONTROL_PF_BIT : 0)) & 0xff,
+    controlExtension: null,
+    pid: null,
     info,
   };
 }

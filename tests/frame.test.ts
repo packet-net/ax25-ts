@@ -6,6 +6,7 @@ import {
   disc,
   dm,
   encodeFrame,
+  frmr,
   getNr,
   getNs,
   iFrame,
@@ -18,6 +19,7 @@ import {
   srej,
   ua,
   ui,
+  xid,
 } from "../src/frame.js";
 
 describe("frame codec — U frames", () => {
@@ -72,6 +74,51 @@ describe("frame codec — U frames", () => {
     const round = decodeFrame(encodeFrame(f));
     expect(round.pid).toBe(0xf0);
     expect(new TextDecoder().decode(round.info)).toBe(">test");
+  });
+
+  it("builds an XID command/response carrying an info field (no PID), round-trips", () => {
+    const info = Uint8Array.from([0x82, 0x80, 0x00, 0x00]);
+    const cmd = xid({
+      destination: Callsign.parse("M0BBB"),
+      source: Callsign.parse("M0AAA"),
+      info,
+      isCommand: true,
+      pollFinal: true,
+    });
+    expect(classify(cmd)).toBe("XID");
+    expect(isCommand(cmd)).toBe(true);
+    expect(pollFinal(cmd)).toBe(true);
+    expect(cmd.pid).toBeNull(); // XID carries no PID (§3.5)
+    const cmdRound = decodeFrame(encodeFrame(cmd));
+    expect(classify(cmdRound)).toBe("XID");
+    expect(cmdRound.pid).toBeNull();
+    expect([...cmdRound.info]).toEqual([...info]);
+
+    const resp = xid({
+      destination: Callsign.parse("M0BBB"),
+      source: Callsign.parse("M0AAA"),
+      info,
+      isCommand: false,
+      pollFinal: true,
+    });
+    expect(classify(resp)).toBe("XID");
+    expect(isResponse(resp)).toBe(true);
+    expect(pollFinal(resp)).toBe(true);
+  });
+
+  it("builds a FRMR response with a 3-octet cause field, round-trips", () => {
+    const cause = Uint8Array.from([0x01, 0x02, 0x03]);
+    const f = frmr({
+      destination: Callsign.parse("M0BBB"),
+      source: Callsign.parse("M0AAA"),
+      info: cause,
+    });
+    expect(classify(f)).toBe("FRMR");
+    expect(isResponse(f)).toBe(true); // FRMR is response-only
+    expect(f.pid).toBeNull();
+    const round = decodeFrame(encodeFrame(f));
+    expect(classify(round)).toBe("FRMR");
+    expect([...round.info]).toEqual([...cause]);
   });
 });
 

@@ -42,9 +42,14 @@ import {
   decodeFrame,
   encodeFrame,
   getNs,
+  isCommand as frameIsCommand,
 } from "../../src/frame.js";
-import type { DataLinkSignal } from "../../src/sdl/action-dispatcher.js";
+import type {
+  DataLinkSignal,
+  MdlSignal,
+} from "../../src/sdl/action-dispatcher.js";
 import type { Ax25Event } from "../../src/sdl/events.js";
+import { Ax25ManagementDataLink } from "../../src/sdl/management-data-link.js";
 import {
   type Ax25SessionContext,
   createSessionContext,
@@ -57,6 +62,7 @@ import {
 } from "../../src/sdl/session-quirks.js";
 import { SdlSessionDriver } from "../../src/sdl/session-driver.js";
 import type { TimerName, TimerScheduler } from "../../src/sdl/timer-scheduler.js";
+import type { XidParameters } from "../../src/xid.js";
 import { assertConverged, checkSafety } from "./invariant-checker.js";
 
 export const DEFAULT_T1_MS = 200;
@@ -147,6 +153,16 @@ export class Endpoint {
    * `Endpoint.Signals` in packet.net. */
   readonly signals: DataLinkSignal[] = [];
 
+  /** Every {@link MdlSignal} this station raised upward (MDL-NEGOTIATE Confirm
+   * / MDL-ERROR Indicate), in order. Mirrors `Endpoint.MdlSignals`. */
+  readonly mdlSignals: MdlSignal[] = [];
+
+  /** Deferred MDL-work queue — frame deliveries destined for the MDL machine
+   * are enqueued here and drained by the pump (after the data-link inbound
+   * events), so an MDL reply is processed after the sender's own MDL transition
+   * commits. Models the async modem boundary; mirrors `Endpoint.MdlWork`. */
+  readonly mdlWork: Array<() => void> = [];
+
   constructor(
     readonly name: string,
     readonly context: Ax25SessionContext,
@@ -160,11 +176,22 @@ export class Endpoint {
      * would let one station's `Stop T1` cancel the other's pending T1 — a
      * cross-talk that silently breaks every timeout-driven recovery. */
     readonly scheduler: ManualScheduler,
+    /** This station's MDL (XID-negotiation) driver. Shares this endpoint's
+     * scheduler (TM201 is a distinct timer name) and wire sink; negotiated
+     * parameters mutate {@link context} — the same context the data-link runs
+     * on. Mirrors `Endpoint.Mdl`. */
+    readonly mdl: Ax25ManagementDataLink,
   ) {}
 
   /** The current SDL state name. */
   get state(): string {
     return this.driver.currentState;
+  }
+
+  /** The MDL machine's current state — `Ready` or `Negotiating`. Mirrors
+   * `Endpoint.MdlState`. */
+  get mdlState(): string {
+    return this.mdl.state;
   }
 }
 
@@ -180,6 +207,12 @@ export interface HarnessOptions {
    * exactly as drawn, defects and all. Mirrors the C# harness's `quirks`
    * parameter. */
   quirks?: Ax25SessionQuirks;
+  /** Station A's explicit XID offer for the MDL negotiation. When omitted, the
+   * MDL derives one from A's link context. Mirrors the C# harness's
+   * `xidOfferA`. */
+  xidOfferA?: XidParameters;
+  /** Station B's explicit XID offer. Mirrors the C# harness's `xidOfferB`. */
+  xidOfferB?: XidParameters;
 }
 
 function mapKindToEvent(kind: string): string | null {
@@ -278,6 +311,8 @@ export class TwoStationHarness {
       n2 = DEFAULT_N2,
       extended = false,
       quirks = defaultSessionQuirks,
+      xidOfferA,
+      xidOfferB,
     } = opts;
     const nodeA = Callsign.parse("M0LTEA-1");
     const nodeB = Callsign.parse("M0LTEB-2");
@@ -305,7 +340,7 @@ export class TwoStationHarness {
       new ManualScheduler(),
       link,
       () => refs.b as Endpoint,
-      { srej, k, t1Ms, n2, extended, quirks },
+      { srej, k, t1Ms, n2, extended, quirks, xidOffer: xidOfferA },
       onTransitionFired,
     );
     const b = buildEndpoint(
@@ -314,7 +349,7 @@ export class TwoStationHarness {
       new ManualScheduler(),
       link,
       () => refs.a as Endpoint,
-      { srej, k, t1Ms, n2, extended, quirks },
+      { srej, k, t1Ms, n2, extended, quirks, xidOffer: xidOfferB },
       onTransitionFired,
     );
     refs.a = a;
@@ -441,6 +476,37 @@ export class TwoStationHarness {
     if (this.checkAfterEachStep) this.checkInvariants();
   }
 
+  // ─── MDL (XID parameter-negotiation) driving ─────────────────────────
+
+  /**
+   * Directly start an MDL XID negotiation from `e` (posts the MDL-NEGOTIATE
+   * Request the data-link figc4.6 path would raise on a v2.2 connect), then
+   * pump. Lets MDL tests exercise negotiation without also reproducing the full
+   * SABME handshake first. Mirrors the C# `TwoStationHarness.StartNegotiation`.
+   */
+  startNegotiation(e: Endpoint): void {
+    e.mdl.negotiate();
+    this.pumpToQuiescence();
+    if (this.checkAfterEachStep) this.checkInvariants();
+  }
+
+  /**
+   * Advance the clock past one TM201 interval (the MDL management retry timer)
+   * and pump — fires a due TM201 retry / give-up and lets the cascade settle.
+   * TM201 defaults to 3000 ms in the MDL driver; advance past the larger of that
+   * and the live T1V so the timer fires regardless of whether the data-link has
+   * (re)set T1V. Mirrors the C# `TwoStationHarness.AdvanceTm201`.
+   */
+  advanceTm201(extraMs = 50): void {
+    const t1 = Math.max(this.a.context.t1vMs, this.b.context.t1vMs);
+    const floor = 3000; // ActionDispatcher.tm201Ms default
+    const step = Math.max(t1, floor) + extraMs;
+    this.a.scheduler.advance(step);
+    this.b.scheduler.advance(step);
+    this.pumpToQuiescence();
+    if (this.checkAfterEachStep) this.checkInvariants();
+  }
+
   // ─── Loss-recovery driving (the adversarial-channel surface) ─────────
 
   /**
@@ -530,6 +596,18 @@ export class TwoStationHarness {
         this.b.driver.postEvent(this.b.inbound.shift() as Ax25Event);
         progress = true;
       }
+      // Deferred MDL work (XID command/response/FRMR routed to the MDL machine)
+      // — drained after the data-link events so a just-sent XID command's MDL
+      // transition has committed before its reply is handled. Mirrors the C#
+      // pump draining MdlWork after the data-link inbound queues.
+      while (this.a.mdlWork.length > 0) {
+        (this.a.mdlWork.shift() as () => void)();
+        progress = true;
+      }
+      while (this.b.mdlWork.length > 0) {
+        (this.b.mdlWork.shift() as () => void)();
+        progress = true;
+      }
       if (!progress) return;
     }
     throw new InvariantViolationError(
@@ -551,6 +629,7 @@ function buildEndpoint(
     n2: number;
     extended: boolean;
     quirks: Ax25SessionQuirks;
+    xidOffer?: XidParameters;
   },
   onTransitionFired: (
     spec: { from: string; id: string },
@@ -587,14 +666,49 @@ function buildEndpoint(
     ) {
       return;
     }
-    const eventName = mapKindToEvent(classify(parsed));
-    if (eventName === null) return;
     // Delivered to the peer: record it on the peer's received log (the C#
-    // `peerLocal.RxLog.Add(parsed)` after the drop + address checks) and queue
-    // the classified event.
+    // `peerLocal.RxLog.Add(parsed)` after the drop + address checks).
     target.receivedFromPeer.push(parsed);
+
+    // Mirror the listener's MDL routing (see Ax25Listener.dispatchInbound):
+    //   XID command                → responder builds the XID response
+    //   XID response (negotiating) → initiator applies negotiated params
+    //   FRMR (negotiating)         → initiator v2.0 fallback
+    //
+    // MDL deliveries are DEFERRED onto the peer's work queue rather than invoked
+    // synchronously: in production frames go out the modem and return through the
+    // async inbound pump, so the sender's own MDL transition completes before the
+    // reply is processed. Invoking synchronously here would re-enter the sender's
+    // MDL postEvent mid-transition (XID command not yet committed → still in
+    // Ready), mis-routing the reply. The pump drains mdlWork.
+    const kind = classify(parsed);
+    const peerMdl = target.mdl;
+    if (kind === "XID" && frameIsCommand(parsed)) {
+      target.mdlWork.push(() => peerMdl.respondToXidCommand(parsed));
+      return;
+    }
+    if (kind === "XID" && peerMdl.isNegotiating) {
+      target.mdlWork.push(() => peerMdl.onXidReceived(parsed));
+      return;
+    }
+    if (kind === "FRMR" && peerMdl.isNegotiating) {
+      target.mdlWork.push(() => peerMdl.onFrmrReceived(parsed));
+      return;
+    }
+
+    const eventName = mapKindToEvent(kind);
+    if (eventName === null) return;
     target.inbound.push({ name: eventName, frame: parsed });
   };
+
+  // The MDL driver shares this endpoint's scheduler (TM201 is a distinct timer
+  // name, so it doesn't collide with T1/T2/T3) and wire sink. Built before the
+  // data-link driver so the data-link's MDL-NEGOTIATE-request poke (raised by
+  // figc4.6 after the UA on a v2.2 connect) can route straight into it.
+  // Negotiated parameters mutate ctx — the same context the data-link runs on —
+  // which is the whole point. Mirrors the C# `BuildEndpoint`.
+  const mdl = new Ax25ManagementDataLink(ctx, scheduler, send, opts.xidOffer);
+  mdl.onMdlSignal((sig) => endpoint.mdlSignals.push(sig));
 
   const driver = new SdlSessionDriver(ctx, scheduler, {
     sendFrame: send,
@@ -613,9 +727,13 @@ function buildEndpoint(
     onUnhandledEvent: () => {},
     freezeT1V: true,
     t1Ms: opts.t1Ms,
+    // The data-link figc4.6 UA-received path raises MDL-NEGOTIATE Request after
+    // a successful v2.2 connect; hand it to the MDL driver to open the XID
+    // exchange. Mirrors C#'s sendInternal routing to mdl.Negotiate().
+    mdl: { onMdlNegotiateRequest: () => mdl.negotiate() },
   });
 
-  endpoint = new Endpoint(local.toString(), ctx, driver, scheduler);
+  endpoint = new Endpoint(local.toString(), ctx, driver, scheduler, mdl);
   return endpoint;
 }
 

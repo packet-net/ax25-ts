@@ -156,9 +156,15 @@ describe("v2.2 arc V2 — mod-128 establishment + version negotiation", () => {
       h.firedTransition("AwaitingV22Connection", "t13_t1_expiry_no"),
     ).toBe(true);
     expect(h.b.receivedFromPeer.length).toBeGreaterThan(0); // retry delivered
-    // Every establishment frame the responder sees is a SABME — the link did
-    // NOT downgrade to mod-8.
-    expect(h.b.receivedFromPeer.every(isSabme)).toBe(true);
+    // Every *establishment* frame the responder sees is a SABME — the link did
+    // NOT downgrade to mod-8. (Filter to SABM/SABME: a successful v2.2 connect
+    // is now followed by the MDL's XID command, a legitimate non-establishment
+    // frame that arrives once both reach Connected. Mirrors the C#
+    // Mod128EstablishmentConformanceTests filter.)
+    const establishmentFrames = h.b.receivedFromPeer.filter(
+      (f) => isSabm(f) || isSabme(f),
+    );
+    expect(establishmentFrames.every(isSabme)).toBe(true);
     expect(h.b.receivedFromPeer.some(isSabm)).toBe(false);
 
     // And it converges to a mod-128 connection.

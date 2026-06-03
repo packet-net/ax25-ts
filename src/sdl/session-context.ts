@@ -87,6 +87,15 @@ export interface Ax25SessionContext {
   isExtended: boolean;
   /** True if SREJ has been negotiated via XID. */
   srejEnabled: boolean;
+  /**
+   * True if the segmenter/reassembler has been negotiated via XID (the HDLC
+   * Optional Functions segmenter bit, §4.3.3.7) — a v2.2-only capability
+   * (§1419) enabled only when both peers advertise it. The MDL negotiation sets
+   * this; forced off on the version-2.0 fallback. Mirrors the C#
+   * `Ax25SessionContext.SegmenterReassemblerEnabled`. (The DL-DATA
+   * segment/reassemble path that gates on it is a later arc.)
+   */
+  segmenterReassemblerEnabled: boolean;
   /** True for half-duplex operation. */
   halfDuplex: boolean;
   /** True if implicit-reject scheme (v2.0); false for selective-reject (v2.2). */
@@ -162,6 +171,7 @@ export function createSessionContext(
     k: 4,
     isExtended: false,
     srejEnabled: false,
+    segmenterReassemblerEnabled: false,
     halfDuplex: true,
     implicitReject: true,
     t2Ms: 3000,

@@ -81,6 +81,73 @@ export type DataLinkSignal =
   | { type: "DL_ERROR_indication"; code: string };
 
 /**
+ * Signals the management data-link (MDL) machine raises *upward* to the
+ * Layer-3 entity — the `MDL-NEGOTIATE Confirm` / `MDL-ERROR Indicate (X)`
+ * primitives of AX.25 v2.2 §5.1 / Appendix C5.3. Distinct from
+ * {@link DataLinkSignal} (the data-link layer's upward primitives); the MDL is
+ * a sibling state machine (figc5.1/figc5.2) handling only XID parameter
+ * negotiation, so its primitive set is just a "negotiation complete" confirm
+ * and a letter-coded error indicate. Emitted by the dispatcher when the MDL
+ * machine's `signal_upper` verbs fire and forwarded to the MDL driver's
+ * consumer via the {@link MdlDispatcherHooks.sendMdl} callback. Mirrors the C#
+ * `MdlSignal` records.
+ *
+ * The error `code` is the §C5.3 management error-code letter: `"B"` —
+ * unexpected XID response (received in Ready); `"C"` — management retry limit
+ * exceeded (TM201/NM201 exhausted); `"D"` — XID response without F=1. (Error
+ * `"A"` — XID command without P=1 — is figc5.x reception-path detail not
+ * encoded by the prose bootstrap.)
+ */
+export type MdlSignal =
+  | { type: "MDL_NEGOTIATE_confirm" }
+  | { type: "MDL_ERROR_indicate"; code: string };
+
+/**
+ * MDL-specific dispatcher hooks. These are the management-data-link analogue of
+ * the data-link `sendFrame` / `emitUpward` callbacks: they ride on the
+ * dispatcher so the generated MDL tables can be driven through the *same*
+ * {@link ActionDispatcher} the data-link uses, rather than a second
+ * interpreter. They default to no-ops / the data-link semantics so a data-link
+ * dispatcher built without them is unaffected; only the
+ * {@link Ax25ManagementDataLink} driver wires real callbacks. Mirrors the C#
+ * `ActionDispatcher`'s `sendMdl` / `sendXidCommand` / `applyNegotiatedParameters`
+ * / `setVersion20` constructor hooks.
+ */
+export interface MdlDispatcherHooks {
+  /**
+   * Called when the MDL `XID_command` verb fires — build and send our XID
+   * *command* frame carrying the offered parameter set (§6.3.2). The U-frame
+   * factory path can't carry an info field through the dispatcher's pending
+   * accumulator, so this routes through a dedicated builder the driver supplies.
+   */
+  readonly sendXidCommand?: (tx: TransitionContext) => void;
+  /**
+   * Called when the MDL `Apply Negotiated Parameters` verb fires (figc5.2) —
+   * the §6.3.2 reverts-to merge of our offer and the peer's XID response.
+   * Defaults to a no-op (the figc5.3–figc5.8 per-parameter subroutines are an
+   * un-transcribed placeholder); the driver supplies the real merge.
+   */
+  readonly applyNegotiatedParameters?: (tx: TransitionContext) => void;
+  /** Called when the MDL machine raises a Layer-3 signal (confirm / error). */
+  readonly sendMdl?: (signal: MdlSignal) => void;
+  /**
+   * Called when the figc4.6 UA-received path raises the `MDL-NEGOTIATE Request`
+   * internal signal on a successful v2.2 connect. The data-link listener routes
+   * it to the session's MDL driver to open the XID exchange. Defaults to a
+   * no-op (the legacy "XID negotiation not implemented" behaviour).
+   */
+  readonly onMdlNegotiateRequest?: () => void;
+  /**
+   * Override for the shared `set_version_2_0` verb. Defaults to the data-link
+   * figc4.6 semantics (clear `isExtended` only — the data-link path runs its
+   * remaining v2.0 verbs separately). The MDL driver overrides it with the
+   * complete §1436 version-2.0 default set, since the figc5.2 FRMR path draws a
+   * single "Set Version 2.0" box that stands in for the whole set.
+   */
+  readonly setVersion20?: (ctx: Ax25SessionContext) => void;
+}
+
+/**
  * Thrown when an action verb fired through the dispatcher isn't handled by any
  * case arm. With well-typed data this is now unreachable: `ActionStep.verb` is
  * the closed {@link Ax25ActionVerb} union and the dispatcher's switch is
@@ -145,11 +212,28 @@ export class ActionDispatcher {
    */
   freezeT1V = false;
 
+  /**
+   * Management retry timer (TM201) duration in ms — armed by the MDL machine's
+   * `Start TM201` verb on each XID-command send (figc5.1/figc5.2, §C5.3). §C5.3
+   * gives no numeric default for TM201; it is the management analogue of the
+   * data-link T1, so it defaults to the same 3000 ms. Mirrors the C#
+   * `ActionDispatcher.Tm201Duration`. Only the MDL driver arms it.
+   */
+  tm201Ms = 3000;
+
+  private readonly mdl: MdlDispatcherHooks;
+
   constructor(
     _t1Ms: number,
     _t2Ms: number,
     private readonly t3Ms: number,
     private readonly onTimerExpiry: (name: TimerName) => void,
+    /**
+     * MDL (figc5.x) hooks — defaulted to no-ops / the data-link semantics so a
+     * data-link dispatcher built without them is unaffected. The
+     * {@link Ax25ManagementDataLink} driver supplies real callbacks.
+     */
+    mdl: MdlDispatcherHooks = {},
   ) {
     // T1's duration is now sourced from ctx.t1vMs on every arm — the
     // initial value is set on the context by the driver. The argument
@@ -161,6 +245,7 @@ export class ActionDispatcher {
     // action — so the constructor's T2 value is unused here. Kept for
     // constructor-shape symmetry with the C# dispatcher's T2Duration.
     void _t2Ms;
+    this.mdl = mdl;
   }
 
   /**
@@ -298,7 +383,16 @@ export class ActionDispatcher {
         return;
 
       // ─── Modulus / version selection ──────────────────────────────
-      case "set_version_2_0":           ctx.isExtended = false; return;
+      // set_version_2_0 is shared between the data-link figc4.6 FRMR fallback
+      // and the MDL figc5.2 FRMR (pre-v2.2 peer) path. Routed through the
+      // injectable setVersion20 hook: the data-link default clears isExtended
+      // only (its other v2.0 verbs run separately); the MDL driver overrides it
+      // to install the full §1436 v2.0 default set (the figc5.2 box stands in
+      // for the whole set). Mirrors ActionDispatcher.cs.
+      case "set_version_2_0":
+        if (this.mdl.setVersion20) this.mdl.setVersion20(ctx);
+        else ctx.isExtended = false;
+        return;
       case "Set Version 2.2":           ctx.isExtended = true;  return;
       case "Modulo := 8":               ctx.isExtended = false; return;
       case "Modulo := 128":             ctx.isExtended = true;  return;
@@ -495,7 +589,41 @@ export class ActionDispatcher {
       case "LM_data_request":           return;
 
       // ─── Internal-out signals ─────────────────────────────────────
-      case "MDL-NEGOTIATE Request":     return; // XID negotiation not implemented
+      // figc4.6's UA-received path raises MDL-NEGOTIATE Request after a v2.2
+      // connect; route it to the MDL driver (via the listener / harness hook)
+      // to open the XID exchange. Defaults to a no-op when no MDL is wired (the
+      // legacy "XID negotiation not implemented" behaviour). Mirrors C#'s
+      // sendInternal(new MdlNegotiateRequestSignal()).
+      case "MDL-NEGOTIATE Request":     this.mdl.onMdlNegotiateRequest?.(); return;
+
+      // ─── Management Data-Link (MDL, figc5.1/figc5.2) ───────────────
+      // These verbs are only ever emitted by the management_data_link machine,
+      // driven by Ax25ManagementDataLink. On a data-link dispatcher the MDL
+      // hooks default to no-ops / the bare timer ops, so an accidental MDL verb
+      // in a data-link table is inert rather than a crash (it can't happen —
+      // the tables are disjoint). Mirrors the C# ActionDispatcher MDL arms.
+      //
+      // XID_command (signal_lower): build + send our XID *command* frame
+      // carrying the offered parameter set (§6.3.2). The U-frame factory path
+      // can't carry an info field through tx.pending, so it routes through the
+      // dedicated builder hook the MDL driver supplies.
+      case "XID_command":               this.mdl.sendXidCommand?.(tx); return;
+      // Start/Stop TM201 (figc5.x management retry timer, §C5.3). Armed on each
+      // XID-command send, cancelled when negotiation completes; expiry routes
+      // through onTimerExpiry("TM201") like the data-link timers, which the MDL
+      // driver maps to a TM201_expiry event.
+      case "Start TM201":               sched.arm("TM201", this.tm201Ms, () => this.onTimerExpiry("TM201")); return;
+      case "Stop TM201":                sched.cancel("TM201"); return;
+      // Apply Negotiated Parameters (figc5.2, subroutine placeholder): the
+      // §6.3.2 reverts-to merge. The MDL driver supplies the real merge
+      // (XidNegotiator.applyNegotiated); default is a no-op.
+      case "Apply Negotiated Parameters": this.mdl.applyNegotiatedParameters?.(tx); return;
+      // MDL → Layer 3 primitives (figc5.x, §5.1 / §C5.3).
+      case "MDL_NEGOTIATE_confirm":     this.mdl.sendMdl?.({ type: "MDL_NEGOTIATE_confirm" }); return;
+      case "MDL_ERROR_indicate_B":      this.mdl.sendMdl?.({ type: "MDL_ERROR_indicate", code: "B" }); return;
+      case "MDL_ERROR_indicate_C":      this.mdl.sendMdl?.({ type: "MDL_ERROR_indicate", code: "C" }); return;
+      case "MDL_ERROR_indicate_D":      this.mdl.sendMdl?.({ type: "MDL_ERROR_indicate", code: "D" }); return;
+
       case "push_frame_on_queue":
       case "Push on I Frame Queue":
       case "Push on I Frame Queue (note: word order?)":

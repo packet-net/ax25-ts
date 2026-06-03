@@ -5,6 +5,8 @@ import {
   DataLinkConnected,
   DataLinkDisconnected,
   DataLinkTimerRecovery,
+  ManagementDataLinkNegotiating,
+  ManagementDataLinkReady,
   type StatePage,
   type TransitionSpec,
 } from "ax25sdl";
@@ -12,6 +14,7 @@ import type { Ax25Frame } from "../frame.js";
 import {
   ActionDispatcher,
   type DataLinkSignal,
+  type MdlDispatcherHooks,
   type PendingFrame,
   type TransitionContext,
 } from "./action-dispatcher.js";
@@ -44,6 +47,22 @@ const STATE_PAGES: Record<string, StatePage> = {
   AwaitingRelease: DataLinkAwaitingRelease,
   Connected: DataLinkConnected,
   TimerRecovery: DataLinkTimerRecovery,
+};
+
+/**
+ * The management data-link (MDL) machine's state pages (ax25sdl 0.9.0+,
+ * figc5.1 `Ready` / figc5.2 `Negotiating`). The TS codegen exports these as
+ * `ManagementDataLinkReady` / `ManagementDataLinkNegotiating` (the C# runtime's
+ * `ManagementDataLink_Ready` / `_Negotiating`). Passed to
+ * {@link SdlSessionDriver} via its `statePages` option by
+ * {@link Ax25ManagementDataLink}, so the 2-state MDL FSM runs through the same
+ * driver/dispatcher/guard machinery the data-link uses rather than a second
+ * interpreter. Keyed by the SDL state name (the `next` targets are `Ready` /
+ * `Negotiating`).
+ */
+export const MDL_STATE_PAGES: Record<string, StatePage> = {
+  Ready: ManagementDataLinkReady,
+  Negotiating: ManagementDataLinkNegotiating,
 };
 
 /**
@@ -80,6 +99,26 @@ export interface SessionDriverHooks {
    * the caller-supplied t1Ms. See {@link ActionDispatcher.freezeT1V}.
    */
   readonly freezeT1V?: boolean;
+  /**
+   * MDL (figc5.x) dispatcher hooks, supplied by {@link Ax25ManagementDataLink}
+   * when this driver runs the management data-link machine. Inert on a
+   * data-link driver (the data-link tables never emit the MDL verbs). See
+   * {@link MdlDispatcherHooks}.
+   */
+  readonly mdl?: MdlDispatcherHooks;
+  /**
+   * Extra guard bindings merged over the standard {@link createSessionBindings}
+   * table — e.g. the MDL driver's `RC_eq_NM201` (figc5.2 retry-limit diamond),
+   * which reads RC vs NM201 (NM201 lives in the MDL context's N2). Mirrors the
+   * C# `Ax25ManagementDataLink` adding `RC_eq_NM201` over the default binding
+   * table.
+   */
+  readonly extraBindings?: ReadonlyMap<string, () => boolean>;
+  /**
+   * TM201 (management retry timer) duration in ms. Only the MDL driver sets it;
+   * defaults to the dispatcher's 3000 ms. See {@link ActionDispatcher.tm201Ms}.
+   */
+  readonly tm201Ms?: number;
 }
 
 /**
@@ -107,23 +146,33 @@ export class SdlSessionDriver {
   private readonly subroutines: SubroutineRegistry;
   private readonly hooks: SessionDriverHooks;
   private readonly pendingEvents: Ax25Event[] = [];
+  /**
+   * The state→page map this driver walks. Defaults to the data-link
+   * {@link STATE_PAGES}; the MDL driver passes {@link MDL_STATE_PAGES} so the
+   * same driver/dispatcher/guard machinery runs the 2-state management FSM.
+   */
+  private readonly statePages: Record<string, StatePage>;
 
   constructor(
     context: Ax25SessionContext,
     private readonly scheduler: TimerScheduler,
     hooks: SessionDriverHooks,
     initialState = "Disconnected",
+    statePages: Record<string, StatePage> = STATE_PAGES,
   ) {
     this.context = context;
     this.state = initialState;
     this.hooks = hooks;
+    this.statePages = statePages;
     this.subroutines = hooks.subroutines ?? new DefaultSubroutineRegistry();
 
-    const bindings = createSessionBindings(
-      context,
-      scheduler,
-      () => this.currentTrigger,
+    const bindings = new Map(
+      createSessionBindings(context, scheduler, () => this.currentTrigger),
     );
+    // Merge any caller-supplied extra bindings (the MDL driver's RC_eq_NM201).
+    if (hooks.extraBindings) {
+      for (const [key, value] of hooks.extraBindings) bindings.set(key, value);
+    }
     this.guards = new GuardEvaluator(bindings);
 
     this.dispatcher = new ActionDispatcher(
@@ -131,8 +180,10 @@ export class SdlSessionDriver {
       hooks.t2Ms ?? 1500,
       hooks.t3Ms ?? 30000,
       (name: TimerName) => this.onTimerExpiry(name),
+      hooks.mdl ?? {},
     );
     if (hooks.freezeT1V) this.dispatcher.freezeT1V = true;
+    if (hooks.tm201Ms !== undefined) this.dispatcher.tm201Ms = hooks.tm201Ms;
 
     // Upgrade the default registry's no-op subroutine stubs to figc4.7 table
     // walkers now that the dispatcher + guards exist. A caller-supplied
@@ -158,9 +209,9 @@ export class SdlSessionDriver {
 
   /** Force the state machine into a specific state. Used at session creation. */
   setState(state: string): void {
-    if (!STATE_PAGES[state]) {
+    if (!this.statePages[state]) {
       throw new Error(
-        `unknown SDL state '${state}'. Known: ${Object.keys(STATE_PAGES).join(", ")}.`,
+        `unknown SDL state '${state}'. Known: ${Object.keys(this.statePages).join(", ")}.`,
       );
     }
     this.state = state;
@@ -186,7 +237,7 @@ export class SdlSessionDriver {
   }
 
   private dispatchOne(event: Ax25Event): void {
-    const page = STATE_PAGES[this.state];
+    const page = this.statePages[this.state];
     if (!page) {
       throw new Error(`no SDL page for current state '${this.state}'`);
     }

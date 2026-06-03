@@ -4,9 +4,11 @@ import {
   classify,
   decodeFrame,
   encodeFrame,
+  isCommand as frameIsCommand,
 } from "./frame.js";
 import type { DataLinkSignal } from "./sdl/action-dispatcher.js";
 import type { Ax25Event } from "./sdl/events.js";
+import { Ax25ManagementDataLink } from "./sdl/management-data-link.js";
 import {
   type Ax25SessionContext,
   createSessionContext,
@@ -223,6 +225,15 @@ interface CachedSession {
   readonly scheduler: TimerScheduler;
   /** Queue of DL signals seen by this cached session, for ConnectAsync to await. */
   readonly signals: DataLinkSignal[];
+  /**
+   * The session's management data-link (MDL) driver — runs the XID
+   * parameter-negotiation FSM. Started by the data-link's MDL-NEGOTIATE Request
+   * poke (raised after the UA on a v2.2 connect); inbound XID-response /
+   * FRMR-of-XID frames are routed here while it is negotiating. Negotiated
+   * parameters land back on the session's context. Mirrors the C# listener's
+   * `CachedSession.Mdl`.
+   */
+  readonly mdl: Ax25ManagementDataLink;
 }
 
 /**
@@ -485,6 +496,34 @@ export class Ax25Listener {
       // ReparseAtSessionModulo).
       const parsed = reparseAtSessionModulo(routed, bytes, cached.session.context);
       const kind = classify(parsed);
+
+      // XID / FRMR-of-XID routing — these belong to the MDL machine, not the
+      // data-link session (the data-link Connected state has no XID handler,
+      // and would FRMR-handle a FRMR as a full link reset):
+      //
+      //   • XID *command*            → we are the responder: build + send the
+      //     XID response (the un-transcribed figc5.1 responder path).
+      //   • XID *response* while negotiating → we are the initiator: figc5.2
+      //     applies the negotiated parameters.
+      //   • FRMR while negotiating   → figc5.2 §6.3.2 ¶1 v2.0 fallback.
+      //
+      // Outside those, frames fall through to the data-link session unchanged
+      // (e.g. a stray XID response with no negotiation → the data-link
+      // catch-all; a real FRMR on an established link → data-link FRMR
+      // handling). C/R-bit disambiguated. Mirrors C#'s DispatchInbound routing.
+      if (kind === "XID" && frameIsCommand(parsed)) {
+        cached.mdl.respondToXidCommand(parsed);
+        return;
+      }
+      if (cached.mdl.isNegotiating && kind === "XID") {
+        cached.mdl.onXidReceived(parsed);
+        return;
+      }
+      if (cached.mdl.isNegotiating && kind === "FRMR") {
+        cached.mdl.onFrmrReceived(parsed);
+        return;
+      }
+
       const event = mapKindToEvent(parsed, kind);
       if (event === null) return; // unknown — drop
       const stateBefore: string = cached.session.state;
@@ -581,6 +620,15 @@ export class Ax25Listener {
       sessionRef?._raiseDataLinkSignal(sig);
     };
 
+    // The session's MDL driver shares the session's scheduler (TM201 is a
+    // distinct timer name, so it doesn't collide with T1/T2/T3) and the same
+    // wire sink. Built before the data-link driver so the data-link's
+    // MDL-NEGOTIATE Request poke (raised by figc4.6 after the UA on a v2.2
+    // connect) can route straight into it. Negotiated parameters mutate this
+    // session's context (ctx) — the same context the data-link runs on. Mirrors
+    // the C# listener's `new Ax25ManagementDataLink(ctx, scheduler, SendBytes)`.
+    const mdl = new Ax25ManagementDataLink(ctx, scheduler, sendFrame);
+
     const driver = new SdlSessionDriver(
       ctx,
       scheduler,
@@ -599,13 +647,17 @@ export class Ax25Listener {
         // so we mustn't let the SDL's `T1V := 2 * SRT` overwrite the
         // initial value the caller asked for).
         freezeT1V: this.options.t1Ms !== undefined,
+        // The figc4.6 UA-received path raises MDL-NEGOTIATE Request after a
+        // successful v2.2 connect; hand it to the MDL driver to open the XID
+        // exchange. Mirrors C#'s sendInternal routing to mdl.Negotiate().
+        mdl: { onMdlNegotiateRequest: () => mdl.negotiate() },
       },
       "Disconnected",
     );
 
     const session = new Ax25ListenerSession(driver);
     sessionRef = session;
-    return { session, driver, scheduler, signals };
+    return { session, driver, scheduler, signals, mdl };
   }
 
   private addToCache(peer: Callsign, built: CachedSession): void {
