@@ -320,6 +320,25 @@ export class ActionDispatcher {
       verb = "N(r) := V(r)";
     }
 
+    // Quirk ax25Spec47TimerRecoveryDrainAdvancesVR (default on): figc4.5's
+    // in-sequence I_received stored-frame drain loop body draws
+    // `V(r) := V(r) - 1`, where the structurally-identical figc4.4 (Connected)
+    // handler uses `V(r) := V(r) + 1`. The drain must ADVANCE V(R) past each
+    // consecutively-stored (SREJ-gap-filled) frame it delivers; the decrement
+    // leaves V(R) under-advanced, so the peer's next genuine window retransmit
+    // is re-accepted and re-delivered and the link fails to converge
+    // (packethacking/ax25spec#47; direwolf's dl_data_indication drain advances
+    // vr). The verb `V(r) := V(r) - 1` appears ONLY in these three figc4.5 drain
+    // loops, so rewriting it to `V(r) := V(r) + 1` is precisely scoped — no
+    // trigger gate needed. Remove once ax25sdl ships a corrected figc4.5. Mirrors
+    // the C# ActionDispatcher.Execute interception (m0lte/packet.net#286).
+    if (
+      ctx.quirks.ax25Spec47TimerRecoveryDrainAdvancesVR &&
+      verb === "V(r) := V(r) - 1"
+    ) {
+      verb = "V(r) := V(r) + 1";
+    }
+
     switch (verb) {
       // ─── Flag mutations ────────────────────────────────────────────
       case "Set Own Receiver Busy":     ctx.ownReceiverBusy = true; return;
@@ -462,9 +481,12 @@ export class ActionDispatcher {
       case "V(s) := V(s) + 1":          ctx.vs = incrementSeq(ctx, ctx.vs); return;
       case "V(r) := 0":                 ctx.vr = 0; return;
       case "V(r) := V(r) + 1":          ctx.vr = incrementSeq(ctx, ctx.vr); return;
-      // figc4.5 Timer Recovery draws the stored-frame drain with V(r) := V(r) - 1.
-      // Surprising for a drain; flagged upstream for spec-author review
-      // (ax25sdl#49). Encoded faithfully pending that.
+      // figc4.5 Timer Recovery draws the stored-frame drain with V(r) := V(r) - 1,
+      // a confirmed figure defect (packethacking/ax25spec#47): figc4.4's
+      // structurally-identical drain uses V(r) := V(r) + 1, so the drain must
+      // ADVANCE V(R). The ax25Spec47TimerRecoveryDrainAdvancesVR quirk (default on)
+      // rewrites this verb to "V(r) := V(r) + 1" before reaching this switch, so
+      // this faithful-decrement arm runs only under strictlyFaithfulSessionQuirks.
       case "V(r) := V(r) - 1":          ctx.vr = decrementSeq(ctx, ctx.vr); return;
       case "V(a) := 0":                 ctx.va = 0; return;
       case "RC := 0":                   ctx.rc = 0; return;

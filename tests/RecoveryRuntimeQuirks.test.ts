@@ -7,9 +7,11 @@
  *   2. `ax25Spec40DiscardOutOfWindowIFrames` — receive-window discard guard.
  *   3. `ax25Spec41KarnSrtSampling` — Karn's-algorithm SRT-sample gate.
  *   4. `ax25Spec42SrejTargetsGap` — retarget the SREJ to the missing gap.
+ *   5. `ax25Spec47TimerRecoveryDrainAdvancesVR` — figc4.5 stored-frame drain
+ *      advances V(R) (rewrite `V(r) := V(r) - 1` → `V(r) := V(r) + 1`).
  *
  * TS ports of packet.net's `DataLinkConnectedRetransmitTests` +
- * `Ax25SessionQuirksTests` (m0lte/packet.net #232/#241/#242/#246).
+ * `Ax25SessionQuirksTests` (m0lte/packet.net #232/#241/#242/#246/#286).
  */
 import { describe, expect, it } from "vitest";
 import { Callsign } from "../src/callsign.js";
@@ -335,5 +337,44 @@ describe("ax25Spec41KarnSrtSampling quirk (packet.net#241)", () => {
     run({ name: "T1_expiry" }, [{ verb: SRT_VERB }]);
     expect(ctx.t1HadExpired).toBe(false);
     expect(ctx.t1RemainingWhenLastStoppedMs).toBe(0);
+  });
+});
+
+describe("ax25Spec47TimerRecoveryDrainAdvancesVR quirk (packet.net#286)", () => {
+  const local = Callsign.parse("M0LTEA");
+  const remote = Callsign.parse("M0LTEB");
+
+  // The drain verb is unique to the three figc4.5 (Timer Recovery) stored-frame
+  // drain loops; the rewrite fires on the verb alone (no trigger gate), so an
+  // I_received trigger faithfully stands in for the drain context.
+  const drainEvent = (): Ax25Event => iReceived(local, remote, 0, 0);
+
+  it("on (default): V(r) := V(r) - 1 is rewritten to advance V(R) (figc4.4 parity)", () => {
+    const ctx = createSessionContext(local, remote);
+    ctx.quirks = { ...defaultSessionQuirks };
+    ctx.vr = 1; // pre-loop increment already moved V(r) to 1
+    newRig(ctx).run(drainEvent(), [{ verb: "V(r) := V(r) - 1" }]);
+    // The drain must ADVANCE past the just-delivered stored frame: 1 → 2, not 1 → 0.
+    expect(ctx.vr).toBe(2);
+  });
+
+  it("off (strictly faithful): V(r) := V(r) - 1 runs as drawn and decrements V(R)", () => {
+    const ctx = createSessionContext(local, remote);
+    ctx.quirks = { ...strictlyFaithfulSessionQuirks };
+    ctx.vr = 1;
+    newRig(ctx).run(drainEvent(), [{ verb: "V(r) := V(r) - 1" }]);
+    // Figure as drawn: the decrement cancels the pre-loop increment (1 → 0), the
+    // defect that leaves V(R) under-advanced. (mod-8 wrap: decrementSeq(0-base).)
+    expect(ctx.vr).toBe(0);
+  });
+
+  it("on: the rewrite is inert for V(r) := V(r) + 1 (already correct) and other verbs", () => {
+    const ctx = createSessionContext(local, remote);
+    ctx.quirks = { ...defaultSessionQuirks };
+    ctx.vr = 1;
+    // figc4.4's drain already uses +1 — the rewrite must leave it (and any other
+    // V(r) assignment) untouched, advancing exactly once.
+    newRig(ctx).run(drainEvent(), [{ verb: "V(r) := V(r) + 1" }]);
+    expect(ctx.vr).toBe(2);
   });
 });
