@@ -141,6 +141,12 @@ export class Endpoint {
   readonly submitted: Uint8Array[] = [];
   /** Payloads this station delivered upward (DL-DATA-indication), in order. */
   readonly delivered: Uint8Array[] = [];
+  /** Layer-3 PIDs this station delivered upward (DL-DATA-indication), in order
+   * — paired one-to-one with {@link delivered}. For a reassembled series this
+   * reflects the §6.6 reassembly's recovered PID (the original L3 PID under the
+   * default inner-PID format; `PID_NO_LAYER_3` under the figure-literal
+   * strictlyFaithful format). Mirrors `Endpoint.DeliveredPids`. */
+  readonly deliveredPids: number[] = [];
   /** Inbound event queue — frames classified from the wire, pumped by settle. */
   readonly inbound: Ax25Event[] = [];
   /** Every frame this station received from its peer (post round-trip through
@@ -457,16 +463,16 @@ export class TwoStationHarness {
 
   /**
    * Submit one (possibly > N1) upper-layer payload through the §6.6
-   * segmentation shim at `from`. Records the WHOLE payload as a single logical
-   * submission (so the oracle expects one reassembled delivery), then posts each
-   * segment-request the shim produces as its own I-frame. With the segmenter
-   * disabled this posts a single un-segmented request (and throws if the payload
-   * exceeds N1, per the shim's strict reject). Mirrors the C#
-   * `TwoStationHarness.SubmitLarge`.
+   * segmentation shim at `from`, carrying Layer-3 PID `pid`. Records the WHOLE
+   * payload as a single logical submission (so the oracle expects one
+   * reassembled delivery), then posts each segment-request the shim produces as
+   * its own I-frame. With the segmenter disabled this posts a single
+   * un-segmented request (and throws if the payload exceeds N1, per the shim's
+   * strict reject). Mirrors the C# `TwoStationHarness.SubmitLarge`.
    */
-  submitLarge(from: Endpoint, payload: Uint8Array): void {
+  submitLarge(from: Endpoint, payload: Uint8Array, pid: number = 0xf0): void {
     from.submitted.push(payload);
-    for (const request of from.segmentation.buildSendRequests(payload)) {
+    for (const request of from.segmentation.buildSendRequests(payload, pid)) {
       from.driver.postEvent(request);
     }
     this.pumpToQuiescence();
@@ -828,6 +834,7 @@ function buildEndpoint(
         sig.type === "DL_UNIT_DATA_indication"
       ) {
         endpoint.delivered.push(sig.data);
+        endpoint.deliveredPids.push(sig.pid);
       }
     },
     onTransitionFired,

@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import { Callsign } from "../src/callsign.js";
 import {
   type Ax25Frame,
+  PID_NET_ROM,
   PID_NO_LAYER_3,
   PID_SEGMENTED,
   classify,
@@ -20,7 +21,9 @@ import {
   Ax25Listener,
   type Ax25ListenerSession,
 } from "../src/listener.js";
+import { SEGMENT_FIRST_BIT } from "../src/sdl/segmenter.js";
 import type { Ax25SessionContext } from "../src/sdl/session-context.js";
+import { strictlyFaithfulSessionQuirks } from "../src/sdl/session-quirks.js";
 import {
   LoopbackTransport,
   waitFor,
@@ -68,7 +71,8 @@ describe("Ax25Listener — segmentation seam", () => {
     const ua = transport.sentFrames.count; // frames already sent (the UA)
     const payload = Uint8Array.from({ length: 300 }, (_, i) => i & 0xff); // 5 segments at N1=64
 
-    listener.sendData(session, payload);
+    // A non-default L3 PID so we can see it carried as the first-segment inner PID.
+    listener.sendData(session, payload, PID_NET_ROM);
 
     // Five I-frames, each carrying PID 0x08, should hit the modem.
     await transport.sentFrames.waitForCount(ua + 5, 2000);
@@ -78,6 +82,44 @@ describe("Ax25Listener — segmentation seam", () => {
     expect(frames.length).toBe(5);
     expect(frames.every((f) => classify(f) === "I")).toBe(true); // each segment is a normal I-frame
     expect(frames.every((f) => f.pid === PID_SEGMENTED)).toBe(true); // PID 0x08 on every segment
+
+    // Default quirk (segmentFirstCarriesL3Pid on): the FIRST segment's info
+    // field is [F/X = First|count][inner-PID = original L3 PID][data…]. So the
+    // first segment's second info octet is the original L3 PID.
+    const firstInfo = frames[0].info;
+    expect(firstInfo[0] & SEGMENT_FIRST_BIT).not.toBe(0); // segment 0 must be the First segment
+    expect(firstInfo[1]).toBe(PID_NET_ROM); // inner-PID octet = original L3 PID (Dire Wolf's default format)
+
+    await listener.dispose();
+  });
+
+  it("sendData under strictlyFaithful emits the figure-literal format without an inner PID", async () => {
+    const { listener, transport, session } = await acceptedSession((ctx) => {
+      ctx.n1 = 64;
+      ctx.k = 16;
+      ctx.segmenterReassemblerEnabled = true;
+      ctx.quirks = strictlyFaithfulSessionQuirks;
+    });
+
+    const ua = transport.sentFrames.count;
+    // payload[0] = 0, distinct from PID_NET_ROM (0xCF), so we can tell the first
+    // segment's second octet is payload, not an inner PID.
+    const payload = Uint8Array.from({ length: 300 }, (_, i) => i & 0xff);
+
+    listener.sendData(session, payload, PID_NET_ROM);
+
+    await transport.sentFrames.waitForCount(ua + 5, 2000);
+    const frames: Ax25Frame[] = [];
+    for (let i = ua; i < ua + 5; i++) frames.push(transport.decodedSent(i));
+
+    // Figure-literal: 300 bytes / (N1-1=63) = 5 segments (no inner-PID octet
+    // stealing a slot).
+    expect(frames.length).toBe(5);
+    expect(frames.every((f) => f.pid === PID_SEGMENTED)).toBe(true);
+
+    const firstInfo = frames[0].info;
+    expect(firstInfo[0] & SEGMENT_FIRST_BIT).not.toBe(0); // segment 0 must be the First segment
+    expect(firstInfo[1]).toBe(0); // figure-literal: byte after F/X is the first PAYLOAD byte, not an inner PID
 
     await listener.dispose();
   });
