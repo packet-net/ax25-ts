@@ -111,6 +111,7 @@ To roll your own, implement `Ax25Transport` and pass it to `new Ax25Stack(yourTr
 - **Inbound listener** — `Ax25Listener` accepts inbound SABM, fires `sessionAccepted`, caches per-peer sessions with LRU eviction, mirrors AX.25 §C.2 path reversal on responses.
 - **figc4.7 subroutine walker** — `Enquiry_Response` / `Select_T1` / `Check_I_Frame_Acknowledged` etc. execute their SDL paths through the dispatcher. With LM-SEIZE granted immediately (contention-free single session), the figc4.4 delayed-ack RR flushes, so connected-mode data transfer **converges** (V(s) → V(a), windows reopen).
 - **Loss recovery (REJ + SREJ)** — timeout-driven go-back-N (`Transmit_Enquiry` → `Invoke_Retransmission`) and single-frame selective reject over a **real SREJ frame on the wire**, with the SREJ recovery quirks (`ax25Spec40` window guard, `ax25Spec41` Karn SRT guard, `ax25Spec42` SREJ-targets-the-gap). The generative loss-recovery conformance suite drives single-drop and bidirectional-burst loss across both modes and asserts convergence (windows empty + complete in-order delivery).
+- **NET/ROM read-only "node aware"** — `NetRomService` taps `Ax25Listener`'s pre-address-filter frame trace to hear NODES routing broadcasts (UI, PID 0xCF, dest `NODES`), parses them (`parseNodesBroadcast`), and maintains a `NetRomRoutingTable` (multiplicative per-hop quality decay, ≤ 3 routes/destination best-first, OBSINIT/obsolescence sweep, trivial-loop guard, MINQUAL floor, table caps) surfaced as an immutable snapshot. Strictly read-only — **no TX, no L4 circuits, no NODES origination** — and hand-written, not SDL-derived (NET/ROM has no SDL figures; BPQ is the de-facto reference, an interop target, not truth). Divergences are named `NetRomParseOptions` flags with `NETROM_PARSE_STRICT` / `Lenient` / `Bpq` / `Xrouter` presets. Parity with [`m0lte/packet.net`'s `Packet.NetRom`](https://github.com/m0lte/packet.net/tree/main/src/Packet.NetRom) ([packet.net#303](https://github.com/m0lte/packet.net/pull/303)). See "Hearing NET/ROM NODES broadcasts" below.
 
 ### Out (deliberate — planned for later)
 
@@ -123,6 +124,43 @@ To roll your own, implement `Ax25Transport` and pass it to `new Ax25Stack(yourTr
 | AGW client / server | Not implemented (the [`Packet.Agw`](https://github.com/m0lte/packet.net/tree/main/src/Packet.Agw) .NET package has the working reference impl) | post-v0.1 |
 | Audio modem transport (browser-side AFSK) | Not implemented | post-v0.1 |
 | XID negotiation | Not implemented — defaults used (mod-8); SREJ is supported when `srejEnabled` is set on the session context | post-v0.1 |
+
+## Hearing NET/ROM NODES broadcasts
+
+`NetRomService` makes a node NET/ROM-*aware*: it taps `Ax25Listener`'s frame trace (which fires for every inbound frame **before** address filtering, so NODES broadcasts addressed to the literal callsign `NODES` are heard even though they aren't addressed to you), parses them, and builds a routing table. It is **read-only** — it never transmits, never opens a circuit, never originates a NODES broadcast, and can't disturb a live session.
+
+```ts
+import {
+  Ax25Listener,
+  Callsign,
+  NetRomService,
+} from "@packet-net/ax25";
+import { TcpKissTransport } from "@packet-net/ax25/tcp-transport";
+
+const transport = new TcpKissTransport("127.0.0.1", 8100, { kissPort: 0 });
+const listener = new Ax25Listener(transport, { myCall: "M0LTE-1" });
+
+const netrom = new NetRomService(); // enabled by default; read-only
+netrom.attachPort("vhf", Callsign.parse("M0LTE-1"), listener);
+
+await listener.start();
+
+// Age routes out on the canonical hourly NODES interval (the library carries no
+// ambient timer — you drive the obsolescence sweep):
+setInterval(() => netrom.sweep(), 3600_000);
+
+// Read the learned topology at any time — the analogue of a node's `NODES` cmd:
+const snap = netrom.snapshot();
+for (const n of snap.neighbours) {
+  console.log(`neighbour ${n.alias || n.neighbour} on ${n.portId} q${n.pathQuality}`);
+}
+for (const d of snap.destinations) {
+  const best = d.bestRoute;
+  console.log(`${d.alias || d.destination}: via ${best?.neighbour} q${best?.quality}`);
+}
+```
+
+Worked example at [`examples/netrom-aware.ts`](examples/netrom-aware.ts). Divergences from the canonical wire format are named `NetRomParseOptions` flags (`NETROM_PARSE_STRICT` / `NETROM_PARSE_LENIENT` / `NETROM_PARSE_BPQ` / `NETROM_PARSE_XROUTER`), passed via `new NetRomService({ parse, routing })`; the default ingest is lenient. Full L4 circuits, originating NODES, and `connect <alias>` routing are deliberately out of scope (they're the C# side's Phase-9 body too).
 
 ## Browser compatibility
 
@@ -143,6 +181,12 @@ src/
 ├── tcp-transport.ts           KISS over TCP (Node-only)
 ├── session.ts                 Public Ax25Stack / Ax25Session — outbound facade
 ├── listener.ts                Ax25Listener — inbound-accepting node coordinator
+├── netrom/                    NET/ROM read-only "node aware" slice (no TX)
+│   ├── nodes-broadcast.ts        NODES wire codec + NetRomParseOptions presets
+│   ├── callsign.ts               shifted-callsign + alias field decoders
+│   ├── quality.ts                multiplicative per-hop quality decay
+│   ├── routing-table.ts          NetRomRoutingTable + model + options
+│   └── service.ts                NetRomService — the frame-trace tap + snapshot API
 └── sdl/                       Table-walking session engine
     ├── events.ts                  Ax25Event variants
     ├── timer-scheduler.ts         T1/T2/T3 arming

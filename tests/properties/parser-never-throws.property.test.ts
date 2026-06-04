@@ -34,6 +34,13 @@ import {
   requiredBytes,
 } from "../../src/frame.js";
 import { KissDecoder, encodeKiss } from "../../src/kiss.js";
+import {
+  NETROM_PARSE_LENIENT,
+  NETROM_PARSE_STRICT,
+  NODES_MAX_ENTRIES_PER_FRAME,
+  NODES_SIGNATURE,
+  parseNodesBroadcast,
+} from "../../src/netrom/index.js";
 import { frameArb } from "./arbitraries.js";
 
 const RUNS = 3000;
@@ -203,4 +210,52 @@ describe("property: well-formed KISS frames always round-trip", () => {
       { numRuns: RUNS },
     );
   });
+});
+
+// NET/ROM NODES-broadcast parser totality — the TS analogue of the C#
+// `NodesBroadcastParseTests` random-garbage + short-input totality cases, lifted
+// into the property suite. parseNodesBroadcast is *read-only ingest of
+// third-party broadcasts*, so it must NEVER throw on any byte sequence (it
+// returns null on malformed input), and any broadcast it *does* accept must be
+// structurally well-formed under both presets.
+describe("property: parseNodesBroadcast never throws and yields well-formed broadcasts", () => {
+  /** Bytes that often *look* like a NODES info field: a 0xFF signature, a
+   * 6-byte alias region, then a run of near-21-byte entries, plus stray
+   * trailing bytes — biased to reach the entry-parse + trailing-remainder
+   * branches rather than bouncing off the signature gate. */
+  const nodesLikeBytesArb: fc.Arbitrary<Uint8Array> = fc
+    .record({
+      sig: fc.constantFrom(NODES_SIGNATURE, 0x00, 0xfe),
+      alias: fc.uint8Array({ minLength: 0, maxLength: 6 }),
+      body: fc.uint8Array({ minLength: 0, maxLength: 21 * 14 }),
+    })
+    .map(({ sig, alias, body }) => Uint8Array.from([sig, ...alias, ...body]));
+
+  for (const [label, arb] of [
+    ["pure-random bytes", rawBytesArb],
+    ["NODES-shaped bytes", nodesLikeBytesArb],
+  ] as const) {
+    for (const [presetLabel, options] of [
+      ["lenient", NETROM_PARSE_LENIENT],
+      ["strict", NETROM_PARSE_STRICT],
+    ] as const) {
+      it(`on ${label} [${presetLabel}]`, () => {
+        fc.assert(
+          fc.property(arb, (bytes) => {
+            const bc = parseNodesBroadcast(bytes, options);
+            if (bc === null) return; // a clean rejection is fine
+            // Accept path invariants.
+            expect(typeof bc.senderAlias).toBe("string");
+            expect(bc.entries.length).toBeLessThanOrEqual(NODES_MAX_ENTRIES_PER_FRAME);
+            for (const e of bc.entries) {
+              expect(typeof e.destinationAlias).toBe("string");
+              expect(e.bestQuality).toBeGreaterThanOrEqual(0);
+              expect(e.bestQuality).toBeLessThanOrEqual(255);
+            }
+          }),
+          { numRuns: RUNS },
+        );
+      });
+    }
+  }
 });
