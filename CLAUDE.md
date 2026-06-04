@@ -24,9 +24,9 @@ The AX.25 SDL state-machine tables come from the [`ax25sdl`](https://www.npmjs.c
 
 ### Integration tests live in packet.net's interop matrix
 
-`tests/integration/*` (notably `linbpq-via-netsim.test.ts`) dials the docker compose stack in [`m0lte/packet.net`](https://github.com/m0lte/packet.net) (LinBPQ + Xrouter + rax25 + netsim, 127.0.0.1:8100 KISS-TCP listener). That stack does not exist in this repo, so CI here runs only unit tests + typecheck + build. The integration step lives in `m0lte/packet.net`'s `interop.yml` job and consumes this package's published npm artefact.
+`tests/integration/*` (notably `linbpq-via-netsim.test.ts`) dials the docker compose stack in [`m0lte/packet.net`](https://github.com/m0lte/packet.net) (LinBPQ + Xrouter + rax25 + netsim, 127.0.0.1:8100 KISS-TCP listener). That stack does not exist in this repo, so CI here runs only unit tests + typecheck + build. The integration step lives in `m0lte/packet.net`'s `interop.yml` job, which **clones this repo's `main`** and runs `npm ci && npm run build && npm run test:integration` against that stack — it builds from source and does *not* consume the published `@packet-net/ax25` npm package.
 
-When you change `tests/integration/*`, the corresponding interop verification happens in `m0lte/packet.net` after this package is published.
+When you change `tests/integration/*`, the corresponding interop verification happens in `m0lte/packet.net` on its next interop run against your merged `main` — no publish required. (The published `@packet-net/ax25` npm artefact is for external/web consumers — the esm.sh pin, packet-term-web — not the interop matrix.)
 
 ### Self-hosted runners only
 
