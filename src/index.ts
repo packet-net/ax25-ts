@@ -200,3 +200,43 @@ export {
   encodeUnsignedXid,
   decodeUnsignedXid,
 } from "./xid.js";
+export {
+  // NET/ROM read-only "node aware" slice (parity with packet.net's Packet.NetRom):
+  // hear NODES broadcasts, build a routing table, surface a snapshot. Transmits
+  // nothing — pure consumer of the Ax25Listener frame-trace tap.
+  // wire
+  NODES_SIGNATURE,
+  NODES_DESTINATION,
+  NODES_MAX_ENTRIES_PER_FRAME,
+  NODES_ENTRY_ENCODED_LENGTH,
+  type NodesRoutingEntry,
+  type NodesBroadcast,
+  parseNodesBroadcast,
+  // parse options + presets
+  type NetRomParseOptions,
+  NETROM_PARSE_STRICT,
+  NETROM_PARSE_LENIENT,
+  NETROM_PARSE_BPQ,
+  NETROM_PARSE_XROUTER,
+  // callsign-field codecs
+  NETROM_SHIFTED_LENGTH,
+  NETROM_ALIAS_LENGTH,
+  tryReadShifted,
+  readAlias,
+  // quality
+  NETROM_QUALITY_MAX,
+  NETROM_QUALITY_MIN,
+  combineQuality,
+  // routing model + table
+  type NetRomRoutingOptions,
+  NETROM_ROUTING_DEFAULTS,
+  type NetRomRoute,
+  type NetRomDestination,
+  type NetRomNeighbour,
+  type NetRomRoutingSnapshot,
+  EMPTY_NETROM_SNAPSHOT,
+  NetRomRoutingTable,
+  // the node-level service (the read-only tap + public API)
+  type NetRomServiceOptions,
+  NetRomService,
+} from "./netrom/index.js";
