@@ -30,12 +30,46 @@ export {
 } from "./nodes-broadcast.js";
 
 export {
-  // callsign-field codecs
+  // callsign-field codecs (decode + encode)
   NETROM_SHIFTED_LENGTH,
   NETROM_ALIAS_LENGTH,
   tryReadShifted,
   readAlias,
+  writeShifted,
+  writeAlias,
 } from "./callsign.js";
+
+export {
+  // L4 transport header (5-octet) + opcode/flags closed sets
+  NetRomOpcode,
+  NetRomTransportFlags,
+  type NetRomTransportFlag,
+  type NetRomTransportHeader,
+  TRANSPORT_HEADER_ENCODED_LENGTH,
+  OPCODE_MASK,
+  FLAGS_MASK,
+  transportHeaderChoke,
+  transportHeaderNak,
+  transportHeaderMoreFollows,
+  transportHeaderOpcodeAndFlags,
+  writeTransportHeader,
+  encodeTransportHeader,
+  tryParseTransportHeader,
+} from "./transport-header.js";
+
+export {
+  // L4 Connect Request info field (15-octet) builder + parser
+  type ConnectRequestInfo,
+  CONNECT_REQUEST_INFO_LENGTH,
+  buildConnectRequestInfo,
+  tryParseConnectRequestInfo,
+} from "./connect-request-info.js";
+
+export {
+  // NODES-broadcast origination (L3 builder — counterpart to parseNodesBroadcast)
+  type NodesBroadcastEntry,
+  buildNodesBroadcast,
+} from "./nodes-broadcast-builder.js";
 
 export {
   // quality arithmetic

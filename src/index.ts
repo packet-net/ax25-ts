@@ -204,9 +204,12 @@ export {
   decodeUnsignedXid,
 } from "./xid.js";
 export {
-  // NET/ROM read-only "node aware" slice (parity with packet.net's Packet.NetRom):
-  // hear NODES broadcasts, build a routing table, surface a snapshot. Transmits
-  // nothing — pure consumer of the Ax25Listener frame-trace tap.
+  // NET/ROM "node aware" slice (parity with packet.net's Packet.NetRom): hear
+  // NODES broadcasts, build a routing table, surface a snapshot. The routing
+  // table / service path is a pure read-only consumer of the Ax25Listener tap;
+  // the wire codecs below additionally include the L4 / L3-origination *encoders*
+  // (transport header, Connect Request info, NODES builder) that later TX slices
+  // ride on.
   // wire
   NODES_SIGNATURE,
   NODES_DESTINATION,
@@ -221,11 +224,36 @@ export {
   NETROM_PARSE_LENIENT,
   NETROM_PARSE_BPQ,
   NETROM_PARSE_XROUTER,
-  // callsign-field codecs
+  // callsign-field codecs (decode + encode)
   NETROM_SHIFTED_LENGTH,
   NETROM_ALIAS_LENGTH,
   tryReadShifted,
   readAlias,
+  writeShifted,
+  writeAlias,
+  // L4 transport header (5-octet) + opcode/flags closed sets
+  NetRomOpcode,
+  NetRomTransportFlags,
+  type NetRomTransportFlag,
+  type NetRomTransportHeader,
+  TRANSPORT_HEADER_ENCODED_LENGTH,
+  OPCODE_MASK,
+  FLAGS_MASK,
+  transportHeaderChoke,
+  transportHeaderNak,
+  transportHeaderMoreFollows,
+  transportHeaderOpcodeAndFlags,
+  writeTransportHeader,
+  encodeTransportHeader,
+  tryParseTransportHeader,
+  // L4 Connect Request info field (15-octet) builder + parser
+  type ConnectRequestInfo,
+  CONNECT_REQUEST_INFO_LENGTH,
+  buildConnectRequestInfo,
+  tryParseConnectRequestInfo,
+  // NODES-broadcast origination (L3 builder — counterpart to parseNodesBroadcast)
+  type NodesBroadcastEntry,
+  buildNodesBroadcast,
   // quality
   NETROM_QUALITY_MAX,
   NETROM_QUALITY_MIN,
