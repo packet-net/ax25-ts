@@ -66,6 +66,51 @@ export {
 } from "./connect-request-info.js";
 
 export {
+  // L3 network header (15-octet) — origin/destination nodes + TTL
+  NETWORK_HEADER_ENCODED_LENGTH,
+  DEFAULT_TIME_TO_LIVE,
+  type NetRomNetworkHeader,
+  decrementedNetworkHeader,
+  writeNetworkHeader,
+  encodeNetworkHeader,
+  tryParseNetworkHeader,
+} from "./network-header.js";
+
+export {
+  // L3 datagram (network + transport + payload)
+  MAX_PAYLOAD,
+  PACKET_HEADER_LENGTH,
+  type NetRomPacket,
+  encodeNetRomPacket,
+  tryParseNetRomPacket,
+} from "./packet.js";
+
+export {
+  // L4 circuit FSM state + close reason (as-const value-unions)
+  NetRomCircuitState,
+  NetRomCircuitCloseReason,
+} from "./circuit-state.js";
+
+export {
+  // L4 circuit tunables
+  type NetRomCircuitOptions,
+  type ResolvedNetRomCircuitOptions,
+  NETROM_CIRCUIT_DEFAULTS,
+  resolveCircuitOptions,
+} from "./circuit-options.js";
+
+export {
+  // L4 virtual-circuit FSM (one end of a connection)
+  NetRomCircuit,
+} from "./circuit.js";
+
+export {
+  // L4 circuit table owner + inbound demux / accept-refuse
+  type IncomingCircuitEvent,
+  CircuitManager,
+} from "./circuit-manager.js";
+
+export {
   // NODES-broadcast origination (L3 builder — counterpart to parseNodesBroadcast)
   type NodesBroadcastEntry,
   buildNodesBroadcast,
