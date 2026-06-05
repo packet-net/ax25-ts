@@ -178,7 +178,9 @@ for (const d of snap.destinations) {
 }
 ```
 
-Worked example at [`examples/netrom-aware.ts`](examples/netrom-aware.ts). Divergences from the canonical wire format are named `NetRomParseOptions` flags (`NETROM_PARSE_STRICT` / `NETROM_PARSE_LENIENT` / `NETROM_PARSE_BPQ` / `NETROM_PARSE_XROUTER`), passed via `new NetRomService({ parse, routing })`; the default ingest is lenient. Full L4 circuits, originating NODES, and `connect <alias>` routing are deliberately out of scope (they're the C# side's Phase-9 body too).
+Worked example at [`examples/netrom-aware.ts`](examples/netrom-aware.ts). Divergences from the canonical wire format are named `NetRomParseOptions` flags (`NETROM_PARSE_STRICT` / `NETROM_PARSE_LENIENT` / `NETROM_PARSE_BPQ` / `NETROM_PARSE_XROUTER`), passed via `new NetRomService({ parse, routing })`; the default ingest is lenient.
+
+Beyond the read-only ingest, the module now also **originates** NODES (`NetRomOriginator`, the opt-in TX half) and routes **`connect <alias>`** end-to-end (`NetRomConnector`): given a destination alias or callsign it resolves the best route, opens a CONNECTED-mode AX.25 interlink (PID 0xCF) to the best neighbour, runs an L4 `NetRomCircuit` over it, and hands back a duplex `NetRomConnection` (`onData` / `write` / `onClosed` / `completion`) — reaching a node you have no direct RF path to, by name. Both are opt-in (`{ enabled: true }`) and embedder-driven (drive the originator's re-broadcast and the connector's circuit retransmits from your own `setInterval` — the library owns no ambient timers). L3 datagram *forwarding* (relaying a circuit a transit node is not an endpoint of) remains out of scope (the C# side's Phase-9 body too).
 
 ## Browser compatibility
 
@@ -201,12 +203,16 @@ src/
 ├── axudp-transport.ts         AX.25 over UDP / BPQAXIP (Node-only, FCS-always)
 ├── session.ts                 Public Ax25Stack / Ax25Session — outbound facade
 ├── listener.ts                Ax25Listener — inbound-accepting node coordinator
-├── netrom/                    NET/ROM read-only "node aware" slice (no TX)
+├── netrom/                    NET/ROM "node aware" slice (ingest + TX + L4 connect)
 │   ├── nodes-broadcast.ts        NODES wire codec + NetRomParseOptions presets
 │   ├── callsign.ts               shifted-callsign + alias field decoders
 │   ├── quality.ts                multiplicative per-hop quality decay
-│   ├── routing-table.ts          NetRomRoutingTable + model + options
-│   └── service.ts                NetRomService — the frame-trace tap + snapshot API
+│   ├── routing-table.ts          NetRomRoutingTable + model + resolveDestination
+│   ├── service.ts                NetRomService — the frame-trace tap + snapshot API
+│   ├── originator.ts             NetRomOriginator — the opt-in NODES TX half
+│   ├── circuit.ts                NetRomCircuit + CircuitManager — the L4 transport
+│   ├── connector.ts              NetRomConnector — connect <alias> → interlink + circuit
+│   └── connection.ts             NetRomConnection — duplex stream over an L4 circuit
 └── sdl/                       Table-walking session engine
     ├── events.ts                  Ax25Event variants
     ├── timer-scheduler.ts         T1/T2/T3 arming

@@ -162,6 +162,63 @@ export const EMPTY_NETROM_SNAPSHOT: NetRomRoutingSnapshot = {
   generatedAt: 0,
 };
 
+/**
+ * Resolve a connect target — an *alias* (e.g. `SOT`) or a *callsign* (e.g.
+ * `GB7SOT`, with or without SSID) — against a {@link NetRomRoutingSnapshot} to the
+ * known destination, or `null` if the table has no route to it. Alias match is
+ * preferred (the human-friendly name a user types) and case-insensitive; the
+ * callsign fallback is a case-insensitive text match. This is what
+ * `connect <alias>` consults to find the best next hop across the network.
+ *
+ * Mirrors `NetRomRoutingSnapshot.ResolveDestination` on the C# side. (The C# method
+ * lives on the snapshot record; the TS snapshot is a plain interface, so this is a
+ * free function over it — the project's "model is data, behaviour is functions"
+ * idiom, the same shape as the wire codecs.)
+ */
+export function resolveDestination(
+  snapshot: NetRomRoutingSnapshot,
+  aliasOrCallsign: string,
+): NetRomDestination | null {
+  const needle = aliasOrCallsign.trim();
+  if (needle === "") {
+    return null;
+  }
+  const upper = needle.toUpperCase();
+
+  // Prefer an exact alias match (case-insensitive).
+  for (const d of snapshot.destinations) {
+    if (d.alias !== "" && d.alias.toUpperCase() === upper) {
+      return d;
+    }
+  }
+  // Else a callsign match (case-insensitive text, e.g. GB7SOT or GB7SOT-2).
+  for (const d of snapshot.destinations) {
+    if (d.destination.toString().toUpperCase() === upper) {
+      return d;
+    }
+  }
+  return null;
+}
+
+/**
+ * The directly-heard neighbour entry for `neighbour` in `snapshot`, or `null` if it
+ * is not a known neighbour. Used to find the port an interlink to that neighbour
+ * should run on.
+ *
+ * Mirrors `NetRomRoutingSnapshot.NeighbourFor` on the C# side.
+ */
+export function neighbourFor(
+  snapshot: NetRomRoutingSnapshot,
+  neighbour: Callsign,
+): NetRomNeighbour | null {
+  for (const n of snapshot.neighbours) {
+    if (n.neighbour.equals(neighbour)) {
+      return n;
+    }
+  }
+  return null;
+}
+
 // ─── Mutable internal state (private to the table) ──────────────────────────
 
 interface RouteState {

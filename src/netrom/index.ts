@@ -133,6 +133,9 @@ export {
   type NetRomRoutingSnapshot,
   EMPTY_NETROM_SNAPSHOT,
   NetRomRoutingTable,
+  // alias/callsign + neighbour resolution over a snapshot (connect-routing helpers)
+  resolveDestination,
+  neighbourFor,
 } from "./routing-table.js";
 
 export {
@@ -149,3 +152,20 @@ export {
   type NetRomOriginatorOptions,
   NetRomOriginator,
 } from "./originator.js";
+
+export {
+  // L4 outbound connector — `connect <alias>` across the network: resolve the best
+  // route, open a CONNECTED-mode AX.25 interlink (PID 0xCF), run a NetRomCircuit over
+  // it end-to-end, and present the established circuit as a duplex connection.
+  type NetRomInterlinkListener,
+  type RoutingSnapshotSource,
+  type NetRomConnectorOptions,
+  NetRomNoRouteError,
+  NetRomConnector,
+} from "./connector.js";
+
+export {
+  // The duplex byte stream over an L4 circuit (the far side of connect <alias>, and
+  // the wrapper for an inbound circuit a remote opens to us).
+  NetRomConnection,
+} from "./connection.js";

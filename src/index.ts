@@ -290,6 +290,8 @@ export {
   type NetRomRoutingSnapshot,
   EMPTY_NETROM_SNAPSHOT,
   NetRomRoutingTable,
+  resolveDestination,
+  neighbourFor,
   // the node-level service (the read-only tap + public API)
   type NetRomServiceOptions,
   NetRomService,
@@ -298,4 +300,12 @@ export {
   type NetRomUiSender,
   type NetRomOriginatorOptions,
   NetRomOriginator,
+  // L4 outbound connector + the duplex connection it yields — `connect <alias>`
+  // across the network (open an interlink, run a circuit over it, present a stream).
+  type NetRomInterlinkListener,
+  type RoutingSnapshotSource,
+  type NetRomConnectorOptions,
+  NetRomNoRouteError,
+  NetRomConnector,
+  NetRomConnection,
 } from "./netrom/index.js";
