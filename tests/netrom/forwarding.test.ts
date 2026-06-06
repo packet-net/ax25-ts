@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { Callsign } from "../../src/callsign.js";
 import {
   decideForward,
+  ForwardMode,
   ForwardOutcome,
   type NetRomDestination,
   NetRomOpcode,
@@ -112,5 +113,58 @@ describe("decideForward — NET/ROM L3 forwarding decision", () => {
     const decision = decideForward(datagram(Source, Dest, 10), FromNbr, Me, routing, 25);
     expect(decision.outcome).toBe(ForwardOutcome.ForwardTo);
     expect(decision.nextHop?.equals(AltNbr)).toBe(true);
+  });
+
+  // ─── multi-route load-balancing (per-flow, quality-weighted) ──────────
+
+  // A datagram with a chosen flow key (FlowHash keys on the L3 origin + L4 circuit
+  // index/id; vary the index to make distinct flows).
+  function flow(origin: Callsign, dest: Callsign, ttl: number, circuitIndex: number): NetRomPacket {
+    return {
+      network: { origin, destination: dest, timeToLive: ttl },
+      transport: { circuitIndex, circuitId: 0, txSequence: 0, rxSequence: 0, opcode: NetRomOpcode.Information, flags: NetRomTransportFlags.None },
+      payload: new Uint8Array(0),
+    };
+  }
+
+  it("per-flow pins a circuit to one route regardless of TTL or sequence", () => {
+    const routing = routesTo(Dest, { neighbour: OnwardNbr, quality: 200 }, { neighbour: AltNbr, quality: 200 });
+    const a = decideForward(flow(Source, Dest, 20, 5), FromNbr, Me, routing, 25, ForwardMode.PerFlow);
+    const b = decideForward(flow(Source, Dest, 9, 5), FromNbr, Me, routing, 25, ForwardMode.PerFlow);
+    expect(a.outcome).toBe(ForwardOutcome.ForwardTo);
+    expect(a.nextHop?.equals(b.nextHop!)).toBe(true);
+  });
+
+  it("per-flow spreads distinct circuits across the kept routes", () => {
+    const routing = routesTo(Dest, { neighbour: OnwardNbr, quality: 200 }, { neighbour: AltNbr, quality: 200 });
+    const seen = new Set<string>();
+    for (let i = 0; i < 60; i++) {
+      const d = decideForward(flow(Source, Dest, 20, i), FromNbr, Me, routing, 25, ForwardMode.PerFlow);
+      seen.add(d.nextHop!.toString());
+    }
+    expect(seen.has(OnwardNbr.toString())).toBe(true);
+    expect(seen.has(AltNbr.toString())).toBe(true);
+  });
+
+  it("per-flow weights the spread by route quality", () => {
+    const routing = routesTo(Dest, { neighbour: OnwardNbr, quality: 200 }, { neighbour: AltNbr, quality: 100 });
+    let onward = 0;
+    let alt = 0;
+    for (let i = 0; i < 256; i++) {
+      const d = decideForward(flow(Source, Dest, 20, i), FromNbr, Me, routing, 25, ForwardMode.PerFlow);
+      if (d.nextHop?.equals(OnwardNbr)) onward++;
+      else if (d.nextHop?.equals(AltNbr)) alt++;
+    }
+    expect(onward).toBeGreaterThan(0);
+    expect(alt).toBeGreaterThan(0);
+    expect(onward).toBeGreaterThan(alt); // higher-quality route carries more flows
+  });
+
+  it("BestRoute mode ignores the flow and always takes the single best route", () => {
+    const routing = routesTo(Dest, { neighbour: OnwardNbr, quality: 200 }, { neighbour: AltNbr, quality: 100 });
+    for (let i = 0; i < 20; i++) {
+      const d = decideForward(flow(Source, Dest, 20, i), FromNbr, Me, routing, 25, ForwardMode.BestRoute);
+      expect(d.nextHop?.equals(OnwardNbr)).toBe(true);
+    }
   });
 });

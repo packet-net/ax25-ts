@@ -1,6 +1,7 @@
 import type { Callsign } from "../callsign.js";
+import { NETROM_SHIFTED_LENGTH, writeShifted } from "./callsign.js";
 import type { NetRomPacket } from "./packet.js";
-import type { NetRomRoutingSnapshot } from "./routing-table.js";
+import type { NetRomRoute, NetRomRoutingSnapshot } from "./routing-table.js";
 
 /**
  * The NET/ROM L3 **forwarding decision** — what a transit node does with a datagram
@@ -27,6 +28,18 @@ export enum ForwardOutcome {
   DropLooped = "drop-looped",
   /** Drop: no onward route to the destination (excluding the way it came). */
   DropNoRoute = "drop-no-route",
+}
+
+/** The route-selection policy a forwarding node uses when a destination has more than
+ *  one kept route. Mirrors the C# `NetRomForwardMode`. */
+export enum ForwardMode {
+  /** Always the single best route (bounce-back excluded). Deterministic — every
+   *  transit datagram for a destination takes the same path. */
+  BestRoute = "best-route",
+  /** Per-flow quality-weighted spread: every datagram of one L4 circuit hashes to the
+   *  same route (so its ordering is preserved), while distinct circuits distribute
+   *  across the kept routes in proportion to quality. Stateless. The default. */
+  PerFlow = "per-flow",
 }
 
 /** The outcome of a forwarding decision. When {@link ForwardOutcome.ForwardTo},
@@ -61,6 +74,7 @@ export function decideForward(
   nodeCall: Callsign,
   routing: NetRomRoutingSnapshot,
   maxTimeToLive: number,
+  mode: ForwardMode = ForwardMode.PerFlow,
 ): ForwardDecision {
   // 1. Decrement the hop limit; a datagram that arrives at TTL 1 (or 0) is at the
   //    end of its life and must not be forwarded.
@@ -80,19 +94,10 @@ export function decideForward(
     return { outcome: ForwardOutcome.DropLooped, packet, nextHop: null };
   }
 
-  // 4. Next hop: the destination's best route (routes is best-first) whose neighbour
-  //    is not the one it arrived from.
-  const dest = packet.network.destination;
-  const resolved = routing.destinations.find((d) => d.destination.equals(dest));
-  let nextHop: Callsign | null = null;
-  if (resolved !== undefined) {
-    for (const route of resolved.routes) {
-      if (!route.neighbour.equals(receivedFrom)) {
-        nextHop = route.neighbour;
-        break;
-      }
-    }
-  }
+  // 4. Next hop: under the active mode, among the destination's kept routes
+  //    (best-first), excluding the one it arrived from.
+  const resolved = routing.destinations.find((d) => d.destination.equals(packet.network.destination));
+  const nextHop = resolved === undefined ? null : selectNextHop(resolved.routes, receivedFrom, mode, packet);
 
   if (nextHop === null) {
     return { outcome: ForwardOutcome.DropNoRoute, packet, nextHop: null };
@@ -103,4 +108,73 @@ export function decideForward(
     network: { ...packet.network, timeToLive: cappedTtl },
   };
   return { outcome: ForwardOutcome.ForwardTo, packet: forwarded, nextHop };
+}
+
+/** The next-hop neighbour for a destination under the active mode, excluding the
+ *  neighbour the datagram arrived from. `routes` is best-first. */
+function selectNextHop(
+  routes: readonly NetRomRoute[],
+  receivedFrom: Callsign,
+  mode: ForwardMode,
+  packet: NetRomPacket,
+): Callsign | null {
+  return mode === ForwardMode.PerFlow
+    ? selectWeighted(routes, receivedFrom, flowHash(packet))
+    : selectBest(routes, receivedFrom);
+}
+
+/** The single best usable route — the first in the best-first list that isn't the way
+ *  the datagram came. */
+function selectBest(routes: readonly NetRomRoute[], receivedFrom: Callsign): Callsign | null {
+  for (const route of routes) {
+    if (!route.neighbour.equals(receivedFrom)) {
+      return route.neighbour;
+    }
+  }
+  return null;
+}
+
+/** A per-flow, quality-weighted pick among the eligible routes (not the way it came,
+ *  quality > 0): all datagrams of one circuit hash to the same route, while distinct
+ *  circuits spread across the kept routes in proportion to quality. Stateless. */
+function selectWeighted(routes: readonly NetRomRoute[], receivedFrom: Callsign, flowHashValue: number): Callsign | null {
+  let total = 0;
+  for (const route of routes) {
+    if (!route.neighbour.equals(receivedFrom) && route.quality > 0) {
+      total += route.quality;
+    }
+  }
+  if (total === 0) {
+    return null;
+  }
+
+  let target = flowHashValue % total;
+  for (const route of routes) {
+    if (route.neighbour.equals(receivedFrom) || route.quality === 0) {
+      continue;
+    }
+    if (target < route.quality) {
+      return route.neighbour;
+    }
+    target -= route.quality;
+  }
+  return null; // unreachable: total > 0 guarantees a pick
+}
+
+/** FNV-1a (32-bit) over the flow key — the L3 origin (AX.25-shifted, 7 octets) + the
+ *  L4 circuit index + id — so every datagram of a circuit hashes identically across
+ *  its lifetime. Defined byte-for-byte (mod-2^32 via {@link Math.imul}) so the
+ *  C#/TS/Rust ports agree. Returns an unsigned 32-bit value. */
+function flowHash(packet: NetRomPacket): number {
+  const key = new Uint8Array(NETROM_SHIFTED_LENGTH + 2);
+  writeShifted(packet.network.origin, key);
+  key[NETROM_SHIFTED_LENGTH] = packet.transport.circuitIndex & 0xff;
+  key[NETROM_SHIFTED_LENGTH + 1] = packet.transport.circuitId & 0xff;
+
+  let hash = 0x811c9dc5; // FNV-1a offset basis (2166136261)
+  for (const b of key) {
+    hash ^= b;
+    hash = Math.imul(hash, 0x01000193); // FNV-1a prime (16777619), mod 2^32
+  }
+  return hash >>> 0;
 }

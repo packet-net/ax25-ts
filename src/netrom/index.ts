@@ -174,6 +174,7 @@ export {
   // The pure L3 forwarding decision — what a transit node does with a datagram
   // addressed to another node (drop / forward, TTL + loop-guard logic).
   ForwardOutcome,
+  ForwardMode,
   type ForwardDecision,
   decideForward,
   shouldForward,

@@ -5,7 +5,7 @@ import type { DataLinkSignal } from "../sdl/action-dispatcher.js";
 import { CircuitManager, type IncomingCircuitEvent } from "./circuit-manager.js";
 import type { NetRomCircuitOptions } from "./circuit-options.js";
 import { NetRomConnection } from "./connection.js";
-import { decideForward, ForwardOutcome } from "./forwarding.js";
+import { decideForward, ForwardMode, ForwardOutcome } from "./forwarding.js";
 import { DEFAULT_TIME_TO_LIVE } from "./network-header.js";
 import {
   type NetRomPacket,
@@ -57,6 +57,14 @@ export interface NetRomConnectorOptions {
    * originate-only node that does not carry third-party traffic.
    */
   forward?: boolean;
+  /**
+   * How a forwarding node picks among multiple kept routes to a destination
+   * ({@link ForwardMode}). Default {@link ForwardMode.PerFlow} — spread distinct L4
+   * circuits across the kept routes, quality-weighted, each circuit pinned to one
+   * path. Set {@link ForwardMode.BestRoute} for the single best route. Mirrors the C#
+   * `netRom.ForwardMode`.
+   */
+  forwardMode?: ForwardMode;
   /**
    * The L4 circuit tunables ({@link NetRomCircuitOptions}) handed to the owned
    * {@link CircuitManager} — window, retransmit timeout, retries, TTL, fragment
@@ -143,6 +151,7 @@ interface Interlink {
 export class NetRomConnector {
   private readonly enabledFlag: boolean;
   private readonly forwardFlag: boolean;
+  private readonly forwardMode: ForwardMode;
   private readonly maxTimeToLive: number;
   private readonly routing: RoutingSnapshotSource;
   private readonly onError: (err: unknown) => void;
@@ -177,6 +186,7 @@ export class NetRomConnector {
     this.routing = routing;
     this.enabledFlag = options.enabled ?? false;
     this.forwardFlag = options.forward ?? true;
+    this.forwardMode = options.forwardMode ?? ForwardMode.PerFlow;
     this.maxTimeToLive = options.circuit?.timeToLive ?? DEFAULT_TIME_TO_LIVE;
     this.onError = options.onError ?? (() => {});
     this.circuits = new CircuitManager(
@@ -538,6 +548,7 @@ export class NetRomConnector {
       this.nodeCall,
       this.routing.snapshot(),
       this.maxTimeToLive,
+      this.forwardMode,
     );
     if (decision.outcome !== ForwardOutcome.ForwardTo || decision.nextHop === null) {
       // Dropped — TTL expired, looped back to origin, or no onward route.
