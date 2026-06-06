@@ -5,6 +5,8 @@ import type { DataLinkSignal } from "../sdl/action-dispatcher.js";
 import { CircuitManager, type IncomingCircuitEvent } from "./circuit-manager.js";
 import type { NetRomCircuitOptions } from "./circuit-options.js";
 import { NetRomConnection } from "./connection.js";
+import { decideForward, ForwardOutcome } from "./forwarding.js";
+import { DEFAULT_TIME_TO_LIVE } from "./network-header.js";
 import {
   type NetRomPacket,
   encodeNetRomPacket,
@@ -45,6 +47,16 @@ export interface NetRomConnectorOptions {
    * embedder falls straight back to a direct AX.25 dial.
    */
   enabled?: boolean;
+  /**
+   * Whether this node **forwards transit datagrams** — relays a NET/ROM L3 datagram
+   * whose destination node is not us onward toward its destination (the network-layer
+   * routing role; mirrors the C# `netRom.forward`). Default `true`, but effective
+   * only when {@link enabled} is on (forwarding needs the connected-mode interlink
+   * machinery connect-routing provides). So an endpoint node (`enabled` off) never
+   * relays; a connect-enabled node forwards by default; set `false` to run an
+   * originate-only node that does not carry third-party traffic.
+   */
+  forward?: boolean;
   /**
    * The L4 circuit tunables ({@link NetRomCircuitOptions}) handed to the owned
    * {@link CircuitManager} — window, retransmit timeout, retries, TTL, fragment
@@ -130,6 +142,8 @@ interface Interlink {
  */
 export class NetRomConnector {
   private readonly enabledFlag: boolean;
+  private readonly forwardFlag: boolean;
+  private readonly maxTimeToLive: number;
   private readonly routing: RoutingSnapshotSource;
   private readonly onError: (err: unknown) => void;
   private readonly circuits: CircuitManager;
@@ -162,6 +176,8 @@ export class NetRomConnector {
   ) {
     this.routing = routing;
     this.enabledFlag = options.enabled ?? false;
+    this.forwardFlag = options.forward ?? true;
+    this.maxTimeToLive = options.circuit?.timeToLive ?? DEFAULT_TIME_TO_LIVE;
     this.onError = options.onError ?? (() => {});
     this.circuits = new CircuitManager(
       new Callsign("", 0),
@@ -178,6 +194,13 @@ export class NetRomConnector {
   /** True if NET/ROM L4 connect-routing is enabled. The C# `ConnectEnabled`. */
   get enabled(): boolean {
     return this.enabledFlag;
+  }
+
+  /** True if this node forwards transit datagrams (the network-layer routing role).
+   *  Rides on {@link enabled} (forwarding needs the interlink machinery) and the
+   *  `forward` option (default on). The C# `ForwardEnabled`. */
+  get forwardEnabled(): boolean {
+    return this.enabledFlag && this.forwardFlag;
   }
 
   /** The owned circuit table (for surfacing / tests). Mirrors the C#
@@ -480,13 +503,66 @@ export class NetRomConnector {
   ): void {
     try {
       const packet = tryParseNetRomPacket(info);
-      if (packet !== null) {
+      if (packet === null) {
+        return;
+      }
+      // L3 dispatch (mirrors the C# `NetRomService.OnInterlinkData`): a datagram
+      // addressed to this node terminates here (up to the L4 circuit layer); one
+      // addressed to another node is forwarded toward its destination (the
+      // network-layer routing role); an endpoint-only node drops it.
+      if (this.nodeCall !== null && packet.network.destination.equals(this.nodeCall)) {
         this.circuits.onPacket(packet);
+      } else if (this.forwardEnabled) {
+        this.forwardDatagram(packet, session.to);
       }
     } catch (err) {
       void session;
       this.onError(err);
     }
+  }
+
+  /**
+   * Forward a transit datagram (one whose destination node is not us) one hop toward
+   * its destination. The decision (TTL decrement/cap, loop guard, no-bounce-back
+   * next-hop resolution) is the pure {@link decideForward}, mirroring the C#
+   * `NetRomService.ForwardDatagram`; this method does only the I/O — send over the
+   * next-hop interlink if it is up (in order), else dial it first then send.
+   */
+  private forwardDatagram(packet: NetRomPacket, receivedFrom: Callsign): void {
+    if (this.nodeCall === null) {
+      return;
+    }
+    const decision = decideForward(
+      packet,
+      receivedFrom,
+      this.nodeCall,
+      this.routing.snapshot(),
+      this.maxTimeToLive,
+    );
+    if (decision.outcome !== ForwardOutcome.ForwardTo || decision.nextHop === null) {
+      // Dropped — TTL expired, looped back to origin, or no onward route.
+      return;
+    }
+
+    const neighbour = decision.nextHop;
+    const neighbourKey = neighbour.toString();
+    const bytes = encodeNetRomPacket(decision.packet);
+
+    const link = this.interlinks.get(neighbourKey);
+    if (link !== undefined) {
+      link.listener.sendData(link.session, bytes, PID_NET_ROM);
+      return;
+    }
+
+    // No interlink yet — establish it, then send (a transit cold-start).
+    void this.ensureInterlink(neighbour)
+      .then(() => {
+        const established = this.interlinks.get(neighbourKey);
+        if (established !== undefined) {
+          established.listener.sendData(established.session, bytes, PID_NET_ROM);
+        }
+      })
+      .catch((err) => this.onError(err));
   }
 
   /**

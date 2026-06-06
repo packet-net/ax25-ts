@@ -169,3 +169,12 @@ export {
   // the wrapper for an inbound circuit a remote opens to us).
   NetRomConnection,
 } from "./connection.js";
+
+export {
+  // The pure L3 forwarding decision — what a transit node does with a datagram
+  // addressed to another node (drop / forward, TTL + loop-guard logic).
+  ForwardOutcome,
+  type ForwardDecision,
+  decideForward,
+  shouldForward,
+} from "./forwarding.js";

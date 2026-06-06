@@ -34,11 +34,20 @@ import {
 import { MockTransport, pair } from "../mock-transport.js";
 import { buildNodesInfo, type NodesEntrySpec } from "../netrom-builder.js";
 
-/** Node callsigns + the end-node the harness routes a circuit to (reachable via B). */
+/**
+ * Node callsigns. This 2-node harness exercises `connect <alias>` to the node
+ * reached over the interlink — node B itself. (Before L3 forwarding, the tests used
+ * a fictional distinct `END` node that B silently terminated on behalf of; that only
+ * worked because the node terminated *every* inbound circuit regardless of L3
+ * destination. With forwarding, a node terminates only circuits addressed to itself,
+ * so the endpoint here is B — the real interlink peer. Genuine multi-hop transit
+ * forwarding is covered by the deterministic `decideForward` tests + the C# 3-node
+ * transit integration test.)
+ */
 export const A_NODE = new Callsign("GB7AAA", 0);
 export const B_NODE = new Callsign("GB7BBB", 0);
-export const END_NODE = new Callsign("GB7END", 0);
-export const END_ALIAS = "ENDND";
+export const END_NODE = B_NODE;
+export const END_ALIAS = "BNODE";
 export const PORT_ID = "p1";
 
 /** Encode a string as ASCII bytes (the TS analogue of `Encoding.ASCII.GetBytes`). */
