@@ -127,6 +127,7 @@ export {
   // routing model + table
   type NetRomRoutingOptions,
   NETROM_ROUTING_DEFAULTS,
+  type Inp3RouteMetric,
   type NetRomRoute,
   type NetRomDestination,
   type NetRomNeighbour,
@@ -179,3 +180,87 @@ export {
   decideForward,
   shouldForward,
 } from "./forwarding.js";
+
+// ─── INP3 (the time-based routing overlay; default-off, opt-in) ──────────────
+// Host-free protocol layers mirroring the merged C# reference (packet.net
+// Packet.NetRom): the wire codecs (L3RTT + RIF/RIP/TLV), the SNTT smoother + the
+// probe/reflect engine, the dual-metric route selection, and the triggered-update
+// scheduler. The live host wiring (engine/scheduler ownership + inbound RIF/L3RTT
+// dispatch on the interlink) is an embedder/connector concern — the TS analogue of
+// the C# NetRomService host-integration slice.
+
+export {
+  // INP3 option record (the tunable knobs) + resolver + validator
+  type Inp3Options,
+  type ResolvedInp3Options,
+  INP3_DEFAULTS,
+  INP3_DEFAULT_CAPABILITY_TEXT_WIDTH,
+  resolveInp3Options,
+  validateInp3Options,
+} from "./inp3-options.js";
+
+export {
+  // SNTT (Smoothed Neighbour Transport Time) integer IIR smoother
+  Inp3Sntt,
+  smoothSntt,
+  SNTT_DEFAULT_GAIN_SHIFT,
+  SNTT_MIN_GAIN_SHIFT,
+  SNTT_MAX_GAIN_SHIFT,
+  SNTT_SAMPLE_MAX_MS,
+  SNTT_UNSET,
+} from "./inp3-sntt.js";
+
+export {
+  // L3RTT link-time frame (probe / reflect)
+  Inp3L3RttFrame,
+} from "./inp3-l3rtt.js";
+
+export {
+  // RIF / RIP / TLV — the 0xFF-signed routing-information frame
+  type Inp3ParseOptions,
+  INP3_PARSE_LENIENT,
+  INP3_PARSE_STRICT,
+  INP3_PARSE_BPQ,
+  INP3_PARSE_XROUTER,
+  INP3_TLV_ALIAS_TYPE,
+  INP3_TLV_IP_TYPE,
+  type Inp3Tlv,
+  inp3TlvIsKnown,
+  inp3TlvAlias,
+  inp3TlvIp,
+  inp3TlvAsAlias,
+  inp3TlvAsIpAddress,
+  INP3_HORIZON_UNITS,
+  INP3_HORIZON_MS,
+  INP3_END_OF_PACKET,
+  type Inp3Rip,
+  inp3RipIsHorizon,
+  inp3RipAlias,
+  inp3RipToBytes,
+  parseInp3Rip,
+  INP3_RIF_SIGNATURE,
+  type Inp3Rif,
+  inp3RifToBytes,
+  parseInp3Rif,
+} from "./inp3-rif.js";
+
+export {
+  // The host-free L3RTT probe/reflect + SNTT + 180s-reset engine
+  type Inp3NeighbourDownEvent,
+  type Inp3NeighbourTiming,
+  Inp3Engine,
+} from "./inp3-engine.js";
+
+export {
+  // The pure dual-metric (quality / target-time) route selection
+  selectActiveRoute,
+} from "./inp3-route-selector.js";
+
+export {
+  // The host-free triggered-update timing state machine
+  Inp3UpdateClass,
+  Inp3AdvertiseReason,
+  type Inp3AdvertiseIntent,
+  type Inp3SchedulerStatus,
+  Inp3UpdateScheduler,
+} from "./inp3-update-scheduler.js";

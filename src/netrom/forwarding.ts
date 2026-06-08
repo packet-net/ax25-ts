@@ -67,6 +67,15 @@ export function shouldForward(decision: ForwardDecision): boolean {
  * @param routing The current routing view.
  * @param maxTimeToLive The TTL cap applied to everything forwarded (the node's
  *   configured initial TTL — BPQ's `L3LIVES`).
+ * @param mode The route-selection policy among kept quality routes (default
+ *   {@link ForwardMode.PerFlow}).
+ * @param preferInp3Routes The resolved INP3 forwarding preference (BPQ's
+ *   `PREFERINP3ROUTES`; `NetRomInp3Options.PreferInp3Routes`). When `true` and the
+ *   destination holds at least one INP3 time-route, the datagram is forwarded over
+ *   the **lowest-target-time** INP3 route (the way it came excluded), falling back
+ *   to the quality next-hop only when no INP3 route is usable. When `false` (the
+ *   default) the INP3 metric is ignored entirely and selection is byte-for-byte
+ *   today's quality path.
  */
 export function decideForward(
   packet: NetRomPacket,
@@ -75,6 +84,7 @@ export function decideForward(
   routing: NetRomRoutingSnapshot,
   maxTimeToLive: number,
   mode: ForwardMode = ForwardMode.PerFlow,
+  preferInp3Routes = false,
 ): ForwardDecision {
   // 1. Decrement the hop limit; a datagram that arrives at TTL 1 (or 0) is at the
   //    end of its life and must not be forwarded.
@@ -94,10 +104,20 @@ export function decideForward(
     return { outcome: ForwardOutcome.DropLooped, packet, nextHop: null };
   }
 
-  // 4. Next hop: under the active mode, among the destination's kept routes
-  //    (best-first), excluding the one it arrived from.
+  // 4. Next hop: the destination's best route (best-first) whose neighbour is not
+  //    the one it arrived from. When INP3 is preferred and the destination holds a
+  //    time-route, the lowest-target-time INP3 route wins; otherwise (knob off, or
+  //    no usable INP3 route) the quality next-hop, exactly as today.
   const resolved = routing.destinations.find((d) => d.destination.equals(packet.network.destination));
-  const nextHop = resolved === undefined ? null : selectNextHop(resolved.routes, receivedFrom, mode, packet);
+  let nextHop: Callsign | null = null;
+  if (resolved !== undefined) {
+    if (preferInp3Routes) {
+      nextHop = selectInp3NextHop(resolved.routes, receivedFrom);
+    }
+    if (nextHop === null) {
+      nextHop = selectNextHop(resolved.routes, receivedFrom, mode, packet);
+    }
+  }
 
   if (nextHop === null) {
     return { outcome: ForwardOutcome.DropNoRoute, packet, nextHop: null };
@@ -121,6 +141,38 @@ function selectNextHop(
   return mode === ForwardMode.PerFlow
     ? selectWeighted(routes, receivedFrom, flowHash(packet))
     : selectBest(routes, receivedFrom);
+}
+
+/** The single lowest-target-time INP3 route whose neighbour isn't the way the datagram
+ *  came — the time-space mirror of {@link selectBest}, and identical to the connect
+ *  path's `Inp3RouteSelector.SelectActiveRoute` pick (so forward + connect agree on the
+ *  active INP3 next hop). Per-flow weighting is a quality-space concept: in the measured
+ *  time-space we always forward the fastest path (spreading flows across slower
+ *  time-routes would defeat the measurement), so PerFlow/BestRoute is moot here. Returns
+ *  `null` when the destination holds no usable INP3 route (every time-route is the way it
+ *  came, or there are none), at which point {@link decideForward} falls back to the
+ *  quality next-hop. Tie-break: target time, then hop count, then neighbour callsign
+ *  ordinal — mirroring the C# `NetRomForwarding.SelectInp3NextHop`. */
+function selectInp3NextHop(routes: readonly NetRomRoute[], receivedFrom: Callsign): Callsign | null {
+  let best: NetRomRoute | null = null;
+  for (const route of routes) {
+    const m = route.inp3;
+    if (m === undefined || route.neighbour.equals(receivedFrom)) {
+      continue; // a pure quality-route, or the way it came — not an eligible INP3 next hop.
+    }
+    const b = best?.inp3;
+    const better =
+      b === undefined ||
+      m.targetTimeMs < b.targetTimeMs ||
+      (m.targetTimeMs === b.targetTimeMs && m.hopCount < b.hopCount) ||
+      (m.targetTimeMs === b.targetTimeMs &&
+        m.hopCount === b.hopCount &&
+        compareOrdinal(route.neighbour.toString(), best!.neighbour.toString()) < 0);
+    if (better) {
+      best = route;
+    }
+  }
+  return best === null ? null : best.neighbour;
 }
 
 /** The single best usable route — the first in the best-first list that isn't the way
@@ -177,4 +229,10 @@ function flowHash(packet: NetRomPacket): number {
     hash = Math.imul(hash, 0x01000193); // FNV-1a prime (16777619), mod 2^32
   }
   return hash >>> 0;
+}
+
+/** Ordinal (codepoint) string comparison — the TS analogue of C# `string.CompareOrdinal`
+ *  (used for the INP3 callsign tie-break). */
+function compareOrdinal(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
 }
