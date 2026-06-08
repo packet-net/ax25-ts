@@ -15,9 +15,26 @@ import {
 import {
   type NetRomDestination,
   type NetRomRoutingSnapshot,
+  NetRomRoutingTable,
   neighbourFor,
   resolveDestination,
 } from "./routing-table.js";
+import {
+  type Inp3Options,
+  type ResolvedInp3Options,
+  resolveInp3Options,
+} from "./inp3-options.js";
+import { Inp3Engine } from "./inp3-engine.js";
+import { Inp3UpdateScheduler } from "./inp3-update-scheduler.js";
+import { Inp3L3RttFrame } from "./inp3-l3rtt.js";
+import {
+  type Inp3Rif,
+  INP3_RIF_SIGNATURE,
+  inp3RifToBytes,
+  parseInp3Rif,
+} from "./inp3-rif.js";
+import { SNTT_UNSET } from "./inp3-sntt.js";
+import { selectActiveRoute } from "./inp3-route-selector.js";
 
 /** The subset of {@link Ax25Listener} the connector drives: open a CONNECTED-mode
  *  session (the interlink), ship L4 datagrams over it, and learn of an inbound
@@ -94,6 +111,27 @@ export interface NetRomConnectorOptions {
    * `NetRomService.EnsureInterlinkAsync` dial-failure path. Defaults to a no-op.
    */
   onNeighbourDown?: (neighbour: Callsign) => void;
+  /**
+   * Enable the INP3 time-based routing overlay (the TS analogue of the C#
+   * `NetRomService` host-integration). When set, the connector owns an
+   * {@link Inp3Engine} + {@link Inp3UpdateScheduler}: it taps inbound PID-0xCF for
+   * RIF / L3RTT frames ahead of the L4 path, probes interlink neighbours, ingests
+   * RIFs into {@link table} as time-routes, fans out poison-reversed RIFs, and —
+   * when `options.preferInp3Routes` is set — forwards / connects over the
+   * lowest-target-time route. **Default-off**: omit this and the connector behaves
+   * exactly as today (no INP3 frames, no time-routes).
+   *
+   * `table` MUST be the same writable {@link NetRomRoutingTable} the NODES-ingest
+   * side (`NetRomService.routingTable`) writes to, so quality (NODES) and time (RIF)
+   * routes coexist on one table — mirroring the single C# table. The engine/scheduler
+   * are driven by the connector's {@link tick} (no ambient timer).
+   */
+  inp3?: {
+    /** The shared writable routing table (use `netRomService.routingTable`). */
+    readonly table: NetRomRoutingTable;
+    /** INP3 tuning (probe cadence, SNTT gain, `preferInp3Routes`, …). */
+    readonly options?: Inp3Options;
+  };
 }
 
 /** Raised by {@link NetRomConnector.connect} when connect-routing is enabled but the
@@ -180,6 +218,18 @@ export class NetRomConnector {
   private nodeCall: Callsign | null = null;
   private disposed = false;
 
+  // ─── INP3 overlay (null unless options.inp3 was supplied) ───
+  // The shared writable table (NODES + RIF routes coexist on it), the engine +
+  // scheduler, the resolved knobs, and the per-round withdrawn snapshot the
+  // advertise sink reads (drained once at the top of each INP3 tick — the atomic
+  // round boundary that mirrors the C# host's DrainRecentlyWithdrawn fix).
+  private readonly inp3Table: NetRomRoutingTable | null = null;
+  private readonly inp3Engine: Inp3Engine | null = null;
+  private readonly inp3Scheduler: Inp3UpdateScheduler | null = null;
+  private readonly inp3Options: ResolvedInp3Options | null = null;
+  private readonly preferInp3: boolean;
+  private inp3RoundWithdrawn: readonly Callsign[] = [];
+
   private readonly incomingListeners: Array<
     (connection: NetRomConnection, event: IncomingCircuitEvent) => void
   > = [];
@@ -212,6 +262,53 @@ export class NetRomConnector {
     this.circuits.sendPacket = (p) => this.sendNetRomPacket(p);
     // A remote opening a circuit to us → wrap + raise to the embedder's bridge.
     this.circuits.onIncomingCircuit((e) => this.onIncomingCircuit(e));
+
+    // INP3 overlay (opt-in). When a writable table is supplied, stand up the engine
+    // + scheduler and wire their sinks to the interlink send path + the shared table.
+    // All dead code when omitted (the inp3* fields stay null → byte-for-byte today).
+    if (options.inp3 !== undefined && this.enabledFlag) {
+      this.inp3Table = options.inp3.table;
+      this.inp3Options = resolveInp3Options(options.inp3.options);
+      this.preferInp3 = this.inp3Options.preferInp3Routes;
+      const engine = new Inp3Engine(
+        new Callsign("", 0),
+        options.inp3.options,
+        options.now ?? Date.now,
+      );
+      const scheduler = new Inp3UpdateScheduler(
+        options.inp3.options,
+        options.now ?? Date.now,
+      );
+      // L3RTT send: ship the frame over the neighbour's interlink (cold → drop, don't
+      // dial — the engine just won't measure an absent link).
+      engine.sendL3Rtt = (neighbour, frame) =>
+        this.sendInp3Bytes(neighbour, frame.toBytes());
+      // 180 s reflection-timeout teardown of an INP3-capable neighbour: drop its
+      // routes from the shared table (so forward / connect re-routes at once) AND
+      // signal the embedder's failover hook, then refresh the capable fan-out set.
+      engine.onNeighbourDown((e) => {
+        this.inp3Table?.markNeighbourDown(e.neighbour);
+        this.onNeighbourDown(e.neighbour);
+        this.refreshInp3Capable();
+      });
+      // RIF advertise: build the poison-reversed RIF for this neighbour from the
+      // round's drained withdrawn snapshot and ship it over the interlink.
+      scheduler.advertise = (intent) => {
+        if (this.nodeCall === null || this.inp3Table === null) {
+          return;
+        }
+        const rif = this.inp3Table.buildRif(
+          this.nodeCall,
+          intent.neighbour,
+          this.inp3RoundWithdrawn,
+        );
+        this.sendInp3Bytes(intent.neighbour, inp3RifToBytes(rif));
+      };
+      this.inp3Engine = engine;
+      this.inp3Scheduler = scheduler;
+    } else {
+      this.preferInp3 = false;
+    }
   }
 
   /** True if NET/ROM L4 connect-routing is enabled. The C# `ConnectEnabled`. */
@@ -277,6 +374,9 @@ export class NetRomConnector {
     if (this.nodeCall === null) {
       this.nodeCall = call;
       this.circuits.setLocalNode(call);
+      // The INP3 engine stamps the node into its probes' L3 origin + uses it as the
+      // reflection self-test identity — pin it at first attach too.
+      this.inp3Engine?.setLocalNode(call);
     }
 
     // Tap inbound interlinks arriving on this port (a remote dialling us with a
@@ -385,7 +485,8 @@ export class NetRomConnector {
     const cap = 1 + 3;
     for (let attempt = 0; attempt < cap; attempt++) {
       const live = resolveDestination(this.routing.snapshot(), destText);
-      const best = live?.bestRoute ?? null;
+      const best =
+        live === null ? null : selectActiveRoute(live, this.preferInp3);
       if (best === null) {
         throw new Error(`no usable NET/ROM route to ${destText}.`);
       }
@@ -445,6 +546,9 @@ export class NetRomConnector {
    */
   tick(): void {
     this.circuits.tick();
+    // Drive the INP3 engine + scheduler on the same embedder cadence (the C# host
+    // uses a 1 s timer; here the embedder's tick is the single driver). No-op off.
+    this.inp3Tick();
   }
 
   /** Forget every port + interlink and stop accepting inbound circuits. The interlink
@@ -567,6 +671,12 @@ export class NetRomConnector {
     info: Uint8Array,
   ): void {
     try {
+      // INP3 peel (mirrors the C# `DispatchInp3`, the load-bearing precedence): when
+      // the overlay is on, a RIF (0xFF-led) or an L3RTT is consumed BEFORE the L4
+      // path so it can never reach circuits / forwarding. Returns true when consumed.
+      if (this.inp3Engine !== null && this.dispatchInp3(session.to, info)) {
+        return;
+      }
       const packet = tryParseNetRomPacket(info);
       if (packet === null) {
         return;
@@ -582,6 +692,125 @@ export class NetRomConnector {
       }
     } catch (err) {
       void session;
+      this.onError(err);
+    }
+  }
+
+  // ─── INP3 overlay internals (no-ops unless the overlay was constructed) ───
+
+  /**
+   * Peel a RIF / L3RTT off the inbound 0xCF stream before the L4 path (mirrors the
+   * C# `DispatchInp3`). Precedence: (A) a 0xFF-led frame is a RIF — consumed whether
+   * or not it parses (a malformed RIF is dropped, never retried as L4); (B) an L3RTT
+   * to `L3RTT-0` is timed/reflected by the engine and consumed. Anything else is not
+   * INP3 → returns false so the caller runs the existing L4 dispatch. Observing the
+   * neighbour here makes every 0xCF-speaking peer a probe target (optimistic probing).
+   */
+  private dispatchInp3(fromNeighbour: Callsign, info: Uint8Array): boolean {
+    const engine = this.inp3Engine;
+    if (engine === null) {
+      return false;
+    }
+    engine.observeNeighbour(fromNeighbour);
+
+    // (A) RIF? — the single-byte 0xFF signature is a total, unambiguous discriminator
+    // (a 0xFF first byte can't be a valid AX.25-shifted callsign).
+    if (info.length >= 1 && info[0] === INP3_RIF_SIGNATURE) {
+      const rif = parseInp3Rif(info);
+      if (rif !== null) {
+        this.ingestInp3Rif(fromNeighbour, rif);
+      }
+      return true; // consumed either way (malformed 0xFF-led frame dropped, never L4).
+    }
+
+    // (B) L3RTT? — a well-formed NetRomPacket to L3RTT-0.
+    const packet = tryParseNetRomPacket(info);
+    if (packet !== null && Inp3L3RttFrame.isL3Rtt(packet)) {
+      engine.onL3Rtt(fromNeighbour, packet); // times our reflection, or reflects a peer probe
+      return true;
+    }
+    return false; // not INP3 — fall through to the L4 path.
+  }
+
+  /**
+   * Ingest a parsed RIF into the shared table as time-routes, supplying the engine's
+   * measured SNTT for the carrying link. Any destination that loses its last INP3
+   * route lands in the table's recently-withdrawn set; it is NOT escalated here — the
+   * next {@link tick} drains the set atomically and fans it out, so this pump path
+   * never races the fan-out round (the C# host-thread race fix).
+   */
+  private ingestInp3Rif(from: Callsign, rif: Inp3Rif): void {
+    if (
+      this.nodeCall === null ||
+      this.inp3Table === null ||
+      this.inp3Engine === null ||
+      this.inp3Options === null
+    ) {
+      return;
+    }
+    const sntt = this.inp3Engine.snttMs(from) ?? SNTT_UNSET;
+    this.inp3Table.ingestRif(
+      from,
+      this.nodeCall,
+      sntt,
+      rif,
+      this.inp3Options.hopLimit,
+    );
+  }
+
+  /** Send raw INP3 bytes (an L3RTT or a RIF) over a neighbour's interlink if one is
+   *  up. Cold-interlink: drop, don't dial (the engine simply won't measure/advertise
+   *  over an absent link) — mirrors the C# `TrySendOverInterlinkBytes`. */
+  private sendInp3Bytes(neighbour: Callsign, bytes: Uint8Array): void {
+    const link = this.interlinks.get(neighbour.toString());
+    if (link !== undefined) {
+      link.listener.sendData(link.session, bytes, PID_NET_ROM);
+    }
+  }
+
+  /** Reconcile the scheduler's fan-out target set from the engine's INP3-capable
+   *  neighbours (the C# `RefreshCapableNeighbours`). */
+  private refreshInp3Capable(): void {
+    if (this.inp3Engine === null || this.inp3Scheduler === null) {
+      return;
+    }
+    const capable = this.inp3Engine.neighbours
+      .filter((n) => n.inp3Capable)
+      .map((n) => n.neighbour);
+    this.inp3Scheduler.setTargetNeighbours(capable);
+  }
+
+  /**
+   * One INP3 host tick, in the locked order (mirrors the C# `Inp3Host.TickOnce`):
+   * refresh the capable set → tick the engine (probes / 180 s resets) → DRAIN the
+   * recently-withdrawn set once (the atomic round boundary), mark each NEGATIVE so
+   * the round fans out immediately, hand the same snapshot to every `buildRif` via
+   * {@link inp3RoundWithdrawn} → tick the scheduler (fans out due intents). Draining
+   * once at the round start (rather than reading the live set per-neighbour) closes
+   * the host-thread race: a concurrent ingest landing mid-round is captured by the
+   * NEXT drain, never cleared unadvertised.
+   */
+  private inp3Tick(): void {
+    const engine = this.inp3Engine;
+    const scheduler = this.inp3Scheduler;
+    const table = this.inp3Table;
+    if (engine === null || scheduler === null || table === null) {
+      return;
+    }
+    try {
+      this.refreshInp3Capable();
+      engine.tick(); // may withdraw routes via onNeighbourDown → recentlyWithdrawn
+      const withdrawn = table.drainRecentlyWithdrawn();
+      for (const dest of withdrawn) {
+        scheduler.markWithdrawn(dest);
+      }
+      this.inp3RoundWithdrawn = withdrawn;
+      try {
+        scheduler.tick();
+      } finally {
+        this.inp3RoundWithdrawn = [];
+      }
+    } catch (err) {
       this.onError(err);
     }
   }
@@ -604,6 +833,7 @@ export class NetRomConnector {
       this.routing.snapshot(),
       this.maxTimeToLive,
       this.forwardMode,
+      this.preferInp3,
     );
     if (decision.outcome !== ForwardOutcome.ForwardTo || decision.nextHop === null) {
       // Dropped — TTL expired, looped back to origin, or no onward route.
@@ -656,8 +886,10 @@ export class NetRomConnector {
       } else {
         const snap = this.routing.snapshot();
         const resolved = resolveDestination(snap, destKey);
-        if (resolved !== null && resolved.bestRoute !== null) {
-          neighbourKey = resolved.bestRoute.neighbour.toString();
+        const active =
+          resolved === null ? null : selectActiveRoute(resolved, this.preferInp3);
+        if (active !== null) {
+          neighbourKey = active.neighbour.toString();
         } else if (neighbourFor(snap, dest) !== null) {
           neighbourKey = destKey;
         }

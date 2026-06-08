@@ -123,6 +123,18 @@ export class NetRomService {
     return this.enabledFlag;
   }
 
+  /**
+   * The live, writable routing table backing this service — the same table the
+   * NODES tap ingests into. Exposed so a host that runs the INP3 overlay can share
+   * one table between NODES (quality) ingest here and RIF (time) ingest in the
+   * {@link NetRomConnector} (`inp3.table`), exactly as the C# `NetRomService` owns
+   * one table for both metric spaces. Read-only consumers should prefer
+   * {@link snapshot}; this is the write handle for the connector's INP3 host wiring.
+   */
+  get routingTable(): NetRomRoutingTable {
+    return this.table;
+  }
+
   /** Port ids currently attached (hearing NODES). */
   get attachedPorts(): readonly string[] {
     return [...this.attachments.keys()];
