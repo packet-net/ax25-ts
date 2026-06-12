@@ -6,6 +6,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-06-12
+
+Parity with the C# reference at packet.net **lib-v0.8.0**: two session-quirk figure-defect fixes and one recorded transport exception.
+
+### Added
+
+- **`ax25Spec13ClampSrejWindowToHalfModulus` session quirk** ([#62](https://github.com/M0LTE/ax25-ts/pull/62)) — mirrors [packet.net#394](https://github.com/m0lte/packet.net/pull/394) ([packethacking/ax25spec#13](https://github.com/packethacking/ax25spec/issues/13)). Selective Repeat needs the textbook `2·W ≤ modulus` bound, but AX.25 lets `k` range to `modulus−1` and the figures never enforce the tighter limit, so above `modulus/2` two in-flight frames can share an N(S) and the receiver can deliver a stale stored I-frame — **silent payload corruption** under SREJ + loss. The quirk (default on; off under `strictlyFaithful`) caps **both** the send window and the receive-side out-of-window-discard bound at `modulus/2` whenever SREJ is enabled, via `Ax25SessionContext.effectiveWindow`. Go-back-N (SREJ off) is never capped — it tolerates `k` up to `modulus−1`; the mod-8 default `k=4 = modulus/2` is exactly at the limit and unchanged.
+- **`ax25Spec9AckProgressResetsRc` session quirk** ([#60](https://github.com/M0LTE/ax25-ts/pull/60)) — mirrors [packet.net ax25spec#9](https://github.com/packethacking/ax25spec/issues/9). The figures only reset the retry counter RC on a fully-acked checkpoint, so under sustained progressing-but-lossy transfer a handful of T1 hiccups ratchet RC to N2 and the sender spontaneously DMs a live session. The quirk (default on; off under `strictlyFaithful`) clamps RC to 1 at a T1 expiry that follows V(A)-advancing progress, so RC counts *consecutive* recovery failures and a genuinely dead link still exhausts N2. Deliberately at-expiry, not an eager zero at ack time (RC==0 doubles as the Karn sampling signal).
+
+### Changed
+
+- **Recorded parity exception for `Ax25ListenerOptions.RestartT1OnTxComplete`** ([#61](https://github.com/M0LTE/ax25-ts/pull/61)) — packet.net's `kiss.t1FromTxComplete` re-arms a running T1 from the TNC's ACKMODE TX-completion echo. The echo is a TNC/node-host transport capability and no TS transport implements `sendFrameWithAck` today, so the option would be inert here; the drift guard carries a reviewed exception in `scripts/parity-exceptions.json` until an ACKMODE-capable TS transport exists.
+
 ## [0.12.0] — 2026-06-10
 
 ### Added

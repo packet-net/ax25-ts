@@ -1,6 +1,6 @@
 {
   "name": "@packet-net/ax25",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "Browser-targeted TypeScript library for AX.25 v2.2 connected-mode sessions over Web Serial KISS modems.",
   "repository": {
     "type": "git",
