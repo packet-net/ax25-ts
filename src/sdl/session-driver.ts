@@ -142,6 +142,13 @@ export class SdlSessionDriver {
   readonly context: Ax25SessionContext;
   private state: string;
   private currentTrigger: Ax25Event | null = null;
+
+  /**
+   * ax25spec#9 ({@link Ax25SessionQuirks.ax25Spec9AckProgressResetsRc}): set
+   * when a committed transition advances V(A); consumed at the next T1 expiry
+   * to clamp RC. See the pre-match clamp in {@link dispatchOne}.
+   */
+  private vaAdvancedSinceT1Expiry = false;
   private readonly dispatcher: ActionDispatcher;
   private readonly guards: GuardEvaluator;
   private readonly subroutines: SubroutineRegistry;
@@ -243,6 +250,28 @@ export class SdlSessionDriver {
       throw new Error(`no SDL page for current state '${this.state}'`);
     }
 
+    // ax25spec#9 (ax25Spec9AckProgressResetsRc): the figures only reset RC on
+    // the fully-acked Timer-Recovery checkpoint (…_yes_yes_yes → Connected,
+    // RC := 0), so a sustained transfer that lives in Timer Recovery with
+    // frames always in flight ratchets RC across a WORKING link and dies
+    // (t21_t1_expiry_yes_no: DL-ERROR I → DM) at the N2'th lifetime hiccup.
+    // If V(A) advanced since the last T1 expiry, the link is demonstrably
+    // alive, so this expiry is the FIRST of a new consecutive-failure run:
+    // clamp RC to 1 before the rc_eq_n2 guard is evaluated. Clamping (not
+    // zeroing) keeps Select_T1's RC==0 Karn branch meaning what the figures
+    // intend — "no retransmission in progress, round-trip sample is clean".
+    // Mirrors the C# Ax25Session dispatch path.
+    if (
+      event.name === "T1_expiry" &&
+      this.context.quirks.ax25Spec9AckProgressResetsRc
+    ) {
+      if (this.vaAdvancedSinceT1Expiry && this.context.rc > 1) {
+        this.context.rc = 1;
+      }
+      this.vaAdvancedSinceT1Expiry = false;
+    }
+
+    const vaBefore = this.context.va;
     this.currentTrigger = event;
     try {
       const match = this.findMatchingTransition(page, event);
@@ -273,6 +302,13 @@ export class SdlSessionDriver {
         this.state,
       );
       this.state = this.resolveNextState(match);
+
+      // ax25spec#9, step 1 of 2: note V(A)-advancing progress — the peer
+      // acknowledged NEW data. RC is deliberately NOT zeroed here (see the
+      // pre-match clamp above for why).
+      if (this.context.va !== vaBefore) {
+        this.vaAdvancedSinceT1Expiry = true;
+      }
     } finally {
       this.currentTrigger = null;
     }

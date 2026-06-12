@@ -311,6 +311,50 @@ export interface Ax25SessionQuirks {
    * in m0lte/packet.net (PR #286).
    */
   ax25Spec47TimerRecoveryDrainAdvancesVR: boolean;
+
+  /**
+   * Work around `packethacking/ax25spec#9`: the figures only reset the retry
+   * counter RC on the Timer-Recovery checkpoint branch where *everything* is
+   * acknowledged (figc4.5's RR-response F=1 path with V(S)=V(A) → Connected;
+   * re-entry re-initialises RC). The partial-ack branch (V(S)≠V(A) → invoke
+   * retransmission, stay in Timer Recovery) never touches RC — and under
+   * sustained bulk transfer the sender almost always has fresh I-frames in
+   * flight when the F=1 lands, so it lives in Timer Recovery indefinitely
+   * while making continuous forward progress, RC ratcheting +1 on every T1
+   * hiccup and never resetting. After N2 *lifetime* hiccups — not N2
+   * *consecutive* failures — the link is declared dead
+   * (`t21_t1_expiry_yes_no`: DL-ERROR I → DM → Disconnected) even though acks
+   * were flowing seconds earlier. Reproduced by packet.net's
+   * `tools/Packet.LinkBench` over net-sim: a 32 KiB transfer at 1200 baud
+   * half-duplex died mid-transfer at the 10th T1 expiry, ~200 s into a link
+   * that was progressing the whole time (packet.net `docs/link-bench-plan.md`
+   * §13).
+   *
+   * When `true` (default), a T1 expiry that follows V(A)-advancing progress
+   * since the previous T1 expiry clamps RC to 1 *before* the figures'
+   * `RC = N2?` guard is evaluated — the peer acknowledging *new* data is
+   * exactly the proof RC exists to test ("they can hear us, and we can hear
+   * them"), so that expiry starts a fresh consecutive-failure run instead of
+   * continuing a lifetime tally. RC then counts *consecutive* recovery
+   * failures, and a genuinely dead link still exhausts N2 (no progress → no
+   * clamps). When `false` ({@link strictlyFaithfulSessionQuirks}), the
+   * figures run as drawn (RC ratchets across a working link — strict
+   * conformance study).
+   *
+   * The clamp deliberately happens at T1-expiry time and goes to 1, not to 0
+   * at ack time: RC==0 is also the figures' Karn signal to `Select_T1`'s
+   * sampling branch ("no retransmission in progress — the round trip is
+   * clean"), so zeroing RC mid-recovery would feed retransmit-polluted
+   * samples into the SRT estimator and corrupt T1V. De-facto corroboration:
+   * rax25 (Thomas Habets, who filed #9) ships the equivalent fix —
+   * `state.rs` resets `rc` on every `va` update, with before/after pcaps on a
+   * 75 % loss channel in the issue (rax25's RC plays no role in its RTT
+   * estimation, so it can reset eagerly; ours clamps lazily for Karn's sake).
+   * Delete once ax25spec resolves #9 and `ax25sdl` ships figures carrying the
+   * reset. Mirrors `Ax25SessionQuirks.Ax25Spec9AckProgressResetsRc` in
+   * m0lte/packet.net.
+   */
+  ax25Spec9AckProgressResetsRc: boolean;
 }
 
 /**
@@ -328,6 +372,7 @@ export const defaultSessionQuirks: Ax25SessionQuirks = {
   ax25Spec44Mod128ConnectRoutesToV22: true,
   ax25Spec45FrmrFallbackReestablishesV20: true,
   ax25Spec47TimerRecoveryDrainAdvancesVR: true,
+  ax25Spec9AckProgressResetsRc: true,
 };
 
 /**
@@ -346,4 +391,5 @@ export const strictlyFaithfulSessionQuirks: Ax25SessionQuirks = {
   ax25Spec44Mod128ConnectRoutesToV22: false,
   ax25Spec45FrmrFallbackReestablishesV20: false,
   ax25Spec47TimerRecoveryDrainAdvancesVR: false,
+  ax25Spec9AckProgressResetsRc: false,
 };

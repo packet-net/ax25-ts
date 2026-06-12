@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Added
+
+- **`ax25Spec9AckProgressResetsRc` session quirk (TS↔C# parity)** — works around [packethacking/ax25spec#9](https://github.com/packethacking/ax25spec/issues/9): the SDL figures only reset the retry counter RC on the Timer-Recovery *fully-acked* checkpoint (V(S)=V(A) → Connected), so a sustained bulk transfer that lives in Timer Recovery with frames always in flight ratchets RC across a **working** link and dies (`t21_t1_expiry_yes_no`: DL-ERROR I → DM → Disconnected) at the N2'th *lifetime* T1 hiccup — reproduced by packet.net's `tools/Packet.LinkBench` over net-sim, where 32 KiB transfers died mid-transfer at the 10th expiry on a link that was progressing the whole time. With the quirk on (default), a T1 expiry that follows V(A)-advancing progress clamps RC to 1 before the `rc_eq_n2` guard runs, so RC counts *consecutive* recovery failures; a genuinely dead link still exhausts N2 (no progress → no clamps). The clamp is deliberately at-expiry rather than zeroing RC at ack time: RC==0 doubles as `Select_T1`'s Karn sampling signal, and an eager zero feeds retransmit-polluted samples into the SRT estimator (it measurably corrupted T1V in the C# SREJ-under-loss suite). Off under `strictlyFaithfulSessionQuirks` (figures as drawn). De-facto corroboration: rax25 ships the equivalent fix (reset `rc` on every `va` update). Mirrors `Ax25SessionQuirks.Ax25Spec9AckProgressResetsRc` in m0lte/packet.net; TS port of `Ax25Spec9RcResetQuirkTests`.
+
 ## [0.12.0] — 2026-06-10
 
 ### Added
