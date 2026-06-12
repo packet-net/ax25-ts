@@ -146,6 +146,24 @@ export interface Ax25SessionContext {
 }
 
 /** Modulus used for sequence-variable arithmetic (8 or 128). */
+/**
+ * The window (k) the engine actually enforces for BOTH the send side (max
+ * outstanding I-frames) and the receive side (the in-window acceptance bound for
+ * storing out-of-sequence frames) — {@link Ax25SessionContext.k}, but capped at
+ * `modulus/2` while Selective Repeat ({@link Ax25SessionContext.srejEnabled}) is
+ * in effect, per the Selective-Repeat window-wrap invariant (ax25spec#13). Above
+ * that cap, two in-flight frames could share an N(S) and SREJ recovery can
+ * silently deliver a stale stored frame (m0lte/packet.net#393). Gated by
+ * {@link Ax25SessionQuirks.ax25Spec13ClampSrejWindowToHalfModulus} (default on);
+ * with the quirk off it is just `k`, reproducing the unbounded figure-literal
+ * behaviour. Go-back-N links (SREJ off) are never capped.
+ */
+export function effectiveWindow(ctx: Ax25SessionContext): number {
+  return ctx.quirks.ax25Spec13ClampSrejWindowToHalfModulus && ctx.srejEnabled
+    ? Math.min(ctx.k, Math.floor(modulus(ctx) / 2))
+    : ctx.k;
+}
+
 export function modulus(ctx: Ax25SessionContext): number {
   return ctx.isExtended ? 128 : 8;
 }

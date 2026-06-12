@@ -25,6 +25,7 @@ import { createSessionBindings } from "./session-bindings.js";
 import {
   type Ax25SessionContext,
   modulus as ctxModulus,
+  effectiveWindow,
 } from "./session-context.js";
 import { executeWithLoops } from "./sdl-loop-executor.js";
 import {
@@ -434,7 +435,7 @@ export class SdlSessionDriver {
     const m = ctxModulus(this.context);
     const outstanding =
       (this.context.vs - this.context.va + m) % m;
-    return outstanding < this.context.k;
+    return outstanding < effectiveWindow(this.context);
   }
 
   private onTimerExpiry(name: TimerName): void {

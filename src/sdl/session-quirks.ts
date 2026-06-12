@@ -355,6 +355,36 @@ export interface Ax25SessionQuirks {
    * m0lte/packet.net (feat/link-bench).
    */
   ax25Spec9AckProgressResetsRc: boolean;
+
+  /**
+   * Enforce the Selective-Repeat window-wrap invariant for
+   * `packethacking/ax25spec#13`: when SREJ is enabled, the send window k must
+   * satisfy `k <= modulus/2` (<= 4 for mod-8, <= 64 for mod-128). Selective
+   * Repeat keys retransmission-recovery state by the bare N(S), so the sender
+   * and receiver windows must not overlap modulo the sequence space (the 2*W <=
+   * modulus bound). AX.25 lets `k` range to modulus-1 (fine for go-back-N, which
+   * buffers no out-of-order frames), and the figures never enforce the tighter
+   * Selective-Repeat bound, so a session running SREJ with `k > modulus/2` can,
+   * under loss, **silently deliver a stale stored I-frame from the previous ring
+   * cycle** (same N(S), exactly `modulus` frames back) in place of the live
+   * frame — exact-length, wrong-content payload corruption. Reproduced by
+   * packet.net's tools/Packet.LinkBench: at mod-8, 5% loss, SREJ on, corruption
+   * appears at k>=5 and is absent at k<=4 (m0lte/packet.net#393).
+   *
+   * When `true` (default), {@link effectiveWindow} caps the outstanding-I-frame
+   * window at `modulus/2` whenever {@link Ax25SessionContext.srejEnabled} is set
+   * — both the `vs_eq_va_plus_k` guard / the I-frame-queue drain (send side) AND
+   * the ax25Spec40 out-of-window discard (receive side) honour the cap, so no
+   * more than `modulus/2` frames are ever outstanding/accepted and two in-flight
+   * frames can never share an N(S). A configured `k` above the cap runs at the
+   * safe window while SREJ is in effect (the configured value is untouched and
+   * applies again on a go-back-N link). When `false`
+   * ({@link strictlyFaithfulSessionQuirks}), the figures run as drawn — SREJ at
+   * `k > modulus/2` is permitted and corrupts under loss, for conformance study.
+   * Mirrors `Ax25SessionQuirks.Ax25Spec13ClampSrejWindowToHalfModulus` in
+   * m0lte/packet.net.
+   */
+  ax25Spec13ClampSrejWindowToHalfModulus: boolean;
 }
 
 /**
@@ -373,6 +403,7 @@ export const defaultSessionQuirks: Ax25SessionQuirks = {
   ax25Spec45FrmrFallbackReestablishesV20: true,
   ax25Spec47TimerRecoveryDrainAdvancesVR: true,
   ax25Spec9AckProgressResetsRc: true,
+  ax25Spec13ClampSrejWindowToHalfModulus: true,
 };
 
 /**
@@ -392,4 +423,5 @@ export const strictlyFaithfulSessionQuirks: Ax25SessionQuirks = {
   ax25Spec45FrmrFallbackReestablishesV20: false,
   ax25Spec47TimerRecoveryDrainAdvancesVR: false,
   ax25Spec9AckProgressResetsRc: false,
+  ax25Spec13ClampSrejWindowToHalfModulus: false,
 };

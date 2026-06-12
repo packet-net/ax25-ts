@@ -12,6 +12,7 @@ import type { GuardBindings } from "./guard-evaluator.js";
 import {
   type Ax25SessionContext,
   modulus as ctxModulus,
+  effectiveWindow,
 } from "./session-context.js";
 import type { TimerScheduler } from "./timer-scheduler.js";
 
@@ -73,7 +74,7 @@ export function createSessionBindings(
   bindings.set("vs_eq_va", () => context.vs === context.va);
   bindings.set("vs_eq_va_plus_k", () => {
     const m = ctxModulus(context);
-    return ((context.vs - context.va + m) % m) >= context.k;
+    return ((context.vs - context.va + m) % m) >= effectiveWindow(context);
   });
 
   // ─── Timer state ────────────────────────────────────────────────────
@@ -226,7 +227,7 @@ export function createSessionBindings(
       if (f == null) return false;
       const m = ctxModulus(context);
       const offset = (getNs(f) - context.vr + m) % m;
-      return offset >= context.k; // N(S) outside [V(r), V(r)+k)
+      return offset >= effectiveWindow(context); // N(S) outside [V(r), V(r)+effective k)
     };
     const baseRejectException = bindings.get("reject_exception")!;
     bindings.set(
