@@ -454,10 +454,17 @@ export class Ax25Listener {
    * @param remote The peer callsign.
    * @param extended Per-call override of the listener's `preferExtendedConnect`
    *   default. Omit to use the default.
+   * @param preConnectXid Per-call override of the listener's
+   *   `preConnectXidNegotiatesSrej` default. Only takes effect on a mod-8 dial
+   *   (`extended === false`) — the v2.2/SABME path negotiates XID post-UA. The
+   *   node's per-peer capability cache uses this to skip the pre-SABM XID probe
+   *   for a neighbour it already knows does not answer one. Omit to use the
+   *   default. Mirrors C# `ConnectAsync(remote, local, extended, preConnectXidNegotiatesSrej)`.
    */
   async connect(
     remote: Callsign | string,
     extended: boolean = this.options.preferExtendedConnect,
+    preConnectXid: boolean = this.options.preConnectXidNegotiatesSrej,
   ): Promise<Ax25ListenerSession> {
     if (this.disposed) throw new Error("Ax25Listener has been disposed");
     if (!this.startedFlag) {
@@ -494,7 +501,7 @@ export class Ax25Listener {
     // XID response arrives in the budget, we fall through to a plain SABM
     // (go-back-N link). Skipped on the extended (SABME) path — that uses the
     // post-UA MDL negotiation. Mirrors C#'s NegotiateSrejBeforeConnectAsync.
-    if (!extended && this.options.preConnectXidNegotiatesSrej) {
+    if (!extended && preConnectXid) {
       await this.negotiateSrejBeforeConnect(cached);
     }
     // Budget — (N2 + 1) × T1V matches the C# heuristic.
