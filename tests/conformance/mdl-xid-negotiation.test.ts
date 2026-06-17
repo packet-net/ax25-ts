@@ -15,8 +15,11 @@
  * raised, and the version-2.0 fallback / error paths.
  */
 import { describe, expect, it } from "vitest";
+import { Callsign } from "../../src/callsign.js";
 import { type Ax25Frame, frmr, isCommand, isResponse, xid } from "../../src/frame.js";
 import type { MdlSignal } from "../../src/sdl/action-dispatcher.js";
+import { Ax25ManagementDataLink } from "../../src/sdl/management-data-link.js";
+import { createSessionContext } from "../../src/sdl/session-context.js";
 import { encodeXid, octetsToBits, type XidParameters } from "../../src/xid.js";
 import { type Endpoint, TwoStationHarness } from "./two-station-harness.js";
 
@@ -315,5 +318,30 @@ describe("v2.2 arc V3 part 2 — MDL XID parameter negotiation", () => {
 
     expect(errorCodes(h.a)).toContain("B"); // unexpected response → MDL-ERROR (B)
     expect(h.a.mdlState).toBe("Ready");
+  });
+});
+
+// ─── defaultOfferFor — the derived XID offer ──────────────────────────────────
+//
+// Change 5: when offering SREJ, the offer MUST advertise the SREJ-multiframe
+// (OPSREJMult) bit — LinBPQ's XID responder (L2Code.c ProcessXIDCommand case 3)
+// rejects the whole XID (BadXID → FRMR) without it and never negotiates SREJ.
+// Mirrors the C# Ax25ManagementDataLink.DefaultOfferFor (SrejMultiframe =
+// context.SrejEnabled).
+describe("Ax25ManagementDataLink.defaultOfferFor — SREJ-multiframe advertisement", () => {
+  it("advertises srejMultiframe when SREJ is enabled (the OPSREJMult bit BPQ requires)", () => {
+    const ctx = createSessionContext(Callsign.parse("M0LTE"), Callsign.parse("G7XYZ"));
+    ctx.srejEnabled = true;
+    const offer = Ax25ManagementDataLink.defaultOfferFor(ctx);
+    expect(offer.hdlcOptionalFunctions?.reject).toBe("selective");
+    expect(offer.hdlcOptionalFunctions?.srejMultiframe).toBe(true);
+  });
+
+  it("does not advertise srejMultiframe when SREJ is disabled (only meaningful with SREJ)", () => {
+    const ctx = createSessionContext(Callsign.parse("M0LTE"), Callsign.parse("G7XYZ"));
+    ctx.srejEnabled = false;
+    const offer = Ax25ManagementDataLink.defaultOfferFor(ctx);
+    expect(offer.hdlcOptionalFunctions?.reject).toBe("implicit");
+    expect(offer.hdlcOptionalFunctions?.srejMultiframe).toBe(false);
   });
 });

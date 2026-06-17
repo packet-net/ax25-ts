@@ -277,6 +277,60 @@ export interface Ax25SessionQuirks {
   ax25Spec45FrmrFallbackReestablishesV20: boolean;
 
   /**
+   * Work around `packethacking/ax25spec#48` — the figc4.6 `DM received`
+   * no-degrade gap. figc4.6's `AwaitingV22Connection` `DM received` handler
+   * splits on the P/F bit of the DM and only the `F=0` branch
+   * (`t11_dm_received_no`) drops back toward v2.0 (→ `AwaitingConnection`); the
+   * `F=1` branch (`t11_dm_received_yes`) treats the DM as a §975 connection
+   * *refusal* and tears the link down to `Disconnected` with **no fallback** —
+   * leaving `ctx.isExtended` stuck `true`. But a DM is precisely the signal that
+   * the peer cannot do v2.2 (it does not recognise our SABME), and a peer that
+   * DMs our *polled* SABME (P=1) correctly answers **F=1** — so a real non-v2.2
+   * peer that refuses SABME with DM(F=1) hits the teardown branch and our
+   * v2.2-preferred connect dies instead of degrading. (Verified on the wire:
+   * XRouter answers our SABME(P=1) with DM(F=1) and figc4.6 routes it straight to
+   * `Disconnected` — packet.net interop `XrouterViaNetsimExtendedMode`.) This is
+   * the DM analogue of the FRMR fallback
+   * ({@link Ax25SessionQuirks.ax25Spec45FrmrFallbackReestablishesV20}): a
+   * pre-v2.2 peer signals "no v2.2" with *either* an FRMR (BPQ) *or* a DM
+   * (XRouter), and both must degrade to v2.0/SABM rather than fail.
+   *
+   * When `true` (default), a `DM_received` firing in `AwaitingV22Connection` —
+   * for **either F=0 or F=1** — is treated exactly like the figc4.6
+   * `t14_frmr_received` v2.0 fallback: version 2.0 is forced (`ctx.isExtended =
+   * false`) and the link is re-established via **SABM** (the matched DM
+   * transition is rewritten to run `t14_frmr_received`'s action chain — SRT
+   * reset, `Establish_Data_Link` → SABM since the link is now mod-8, `Set Layer 3
+   * Initiated`, `set_version_2_0` — and lands in `AwaitingConnection`, the v2.0
+   * path). So *any* DM to our SABME means "peer can't do v2.2, retry mod-8",
+   * never a refusal. When `false` ({@link strictlyFaithfulSessionQuirks}), the
+   * figure runs as drawn: DM(F=0) drops to `AwaitingConnection` with no
+   * re-establish and DM(F=1) tears down to `Disconnected` (the §975 refusal, for
+   * strict conformance study).
+   *
+   * **Scope is the extended-connect state only.** A DM received in
+   * `AwaitingConnection` (in response to a subsequent *SABM*) stays a genuine
+   * v2.0 refusal → `Disconnected` (figc4.2 t03), unchanged — the quirk is keyed
+   * on `from === "AwaitingV22Connection"`, so it is inert once the fallback has
+   * already dropped us to the mod-8 path. Like
+   * {@link Ax25SessionQuirks.ax25Spec44Mod128ConnectRoutesToV22} /
+   * {@link Ax25SessionQuirks.ax25Spec45FrmrFallbackReestablishesV20}, this
+   * rewrites a transition in {@link SdlSessionDriver}'s dispatch path (the matched
+   * DM transition is substituted for the FRMR one in `resolveDmDegradeMatch`, and
+   * `isExtended` is forced before the actions run in `applyPreExecutionQuirks` so
+   * `Establish_Data_Link` emits SABM). Only meaningful once
+   * {@link Ax25SessionQuirks.ax25Spec44Mod128ConnectRoutesToV22} makes figc4.6
+   * reachable by an initiator. De-facto corroboration: direwolf's author hit the
+   * analogous figc4.6 no-degrade gap and made his initiator fall back rather than
+   * honour the figure-literal teardown. Delete once `ax25sdl` ships a figc4.6
+   * carrying the DM-degrades-to-v2.0 resolution. Mirrors
+   * `Ax25SessionQuirks.Ax25Spec48DmRejectionDegradesToV20` in m0lte/packet.net
+   * (the C# property is renamed from the placeholder `Ax25Spec46…`; ax25spec#46
+   * is an unrelated issue, #48 is the real upstream number).
+   */
+  ax25Spec48DmRejectionDegradesToV20: boolean;
+
+  /**
    * Work around `packethacking/ax25spec#47`: figc4.5 (Timer Recovery) draws the
    * in-sequence `I_received` stored-frame drain loop body with
    * `V(r) := V(r) - 1`, where the structurally-identical figc4.4 (Connected)
@@ -401,6 +455,7 @@ export const defaultSessionQuirks: Ax25SessionQuirks = {
   ax25Spec43DlFlowOffEntersBusy: true,
   ax25Spec44Mod128ConnectRoutesToV22: true,
   ax25Spec45FrmrFallbackReestablishesV20: true,
+  ax25Spec48DmRejectionDegradesToV20: true,
   ax25Spec47TimerRecoveryDrainAdvancesVR: true,
   ax25Spec9AckProgressResetsRc: true,
   ax25Spec13ClampSrejWindowToHalfModulus: true,
@@ -421,6 +476,7 @@ export const strictlyFaithfulSessionQuirks: Ax25SessionQuirks = {
   ax25Spec43DlFlowOffEntersBusy: false,
   ax25Spec44Mod128ConnectRoutesToV22: false,
   ax25Spec45FrmrFallbackReestablishesV20: false,
+  ax25Spec48DmRejectionDegradesToV20: false,
   ax25Spec47TimerRecoveryDrainAdvancesVR: false,
   ax25Spec9AckProgressResetsRc: false,
   ax25Spec13ClampSrejWindowToHalfModulus: false,

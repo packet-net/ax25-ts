@@ -20,10 +20,12 @@ import {
   decodeUnsignedXid,
   encodeUnsignedXid,
   encodeXid,
+  hdlcOptionalFunctionsFromOctets,
   hdlcOptionalFunctionsToOctets,
   iFieldLengthRxOctets,
   octetsToBits,
   tryParseXid,
+  type HdlcOptionalFunctions,
   type RejectMode,
   type XidParameters,
 } from "../src/xid.js";
@@ -37,19 +39,33 @@ import {
  * short-buffer cases, and the strict-vs-lenient pairing the repo requires for
  * any parser leniency.
  *
- * The bit-to-octet mapping is LSB-first within each octet (octet 0 transmitted
- * first), verified independently against Figure 4.6 — see the
- * "spec bit layout" describe block below.
+ * The 3-octet HDLC Optional Functions PV goes on the wire most-significant
+ * octet first (AX.25 v2.2 §3.8 / direwolf / LinBPQ) — verified independently
+ * against Figure 4.6 (whose printed `82 A8 22` is the byte-reversed figure
+ * error) in the "spec bit layout" describe block and the dedicated octet-order
+ * test below.
  */
 describe("XID information-field codec (§4.3.3.7 / Fig 4.5)", () => {
-  // The exact information field from Figure 4.6 (NJ7P → N7LEM), parameter
-  // field GL = 0x17 (23 octets):
+  // The information field from Figure 4.6 (NJ7P → N7LEM), parameter field
+  // GL = 0x17 (23 octets):
   //   FI GI  GL----  P2 ----------  P3 ---------------  P6 ----------  P8 ----  P9 ----------  PA ----
-  //   82 80  00 17   02 02 22 00    03 03 82 A8 22      06 02 04 00    08 01 02 09 02 10 00    0A 01 03
+  //   82 80  00 17   02 02 22 00    03 03 22 A8 82      06 02 04 00    08 01 02 09 02 10 00    0A 01 03
+  //
+  // NOTE on the HDLC Optional Functions PV (P3 = 03 03 ..): Figure 4.6 *prints*
+  // `82 A8 22`, but that is the LSB-octet-first (byte-reversed) layout and is a
+  // figure error — AX.25 v2.2 §3.8 mandates multi-octet fields go on the wire
+  // MOST-SIGNIFICANT OCTET FIRST (the order direwolf's xid.c, LinBPQ's L2Code.c,
+  // and every real peer use — verified on the wire: BPQ accepts the MSB-first PV
+  // and negotiates SREJ, and silently drops the LSB-first one). Our
+  // HdlcOptionalFunctions bit constants are numbered in the LSB-octet value
+  // space, so the SAME logical selection (REJ + modulo-128 + SREJ-multiframe +
+  // the always-1 bits) serialises to the byte-reversed octets `22 A8 82` here.
+  // The decode below recovers the identical selection. Mirrors the C#
+  // XidInfoFieldTests Figure46Info note.
   const figure46Info = new Uint8Array([
     0x82, 0x80, 0x00, 0x17,
     0x02, 0x02, 0x22, 0x00,
-    0x03, 0x03, 0x82, 0xa8, 0x22,
+    0x03, 0x03, 0x22, 0xa8, 0x82,
     0x06, 0x02, 0x04, 0x00,
     0x08, 0x01, 0x02,
     0x09, 0x02, 0x10, 0x00,
@@ -80,11 +96,12 @@ describe("XID information-field codec (§4.3.3.7 / Fig 4.5)", () => {
   // hand (LSB-first per octet, octet 0 first) and assert the bit positions the
   // Figure 4.5 table assigns.
 
-  describe("spec bit layout (LSB-first per octet) verified against Fig 4.6", () => {
+  describe("spec bit layout verified against Fig 4.6", () => {
     it("Classes-of-Procedures Fig 4.6 PV 0x22 0x00 sets bits 1 and 5", () => {
-      // The literal figure bytes. (The table puts ABM at bit 0 ⇒ 0x21; the
-      // figure put it at bit 1 ⇒ 0x22 — the documented worked-example
-      // off-by-one. Either way half-duplex is bit 5.)
+      // The literal figure bytes (Classes-of-Procedures is a 2-octet field; the
+      // figure's worked example is unaffected by the HDLC octet-order fix). The
+      // table puts ABM at bit 0 ⇒ 0x21; the figure put it at bit 1 ⇒ 0x22 — the
+      // documented worked-example off-by-one. Either way half-duplex is bit 5.
       const field = 0x22 | (0x00 << 8);
       const setBits = [...Array(16).keys()].filter((b) => (field >> b) & 1);
       expect(setBits).toEqual([1, 5]);
@@ -92,14 +109,15 @@ describe("XID information-field codec (§4.3.3.7 / Fig 4.5)", () => {
       expect((field >> 6) & 1).toBe(0); // full-duplex bit 6 clear
     });
 
-    it("HDLC-Optional-Functions Fig 4.6 PV 0x82 0xA8 0x22 sets bits 1,7,11,13,15,17,21", () => {
-      // octet0=0x82, octet1=0xA8, octet2=0x22, LSB-first per octet.
-      const field = (0x82 | (0xa8 << 8) | (0x22 << 16)) >>> 0;
+    it("HDLC-Optional-Functions Fig 4.6 selection sets bits 1,7,11,13,15,17,21", () => {
+      // The faithful MSB-octet-first wire PV for this selection is `22 A8 82`
+      // (§3.8); reconstruct the 24-bit field MSB-first (octet0 = bits 16–23).
+      const field = ((0x22 << 16) | (0xa8 << 8) | 0x82) >>> 0;
       const setBits = [...Array(24).keys()].filter((b) => (field >> b) & 1);
       // bit1=REJ, bit7=ext-addr, bit11=mod128, bit13=TEST, bit15=16-FCS,
       // bit17=sync-Tx, bit21=SREJ-multiframe — exactly the Figure 4.5 table
       // positions. Note bit 1 (REJ) is set and bit 2 (SREJ) is clear: the
-      // figure's bytes select REJ, contradicting its own "SREJ/REJ" caption.
+      // figure's selection is REJ, contradicting its own "SREJ/REJ" caption.
       expect(setBits).toEqual([1, 7, 11, 13, 15, 17, 21]);
       expect((field >> 1) & 1).toBe(1); // REJ selected
       expect((field >> 2) & 1).toBe(0); // SREJ not selected
@@ -125,11 +143,11 @@ describe("XID information-field codec (§4.3.3.7 / Fig 4.5)", () => {
     expect(p.classesOfProcedures).toBeDefined();
     expect(p.classesOfProcedures!.halfDuplex).toBe(true); // bit 5 set
 
-    // HDLC Optional Functions: PV 0x82 0xA8 0x22. Per the normative §6.3.2 bit
-    // map these bytes are REJ (bit 1) + modulo-128 (bit 11) + the always-1 bits
-    // + SREJ-multiframe (bit 21). NOTE: Figure 4.6's caption claims "SREJ/REJ";
-    // the literal bytes select REJ (bit 1 set, bit 2 clear), contradicting the
-    // caption. We decode the bytes faithfully.
+    // HDLC Optional Functions: PV 0x22 0xA8 0x82 (MSB-octet first — see the
+    // figure46Info note). Decoded, these are REJ (bit 1) + modulo-128 (bit 11)
+    // + the always-1 bits + SREJ-multiframe (bit 21). NOTE: Figure 4.6's caption
+    // claims "SREJ/REJ"; the selection is REJ (bit 1 set, bit 2 clear),
+    // contradicting the caption. We decode the bytes faithfully.
     expect(p.hdlcOptionalFunctions).toBeDefined();
     expect(p.hdlcOptionalFunctions!.reject).toBe("implicit");
     expect(p.hdlcOptionalFunctions!.modulo128).toBe(true); // bit 11
@@ -173,13 +191,13 @@ describe("XID information-field codec (§4.3.3.7 / Fig 4.5)", () => {
     // Classes-of-Procedures Balanced-ABM bit is "Bit 0" per the Figure 4.5
     // table (and ¶1077 "Bit 0 is always a 1"), so half-duplex ABM encodes as
     // 0x21 0x00. Figure 4.6's worked example instead shows 0x22 0x00 — it has
-    // placed the always-1 ABM bit at position 1, NOT 0. (Figure 4.6's HDLC
-    // field IS table-faithful: ext-addr=bit7, TEST=bit13, 16fcs=bit15,
-    // sync-tx=bit17 all land exactly per the table.) Per the repo's
-    // spec-compliant-by-default rule we follow the normative table, so byte
-    // index 6 is 0x21, not the figure's 0x22. Everything else reproduces
-    // Figure 4.6 byte-for-byte. The duplex selection (bit 5) — the only field a
-    // peer actually reads — is identical either way.
+    // placed the always-1 ABM bit at position 1, NOT 0. (The HDLC field's PV is
+    // serialised MSB-octet-first — `22 A8 82` for this selection — matching §3.8
+    // / direwolf / BPQ on the wire; see the figure46Info note.) Per the repo's
+    // spec-compliant-by-default rule we follow the normative table for the ABM
+    // bit, so byte index 6 is 0x21, not the figure's 0x22. Everything else
+    // reproduces figure46Info byte-for-byte. The duplex selection (bit 5) — the
+    // only field a peer actually reads — is identical either way.
     expect(encoded[ABM_ANOMALY_INDEX]).toBe(0x21); // table/prose (ABM at bit 0)
     expect(figure46Info[ABM_ANOMALY_INDEX]).toBe(0x22); // the literal figure byte
 
@@ -286,9 +304,11 @@ describe("XID information-field codec (§4.3.3.7 / Fig 4.5)", () => {
   it("HDLC-Optional-Functions forces the always-1 bits and encodes the prose selections", () => {
     // Default = SREJ + mod128. Verify the always-1 bits (7=ext addr, 13=TEST,
     // 15=16fcs, 17=sync tx) are set and the SREJ/mod bits encode as the prose
-    // prescribes (SREJ ⇒ bit2; mod128 ⇒ bit11).
+    // prescribes (SREJ ⇒ bit2; mod128 ⇒ bit11). hdlcOptionalFunctionsToOctets
+    // serialises MSB-octet first (octets[0] is bits 16–23); rebuild the 24-bit
+    // field accordingly before checking the (order-independent) bit positions.
     const octets = hdlcOptionalFunctionsToOctets(HDLC_OPTIONAL_FUNCTIONS_DEFAULT);
-    const field = (octets[0] | (octets[1] << 8) | (octets[2] << 16)) >>> 0;
+    const field = ((octets[0] << 16) | (octets[1] << 8) | octets[2]) >>> 0;
 
     expect((field >> 7) & 1).toBe(1); // ext address always 1
     expect((field >> 13) & 1).toBe(1); // TEST always 1
@@ -315,6 +335,55 @@ describe("XID information-field codec (§4.3.3.7 / Fig 4.5)", () => {
     if (!res.ok) return;
     expect(res.parameters.hdlcOptionalFunctions!.srejMultiframe).toBe(true);
     expect(res.parameters.hdlcOptionalFunctions!.segmenterReassembler).toBe(true);
+  });
+
+  // ─── HDLC-Optional-Functions octet order (§3.8) ──────────────────────
+  //
+  // Load-bearing for interop: §3.8 mandates multi-octet fields go on the wire
+  // most-significant octet first. BPQ negotiates SREJ only from the MSB-first
+  // PV and silently drops the byte-reversed LSB-first one. Mirrors the C#
+  // HdlcOptionalFunctions ToOctets/FromOctets `lsbOctetFirst` parameter.
+  it("serialises HDLC-Optional-Functions MSB-octet first by default (§3.8)", () => {
+    // The Figure 4.6 selection (REJ + mod128 + SREJ-multiframe + always-1 bits).
+    const sel: HdlcOptionalFunctions = {
+      reject: "implicit",
+      modulo128: true,
+      srejMultiframe: true,
+      segmenterReassembler: false,
+    };
+    // MSB-first wire bytes: the §3.8-correct order Fig 4.6 prints byte-reversed.
+    expect([...hdlcOptionalFunctionsToOctets(sel)]).toEqual([0x22, 0xa8, 0x82]);
+    // The legacy LSB-first opt-in reproduces the figure's printed bytes.
+    expect([...hdlcOptionalFunctionsToOctets(sel, true)]).toEqual([0x82, 0xa8, 0x22]);
+  });
+
+  it("decodes the MSB-first PV (default) and the LSB-first PV (opt-in) identically", () => {
+    const sel: HdlcOptionalFunctions = {
+      reject: "implicit",
+      modulo128: true,
+      srejMultiframe: true,
+      segmenterReassembler: false,
+    };
+    // Default reads octet0 as the high byte.
+    expect(hdlcOptionalFunctionsFromOctets(new Uint8Array([0x22, 0xa8, 0x82]))).toEqual(sel);
+    // Opt-in reads octet0 as the low byte (the byte-reversed figure layout).
+    expect(
+      hdlcOptionalFunctionsFromOctets(new Uint8Array([0x82, 0xa8, 0x22]), true),
+    ).toEqual(sel);
+  });
+
+  it("round-trips HDLC-Optional-Functions through the LSB-first opt-in", () => {
+    const sel: HdlcOptionalFunctions = {
+      reject: "selective",
+      modulo128: false,
+      srejMultiframe: true,
+      segmenterReassembler: true,
+    };
+    const lsb = hdlcOptionalFunctionsToOctets(sel, true);
+    expect(hdlcOptionalFunctionsFromOctets(lsb, true)).toEqual(sel);
+    // ...and the default MSB path is just the byte-reversal of the LSB path.
+    const msb = hdlcOptionalFunctionsToOctets(sel);
+    expect([...msb]).toEqual([...lsb].reverse());
   });
 
   it.each([

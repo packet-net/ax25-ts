@@ -64,6 +64,7 @@ import {
   ui,
   xid,
 } from "../../src/frame.js";
+import { defaultSessionQuirks } from "../../src/sdl/session-quirks.js";
 import { encodeXid } from "../../src/xid.js";
 import type { Endpoint } from "./two-station-harness.js";
 import { TwoStationHarness } from "./two-station-harness.js";
@@ -171,6 +172,23 @@ function New(opts: {
   n1?: number;
 } = {}): TwoStationHarness {
   const h = TwoStationHarness.build(opts);
+  h.checkAfterEachStep = false;
+  return h;
+}
+
+/**
+ * An extended-connect rig with ONLY ax25Spec48DmRejectionDegradesToV20 turned
+ * off (Spec44 still on, so the connect reaches AwaitingV22Connection). Used to
+ * exercise the figure-literal figc4.6 DM-received transitions (t11_dm_received_yes
+ * teardown / t11_dm_received_no drop) that the default-on Spec48 degrade rewrites
+ * to t14_frmr_received. Mirrors the C# `Default with { Ax25Spec48… = false }`
+ * coverage rigs.
+ */
+function dmDegradeOffRig(): TwoStationHarness {
+  const h = TwoStationHarness.build({
+    extended: true,
+    quirks: { ...defaultSessionQuirks, ax25Spec48DmRejectionDegradesToV20: false },
+  });
   h.checkAfterEachStep = false;
   return h;
 }
@@ -381,7 +399,26 @@ function runBatteryAndCollectFired(): FiredQuery {
     collect(h);
   }
 
-  // 10d-i. DM(F=1) tears the v2.2 connect down (t11_dm_received_yes).
+  // 10d-i. DM(F=1) tears the v2.2 connect down (t11_dm_received_yes →
+  // Disconnected). This is the FIGURE-LITERAL path, which only fires with
+  // ax25Spec48 OFF now: by default ax25Spec48DmRejectionDegradesToV20 rewrites a
+  // DM to the FRMR-fallback (t14_frmr_received) so a DM-ing peer (XRouter)
+  // degrades to v2.0 instead of failing. Turn off ONLY Spec48 (keep Spec44 on so
+  // the connect still reaches AwaitingV22Connection — full strictlyFaithful would
+  // park it in the mod-8 AwaitingConnection state). Mirrors C# rig 10d-i.
+  {
+    const h = dmDegradeOffRig();
+    h.dropWhen((f) => classify(f) === "SABME" && fromA(h, f));
+    h.a.driver.postEvent({ name: "DL_CONNECT_request" });
+    h.settle();
+    if (h.a.state === "AwaitingV22Connection") h.injectFrameBytes(h.a, dmTo(h.a, true));
+    collect(h);
+  }
+
+  // 10d-i-bis. DM(F=1) DEGRADES to v2.0 by default (ax25Spec48): the same DM that
+  // the Spec48-off rig above tore down now runs t14_frmr_received (force v2.0 →
+  // Establish via SABM → AwaitingConnection). Default-on rig. Mirrors C#
+  // rig 10d-i-bis.
   {
     const h = New({ extended: true });
     h.dropWhen((f) => classify(f) === "SABME" && fromA(h, f));
@@ -391,9 +428,12 @@ function runBatteryAndCollectFired(): FiredQuery {
     collect(h);
   }
 
-  // 10d-ii. DM(F=0) drops to the mod-8 AwaitingConnection state (t11_dm_received_no).
+  // 10d-ii. DM(F=0) drops to the mod-8 AwaitingConnection state
+  // (t11_dm_received_no). Figure-literal path — with ax25Spec48 off (by default
+  // Spec48 degrades this to t14 too). Keep Spec44 on so the connect reaches
+  // AwaitingV22Connection. Mirrors C# rig 10d-ii.
   {
-    const h = New({ extended: true });
+    const h = dmDegradeOffRig();
     h.dropWhen((f) => classify(f) === "SABME" && fromA(h, f));
     h.a.driver.postEvent({ name: "DL_CONNECT_request" });
     h.settle();
