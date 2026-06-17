@@ -6,6 +6,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-06-17
+
+Parity with the C# reference at packet.net **lib-v0.9.0 + lib-v0.10.0**: AX.25 v2.2-preferred CONNECT with graceful degradation, working SREJ to LinBPQ, and the per-peer capability cache's per-call dial override.
+
+### Added
+
+- **v2.2-preferred outbound CONNECT** ([#65](https://github.com/packet-net/ax25-ts/pull/65)) — `preferExtendedConnect` (default true) makes `connect()` initiate a SABME/mod-128 dial that negotiates SREJ + window, degrading cleanly to v2.0/SABM for peers that can't (the FRMR fallback `ax25Spec45…` and the new DM fallback `ax25Spec48DmRejectionDegradesToV20`, default on / off under `strictlyFaithful`, mirroring [packethacking/ax25spec#48](https://github.com/packethacking/ax25spec/issues/48)). A per-call `extended` override on `connect()`.
+- **`preConnectXidNegotiatesSrej`** ([#65](https://github.com/packet-net/ax25-ts/pull/65)) — on a mod-8 dial, runs an XID command/response **before** the SABM so LinBPQ negotiates SREJ (its `ProcessXIDCommand` only honours an XID that precedes the link); falls back to a plain SABM (go-back-N) if unanswered.
+- **Answer a pre-session XID command as responder** ([#66](https://github.com/packet-net/ax25-ts/pull/66)) — the listener now replies to an inbound XID command with no active session (plain spec-compliant MDL behaviour, §4.3.3.7 / Annex C5.3), so PDN↔PDN mod-8 interlinks negotiate SREJ instead of stalling; the subsequent SABM adopts the negotiated parameters.
+- **Per-call `preConnectXid` override on `connect()`** ([#67](https://github.com/packet-net/ax25-ts/pull/67)) — a 3rd trailing-optional `connect(remote, extended, preConnectXid)` param (defaults to the listener option), for packet.net's per-peer capability cache to skip the pre-SABM XID probe for a known non-answerer. Parity-invisible (name-deduped overload).
+
+### Changed
+
+- **HDLC Optional Functions XID PV now serialises/parses most-significant-octet first** ([#65](https://github.com/packet-net/ax25-ts/pull/65)) — a conformance fix per AX.25 v2.2 §3.8 ("high-order octet first"). The historical LSB-first order (matching Figure 4.6's printed bytes, themselves a figure error vs §3.8) meant BPQ/direwolf silently dropped our XID and SREJ never negotiated. `lsbOctetFirst` opt-in retained for regression study.
+- **NET/ROM interlinks dial v2.0/mod-8** ([#66](https://github.com/packet-net/ax25-ts/pull/66)) — interlinks are mod-8 infrastructure; `connect(neighbour, false)` instead of inheriting the prefer-extended default (BPQ's AXUDP NET/ROM port silently ignores SABME). The pre-connect XID probe is an optimistic short wait so a non-answering peer doesn't stall the dial.
+- **`defaultOfferFor` advertises `srejMultiframe`** when offering SREJ ([#65](https://github.com/packet-net/ax25-ts/pull/65)) — BPQ's XID responder requires the `OPSREJMult` bit.
+
 ## [0.13.0] — 2026-06-12
 
 Parity with the C# reference at packet.net **lib-v0.8.0**: two session-quirk figure-defect fixes and one recorded transport exception.
