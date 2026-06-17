@@ -584,14 +584,17 @@ export class Ax25Listener {
 
     cached.mdl.negotiate();
 
-    // Bounded wait: enough for the peer's XID response (a couple of T1s + loss
-    // retries on a lossy channel) without stalling a non-XID peer's connect for
-    // long. The MDL leaves Negotiating on the XID response (success), a FRMR
-    // (v2.0 fallback), or after NM201 TM201 retries (give-up).
-    const budgetMs = Math.min(
-      12_000,
-      (ctx.n2 + 1) * Math.max(1500, ctx.t1vMs),
-    );
+    // Optimistic short probe, NOT a full connection-retry budget. A peer that does
+    // pre-session XID (BPQ) answers on the FIRST frame — its XID response is immediate
+    // on the no-active-link path. A peer that doesn't (another PDN, a dumb v2.0 TNC)
+    // never answers, so waiting the full (N2+1)·T1V establishment budget (≈ up to 12 s)
+    // just stalls every mod-8 dial to it — including NET/ROM interlinks — before the
+    // SABM fallback. So wait only ~2·T1V (one command + one retry / a loss margin),
+    // floored at 1.5 s so a clean link gets a fair shot and capped at 3.5 s so a silent
+    // peer degrades to go-back-N promptly. The MDL leaves Negotiating on the XID
+    // response (success), a FRMR (v2.0 fallback), or give-up. (Adaptive per-neighbour
+    // reuse is the capability cache — remember who answers and skip the probe.)
+    const budgetMs = Math.min(3_500, Math.max(1_500, 2 * ctx.t1vMs));
     const deadline = Date.now() + budgetMs;
     while (Date.now() < deadline && cached.mdl.isNegotiating) {
       await delay(25);
@@ -894,6 +897,40 @@ export class Ax25Listener {
     // event; see the cached-session branch above). Mirrors C#'s
     // `Ax25FrameClassifier.Classify` on the cache-miss path.
     const event = classifyFrame(parsed);
+
+    // Pre-session XID *command* (a peer negotiating before it sends SABM —
+    // e.g. a PDN↔PDN NET/ROM mod-8 interlink, or BPQ's pre-connect XID). This
+    // is plain spec-compliant MDL behaviour: §4.3.3.7 — "a station receiving an
+    // XID command returns an XID response" — is unconditional (no active link
+    // required), §6.3.2 has the negotiation precede the connection, and Annex
+    // C5.3 models the MDL as a connection-independent machine. So we answer it
+    // unconditionally (no named flag / quirk / option — answering is mandatory,
+    // not opt-in) — but only when we'd accept the connection it precedes (gate
+    // on acceptIncoming, exactly like the SABM-accept path below; if we won't
+    // accept the link we shouldn't half-open from its XID).
+    //
+    // We build a real session and cache it keyed by the peer: object identity
+    // persists the negotiated link context across the XID→SABM sequence (both
+    // are keyed the same), so the subsequent inbound SABM's figc4.1 t14 "Set
+    // Version 2.0" — which clears only IsExtended, never SrejEnabled — adopts the
+    // XID-negotiated SREJ. We seed SrejEnabled=true / ImplicitReject=false so the
+    // MDL's DefaultOfferFor advertises SREJ; respondToXidCommand's §6.3.2 merge
+    // then reverts it to the mutual result (false if the peer didn't offer SREJ).
+    //
+    // No SessionAccepted is raised (there's no DL-CONNECT yet — the SABM raises
+    // it), and the scheduler is NOT cancelled/disposed (unlike the transient
+    // fall-through): the session must persist for the SABM, and the XID responder
+    // arms no timer, so nothing leaks. Mirrors the cached-session XID-command
+    // responder path above.
+    if (event.name === "XID_received" && frameIsCommand(parsed) && this.acceptIncoming) {
+      const built = this.buildSession(peer, true);
+      this.addToCache(peer, built);
+      this.options.configureSession?.(built.session);
+      built.session.context.srejEnabled = true;
+      built.session.context.implicitReject = false;
+      built.mdl.respondToXidCommand(parsed);
+      return;
+    }
 
     // Cache miss path. See C# DispatchInbound for the rationale block;
     // mirrored here.
