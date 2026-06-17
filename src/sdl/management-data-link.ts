@@ -353,7 +353,15 @@ export class Ax25ManagementDataLink {
       hdlcOptionalFunctions: {
         reject,
         modulo128: context.isExtended,
-        srejMultiframe: false,
+        // Advertise SREJ-multiframe alongside SREJ. LinBPQ's XID responder
+        // (L2Code.c ProcessXIDCommand case 3) REQUIRES the OPSREJMult bit in the
+        // command or it rejects the whole XID (BadXID → FRMR) and never
+        // negotiates SREJ; direwolf offers it as part of its SREJ "menu". We
+        // recover any incoming SREJ regardless of the multi bit, so offering it
+        // is the interoperable, harmless choice. Only meaningful when we are
+        // actually offering SREJ. Mirrors the C# DefaultOfferFor
+        // (SrejMultiframe = context.SrejEnabled).
+        srejMultiframe: context.srejEnabled,
         segmenterReassembler: context.segmenterReassemblerEnabled,
       },
       iFieldLengthRxBits: octetsToBits(context.n1),

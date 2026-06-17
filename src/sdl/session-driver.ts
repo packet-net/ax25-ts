@@ -274,11 +274,28 @@ export class SdlSessionDriver {
 
     this.currentTrigger = event;
     try {
-      const match = this.findMatchingTransition(page, event);
-      if (!match) {
+      const rawMatch = this.findMatchingTransition(page, event);
+      if (!rawMatch) {
         this.hooks.onUnhandledEvent?.(event, this.state);
         return;
       }
+
+      // figc4.6 DM-no-degrade gap (ax25Spec48DmRejectionDegradesToV20): a DM
+      // received in AwaitingV22Connection means the peer can't do v2.2, so it
+      // must degrade to v2.0/SABM exactly like the FRMR fallback — NOT honour the
+      // figure-literal F=1 teardown. Substitute the matched DM transition for
+      // figc4.6's own t14_frmr_received transition (the v2.0 re-establish). The
+      // companion isExtended=false force (applyPreExecutionQuirks) makes
+      // Establish emit SABM. See resolveDmDegradeMatch for the full rationale +
+      // scope. Mirrors the C# Ax25Session.DispatchEvent ResolveDmDegradeMatch step.
+      const match = this.resolveDmDegradeMatch(rawMatch, page);
+
+      // Observability hook fires with the EXECUTED match — the FRMR-fallback
+      // transition once the DM substitution above has happened — so the coverage
+      // ledger records the figure transition that actually runs (t14_frmr_received
+      // under the quirk; the figure-literal t11_dm_received_* only with the quirk
+      // off). Matches the C# Ax25Session.TransitionFired contract, which carries
+      // the post-substitution match.
       this.hooks.onTransitionFired?.(match, this.state);
 
       const pending: PendingFrame = { nr: null, ns: null, pfBit: null };
@@ -347,6 +364,64 @@ export class SdlSessionDriver {
     ) {
       this.context.isExtended = false;
     }
+
+    // figc4.6 DM-no-degrade gap (ax25Spec48DmRejectionDegradesToV20): a DM in
+    // AwaitingV22Connection has had its match substituted for t14_frmr_received
+    // (resolveDmDegradeMatch), so match.on is now FRMR_received and the Spec45
+    // branch above already forces v2.0 when Spec45 is on. Key this companion
+    // force on the actual DM trigger so Spec48 stays self-contained even if
+    // Spec45 is off — without it, Establish_Data_Link would re-send a SABME
+    // (still extended) and the degrade would loop against the non-v2.2 peer.
+    // Mirrors the C# Ax25Session.ApplyPreExecutionQuirks DM-trigger branch.
+    if (
+      this.context.quirks.ax25Spec48DmRejectionDegradesToV20 &&
+      this.context.isExtended &&
+      this.currentTrigger?.name === "DM_received" &&
+      match.from === "AwaitingV22Connection"
+    ) {
+      this.context.isExtended = false;
+    }
+  }
+
+  /**
+   * figc4.6 DM-no-degrade gap (`ax25Spec48DmRejectionDegradesToV20`): when a
+   * `DM received` fires in `AwaitingV22Connection` and the quirk is on,
+   * substitute the matched DM transition (either F-branch — the F=1
+   * `t11_dm_received_yes` teardown *or* the F=0 `t11_dm_received_no` passive
+   * drop) for figc4.6's `FRMR received` transition (`t14_frmr_received`), so a DM
+   * degrades the link to v2.0 and actively re-establishes via SABM — exactly as
+   * the FRMR fallback ({@link Ax25SessionQuirks.ax25Spec45FrmrFallbackReestablishesV20})
+   * does for a peer that signals "no v2.2" with an FRMR instead of a DM. The
+   * companion {@link applyPreExecutionQuirks} step forces `ctx.isExtended = false`
+   * before the actions run, so `Establish_Data_Link` (branches on `isExtended`)
+   * emits a SABM.
+   *
+   * Scope is deliberately tight: only a `DM_received` trigger, only from
+   * `AwaitingV22Connection`, only while the link is still extended. A DM received
+   * in `AwaitingConnection` (in response to a later SABM) stays a genuine v2.0
+   * refusal → `Disconnected` (figc4.2 t03), untouched. If the FRMR transition is
+   * somehow absent from the page the original DM match is returned unchanged
+   * (defensive — every figc4.6 page carries t14_frmr_received). Mirrors the C#
+   * `Ax25Session.ResolveDmDegradeMatch` (m0lte/packet.net Ax25Spec48).
+   */
+  private resolveDmDegradeMatch(
+    match: TransitionSpec,
+    page: StatePage,
+  ): TransitionSpec {
+    if (
+      !this.context.quirks.ax25Spec48DmRejectionDegradesToV20 ||
+      !this.context.isExtended ||
+      match.on !== "DM_received" ||
+      match.from !== "AwaitingV22Connection"
+    ) {
+      return match;
+    }
+
+    for (const t of page.transitions) {
+      if (t.on === "FRMR_received") return t;
+    }
+
+    return match; // defensive: figc4.6 always carries t14_frmr_received
   }
 
   /**

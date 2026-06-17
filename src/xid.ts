@@ -171,7 +171,10 @@ export type RejectMode = "implicit" | "selective";
  * the reject scheme (REJ vs SREJ) and the modulo (8 vs 128) — plus the
  * segmenter/reassembler bit; every other bit is fixed.
  *
- * Bit layout (bits 0–23; LSB-first within each octet, octet 0 first):
+ * Bit layout (bits 0–23; the bit *numbers* below are in the LSB-octet value
+ * space — bits 0–7 are the low octet, 8–15 the middle, 16–23 the high — but on
+ * the wire the 3 octets are transmitted **most-significant octet first**; see
+ * the octet-order note below):
  *   - bit 0 — Reserved: 0.
  *   - bit 1 — REJ command/response (set ⇒ implicit reject selected).
  *   - bit 2 — SREJ command/response (set ⇒ selective reject selected).
@@ -191,12 +194,31 @@ export type RejectMode = "implicit" | "selective";
  * {@link hdlcOptionalFunctionsToOctets} enforces both invariants and forces the
  * always-1 bits (7, 13, 15, 17).
  *
- * **Spec worked-example note.** Figure 4.6 shows PV 0x82 0xA8 0x22, whose
- * caption says "SREJ/REJ … Modulo 128 …". Decoded against the normative §6.3.2
- * bit map, those bytes are REJ (bit 1) + Modulo 128 (bit 11) + the always-1
- * bits + SREJ-multiframe (bit 21) — i.e. the figure selects REJ, not SREJ,
- * contradicting its own caption. We encode/decode per the normative §6.3.2
- * prose, not the figure caption; see the codec's round-trip tests.
+ * **Octet order (load-bearing for interop).** AX.25 v2.2 §3.8 ("Order of Octet
+ * and Bit Transmission") mandates multi-octet fields go on the wire
+ * **high-order octet first** (big-endian). The 3-octet HDLC Optional Functions
+ * PV is therefore serialised / parsed MSB-octet-first by default: the first
+ * octet carries bits 16–23 (incl. SREJ-multiframe, segmenter), the last carries
+ * bits 0–7 (incl. the always-1 Extended-Address bit). This is the order direwolf
+ * (`xid.c` writes `(x>>16),(x>>8),x`) and LinBPQ (`L2Code.c` writes
+ * `xidval>>16` first, parses `value = (value<<8) + *p++`) use, and it is what
+ * real peers accept — BPQ negotiates SREJ from the MSB-first PV (`22 A4 84`) and
+ * silently drops the byte-reversed LSB-first one (`84 A4 22`). The historical
+ * least-significant-octet-first layout is kept only as a non-default opt-in
+ * (`lsbOctetFirst`) for regression study and is never put on the wire by the
+ * production path.
+ *
+ * **Spec worked-example note.** Figure 4.6 *prints* PV `82 A8 22` for this
+ * selection — but that is the LSB-octet-first (byte-reversed) layout and is a
+ * figure error (it contradicts §3.8); a faithful MSB-first serialisation of the
+ * same logical selection is `22 A8 82`. Decoded against the normative §6.3.2 bit
+ * map, the selection is REJ (bit 1) + Modulo 128 (bit 11) + the always-1 bits +
+ * SREJ-multiframe (bit 21) — i.e. the figure selects REJ, not SREJ,
+ * contradicting its own "SREJ/REJ" caption. We encode/decode MSB-first per
+ * §3.8, not the figure's printed bytes; see the codec's round-trip tests.
+ *
+ * Mirrors C# `Packet.Ax25.Xid.HdlcOptionalFunctions` (`ToOctets`/`FromOctets`,
+ * `lsbOctetFirst` defaulting false = MSB-first).
  */
 export interface HdlcOptionalFunctions {
   /** The reject scheme — implicit (REJ) or selective (SREJ). */
@@ -232,12 +254,22 @@ export const HDLC_OPTIONAL_FUNCTIONS_DEFAULT: HdlcOptionalFunctions = {
 };
 
 /**
- * Encode HDLC Optional Functions to its 3-octet PV (octet 0 transmitted first).
- * Forces the always-1 bits (extended address, TEST, 16-bit FCS, synchronous Tx)
- * and sets exactly one reject bit and exactly one modulo bit.
+ * Encode HDLC Optional Functions to its 3-octet PV. Forces the always-1 bits
+ * (extended address, TEST, 16-bit FCS, synchronous Tx) and sets exactly one
+ * reject bit and exactly one modulo bit. Octet order is governed by
+ * `lsbOctetFirst`.
+ *
+ * @param lsbOctetFirst When `false` (the default, spec-correct per §3.8) the
+ *   3-octet value is transmitted **most-significant octet first** (big-endian) —
+ *   the order direwolf / LinBPQ use and real peers accept. When `true`,
+ *   reproduces the repo's historical (incorrect) least-significant-octet-first
+ *   layout — kept only for regression study and never put on the wire by the
+ *   production connect path. See the octet-order note on
+ *   {@link HdlcOptionalFunctions} and the C# `ToOctets(bool lsbOctetFirst)`.
  */
 export function hdlcOptionalFunctionsToOctets(
   hof: HdlcOptionalFunctions,
+  lsbOctetFirst = false,
 ): Uint8Array {
   let field =
     (1 << HOF_BIT_EXTENDED_ADDRESS) |
@@ -251,15 +283,14 @@ export function hdlcOptionalFunctionsToOctets(
   if (hof.srejMultiframe) field |= 1 << HOF_BIT_SREJ_MULTIFRAME;
   if (hof.segmenterReassembler) field |= 1 << HOF_BIT_SEGMENTER;
 
-  // LSB-first per octet, octet 0 first. `>>> 0` keeps the 24-bit field unsigned
-  // (bit 22/23 would otherwise make `field` negative under JS's 32-bit signed
-  // bitwise ops before the shift).
+  // `>>> 0` keeps the 24-bit field unsigned (bit 22/23 would otherwise make
+  // `field` negative under JS's 32-bit signed bitwise ops before the shift).
   field >>>= 0;
-  return new Uint8Array([
-    field & 0xff,
-    (field >>> 8) & 0xff,
-    (field >>> 16) & 0xff,
-  ]);
+  return lsbOctetFirst
+    ? // legacy (incorrect) least-significant octet first
+      new Uint8Array([field & 0xff, (field >>> 8) & 0xff, (field >>> 16) & 0xff])
+    : // spec-correct most-significant octet first (§3.8 / direwolf / BPQ)
+      new Uint8Array([(field >>> 16) & 0xff, (field >>> 8) & 0xff, field & 0xff]);
 }
 
 /**
@@ -268,13 +299,21 @@ export function hdlcOptionalFunctionsToOctets(
  * ambiguous or absent we fall back to the spec defaults (SREJ, modulo 128). The
  * fixed always-1/always-0 bits are not validated on receive — only the
  * negotiable selections are meaningful.
+ *
+ * @param lsbOctetFirst The on-the-wire octet order of `pv`; must match the order
+ *   the peer used. `false` (default, spec-correct per §3.8) reads the first
+ *   octet as the high byte (direwolf / BPQ); `true` reads the legacy
+ *   least-significant-octet-first layout. See {@link hdlcOptionalFunctionsToOctets}.
  */
 export function hdlcOptionalFunctionsFromOctets(
   pv: Uint8Array,
+  lsbOctetFirst = false,
 ): HdlcOptionalFunctions {
   let field = 0;
-  for (let i = 0; i < pv.length && i < 3; i++) {
-    field |= pv[i] << (8 * i);
+  const n = Math.min(pv.length, 3);
+  for (let i = 0; i < n; i++) {
+    const shift = lsbOctetFirst ? 8 * i : 8 * (n - 1 - i);
+    field |= pv[i] << shift;
   }
   field >>>= 0;
 
@@ -468,7 +507,10 @@ export function encodeXid(parameters: XidParameters): Uint8Array {
   }
 
   if (parameters.hdlcOptionalFunctions !== undefined) {
-    // PI=3, PL=3, PV = 24-bit field, big-endian, LSB-first per octet.
+    // PI=3, PL=3, PV = 24-bit field serialised most-significant octet first
+    // (§3.8 / Fig 4.6 logical value / direwolf / LinBPQ; see ToOctets). The
+    // historical LSB-first layout was an interop bug — BPQ silently drops it and
+    // never negotiates SREJ (proven on the wire, packet.net's SrejXidViaNetsim).
     pushParameter(
       pf,
       PI_HDLC_OPTIONAL_FUNCTIONS,

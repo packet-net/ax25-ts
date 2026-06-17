@@ -23,6 +23,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type { Ax25Frame } from "../../src/frame.js";
+import { defaultSessionQuirks } from "../../src/sdl/session-quirks.js";
 import type { Endpoint } from "./two-station-harness.js";
 import { TwoStationHarness } from "./two-station-harness.js";
 
@@ -220,11 +221,53 @@ describe("v2.2 arc V2 — mod-128 establishment + version negotiation", () => {
     expect(h.b.context.isExtended).toBe(false);
   });
 
-  // 4 — a not-capable peer answers a SABME with DM (§975 DM case). figc4.6
-  // t11_dm_received_yes tears the connect attempt down to Disconnected and
-  // indicates DL-DISCONNECT.
-  it("a DM to a SABME tears the connect attempt down to Disconnected", () => {
+  // 4 — a not-capable peer answers a SABME with DM(F=1). By DEFAULT
+  // (ax25Spec48DmRejectionDegradesToV20) this no longer tears the connect down:
+  // a DM is the signal the peer can't do v2.2, so the matched DM transition is
+  // rewritten to figc4.6's t14_frmr_received v2.0 fallback (force v2.0 →
+  // Establish via SABM → AwaitingConnection), exactly like the FRMR fallback.
+  // The DM-ing peer (XRouter-class) thereby degrades to v2.0 instead of failing.
+  it("a DM to a SABME degrades to v2.0 via SABM by default (ax25Spec48)", () => {
     const h = TwoStationHarness.build({ extended: true, k: 8 });
+
+    // Swallow the SABME so the v2.2 peer never auto-UAs; inject the DM(F=1) a
+    // not-capable peer would send.
+    h.dropWhen(
+      (f) =>
+        isSabme(f) &&
+        f.source.callsign.toString() === h.a.context.local.toString(),
+    );
+
+    h.a.driver.postEvent({ name: "DL_CONNECT_request" });
+    h.settle();
+    expect(h.a.state).toBe("AwaitingV22Connection");
+
+    h.inject(h.a, { name: "DM_received", frame: dmFinalToward(h.a) });
+
+    // The DM ran the FRMR-fallback transition (not the figure-literal teardown).
+    expect(
+      h.firedTransition("AwaitingV22Connection", "t14_frmr_received"),
+    ).toBe(true);
+    // Version 2.0 forced, so the re-establish is a SABM (not SABME).
+    expect(h.b.receivedFromPeer.some(isSabm)).toBe(true);
+    expect(h.a.context.isExtended).toBe(false); // degraded to mod-8
+    expect(h.a.state).toBe("Connected"); // the v2.0 SABM re-establish completed
+    expect(h.b.state).toBe("Connected");
+    expect(h.b.context.isExtended).toBe(false); // peer adopted mod-8 from the SABM
+  });
+
+  // 4b — figure-literal teardown, reachable only with ax25Spec48 OFF: figc4.6
+  // t11_dm_received_yes tears the connect attempt down to Disconnected and
+  // indicates DL-DISCONNECT (the §975 DM refusal). Keep ax25Spec44 ON so the
+  // connect still reaches AwaitingV22Connection (full strictlyFaithful would
+  // park it in the mod-8 AwaitingConnection state). Mirrors the C#
+  // TransitionCoverageTests "10d-i" rig (Default with Spec48 = false).
+  it("a DM to a SABME tears the connect down to Disconnected with ax25Spec48 off (figure-literal)", () => {
+    const h = TwoStationHarness.build({
+      extended: true,
+      k: 8,
+      quirks: { ...defaultSessionQuirks, ax25Spec48DmRejectionDegradesToV20: false },
+    });
 
     // Swallow the SABME so the v2.2 peer never auto-UAs; inject the DM(F=1) a
     // not-capable peer would send.
