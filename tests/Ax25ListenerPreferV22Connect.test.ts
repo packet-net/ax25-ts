@@ -33,7 +33,10 @@ const XID_BASE = 0xaf;
  * wire synchronously on dispatch. Swallow the eventual timeout rejection so it
  * doesn't surface as an unhandled rejection.
  */
-function dialAndIgnore(listener: Ax25Listener, ...args: [Callsign, boolean?]): void {
+function dialAndIgnore(
+  listener: Ax25Listener,
+  ...args: [Callsign, boolean?, boolean?]
+): void {
   void listener.connect(...args).catch(() => {});
 }
 
@@ -120,6 +123,40 @@ describe("Ax25Listener — outbound CONNECT version preference", () => {
     // The FIRST frame on a mod-8 dial is now the XID command (the LinBPQ SREJ
     // accommodation), not the SABM — the SABM follows once the XID exchange
     // settles or times out. No peer answers here, so we only assert the lead XID.
+    await transport.sentFrames.waitForCount(1, 2000);
+    expect(transport.decodedSent(0).control & 0xef).toBe(XID_BASE);
+
+    await listener.dispose();
+  });
+
+  it("per-call preConnectXid=false skips the XID and leads with SABM even when the listener default is on", async () => {
+    const transport = new LoopbackTransport();
+    const listener = new Ax25Listener(transport, {
+      myCall: LocalCall,
+      preferExtendedConnect: false, // mod-8 dial …
+      preConnectXidNegotiatesSrej: true, // … listener default would lead with XID
+    });
+    await listener.start();
+
+    dialAndIgnore(listener, PeerCall, false, false); // per-call: mod-8, no pre-connect XID
+
+    await transport.sentFrames.waitForCount(1, 2000);
+    expect(transport.decodedSent(0).control & 0xef).toBe(SABM_BASE);
+
+    await listener.dispose();
+  });
+
+  it("per-call preConnectXid=true emits the XID even when the listener default is off", async () => {
+    const transport = new LoopbackTransport();
+    const listener = new Ax25Listener(transport, {
+      myCall: LocalCall,
+      preferExtendedConnect: false, // mod-8 dial …
+      preConnectXidNegotiatesSrej: false, // … listener default would lead with SABM
+    });
+    await listener.start();
+
+    dialAndIgnore(listener, PeerCall, false, true); // per-call: mod-8, force the pre-connect XID
+
     await transport.sentFrames.waitForCount(1, 2000);
     expect(transport.decodedSent(0).control & 0xef).toBe(XID_BASE);
 
