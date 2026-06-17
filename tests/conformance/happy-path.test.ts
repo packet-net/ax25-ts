@@ -15,8 +15,10 @@
  * `Enquiry Response (F = 0)` emit the acknowledging RR, and the dispatcher grants
  * LM-SEIZE immediately (posts `LM_SEIZE_confirm`) on the contention-free single-
  * session model — so the receiver acks, the sender's V(a) advances, and windows
- * reopen. The one remaining `.skip` is mod-128 connected-mode data (cf.
- * packet.net#239), unrelated to the ack flush.
+ * reopen. mod-128 (extended) connected-mode data is now covered here too — the
+ * "mod-128 (extended) windowed data transfer converges" case below is un-skipped
+ * and green (cf. packet.net#239), and the wire leg lives in the
+ * `tests/integration/mod128-*` suite (ax25-ts#69).
  */
 import { describe, expect, it } from "vitest";
 import { TwoStationHarness } from "./two-station-harness.js";
