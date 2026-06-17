@@ -22,7 +22,7 @@ import {
   type XidParameters,
 } from "../src/xid.js";
 import { LoopbackTransport, withTimeout } from "./listener-test-support.js";
-import { sabme } from "../src/frame.js";
+import { sabm, sabme } from "../src/frame.js";
 
 const LocalCall = Callsign.parse("M0LTE");
 const PeerCall = Callsign.parse("G7XYZ-7");
@@ -101,6 +101,87 @@ describe("Ax25Listener — MDL XID responder (production path)", () => {
       expect(parsed.parameters.hdlcOptionalFunctions?.modulo128).toBe(false);
       expect(parsed.parameters.windowSizeRx).toBe(4);
     }
+
+    await listener.dispose();
+  });
+
+  it("answers a pre-session XID command, then the SABM adopts the negotiated SREJ", async () => {
+    // The PDN↔PDN NET/ROM mod-8 interlink case: the initiator does pre-SABM XID
+    // negotiation with NO active session yet. §4.3.3.7 makes answering an XID
+    // command unconditional (no active link required), so the listener must build
+    // + cache a session, answer the XID command (figc5.1 responder), and let the
+    // subsequent SABM adopt the XID-negotiated SREJ — the figc4.1 t14 "Set
+    // Version 2.0" clears only IsExtended, never SrejEnabled. (Previously this XID
+    // fell through to a transient → DM, and the initiator stalled.)
+    const transport = new LoopbackTransport();
+    const listener = new Ax25Listener(transport, { myCall: LocalCall });
+    const accepted = new Promise<Ax25ListenerSession>((resolve) => {
+      listener.onSessionAccepted((s) => resolve(s));
+    });
+
+    await listener.start();
+
+    // The peer's pre-session XID command DOES offer SREJ (a v2.2-capable peer
+    // doing mod-8 with selective reject), so the §6.3.2 merge keeps SREJ on our
+    // side — the whole point of the negotiation.
+    const peerOffer: XidParameters = {
+      classesOfProcedures: { halfDuplex: true },
+      hdlcOptionalFunctions: {
+        reject: "selective",
+        modulo128: false,
+        srejMultiframe: true,
+        segmenterReassembler: false,
+      },
+      iFieldLengthRxBits: octetsToBits(256),
+      windowSizeRx: 7,
+      ackTimerMillis: 5000,
+      retries: 10,
+    };
+    transport.injectInbound(
+      xid({
+        destination: LocalCall,
+        source: PeerCall,
+        info: encodeXid(peerOffer),
+        isCommand: true,
+        pollFinal: true,
+      }),
+    );
+
+    // The listener answers the pre-session XID command with an XID response
+    // (F=1) — no SessionAccepted yet (no DL-CONNECT until the SABM arrives).
+    await transport.sentFrames.waitForCount(1, 2000);
+    const xidReply = transport.decodedSent(0);
+    expect(isXid(xidReply)).toBe(true);
+    expect(xidReply.destination.callsign.equals(PeerCall)).toBe(true);
+    expect(pollFinal(xidReply)).toBe(true);
+    // The response echoes the agreed values — SREJ survived the merge (both
+    // sides offered it).
+    const parsedReply = tryParseXid(xidReply.info);
+    expect(parsedReply.ok).toBe(true);
+    if (parsedReply.ok) {
+      expect(parsedReply.parameters.hdlcOptionalFunctions?.reject).toBe(
+        "selective",
+      );
+      expect(parsedReply.parameters.hdlcOptionalFunctions?.srejMultiframe).toBe(
+        true,
+      );
+      expect(parsedReply.parameters.hdlcOptionalFunctions?.modulo128).toBe(
+        false,
+      );
+    }
+
+    // Now the peer sends the SABM. The cached (XID-negotiated) session answers
+    // it — the link comes up Connected at mod-8 with SREJ intact, and only now
+    // does SessionAccepted fire.
+    transport.injectInbound(sabm({ destination: LocalCall, source: PeerCall }));
+    const session = await withTimeout(accepted, 2000, "accepted");
+    await transport.sentFrames.waitForCount(2, 2000); // the UA
+    expect(session.state).toBe("Connected");
+    // The SABM adopted the XID-negotiated SREJ (Set Version 2.0 cleared only the
+    // extended bit), and stayed mod-8.
+    expect(session.context.srejEnabled).toBe(true);
+    expect(session.context.implicitReject).toBe(false);
+    expect(session.context.isExtended).toBe(false);
 
     await listener.dispose();
   });

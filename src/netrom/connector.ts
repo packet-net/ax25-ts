@@ -604,7 +604,14 @@ export class NetRomConnector {
     // fault, not a neighbour-down. Mirrors C# EnsureInterlinkAsync.
     let session: Awaited<ReturnType<NetRomInterlinkListener["connect"]>>;
     try {
-      session = await attachment.listener.connect(neighbour);
+      // NET/ROM interlinks dial v2.0 (SABM) explicitly — NOT the listener's
+      // preferExtendedConnect default. The neighbour population is overwhelmingly
+      // v2.0/mod-8 (BPQ/XRouter), and a peer that silently ignores our SABME (e.g.
+      // BPQ's AXUDP NET/ROM port) makes the dial exhaust N2 and throw instead of
+      // FRMR-degrading — breaking circuit origination. Prefer-extended is for the
+      // user's point-to-point connect, not the L3/L4 plumbing. Mirrors C#
+      // NetRomService / PortSupervisor interlink dials.
+      session = await attachment.listener.connect(neighbour, false);
     } catch (err) {
       this.onNeighbourDown(neighbour);
       throw err;
