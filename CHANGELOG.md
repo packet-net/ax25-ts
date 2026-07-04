@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Added
+
+- **Carrier-sense CSMA seam on the listener** — a new optional `carrierSense` option on `Ax25ListenerOptions` (a `CarrierSense` source with `channelBusy(): boolean | null`) the listener consults before every keyup: while it reports the channel busy the transmission is held (`CarrierSenseGate` — slot-time wait-for-clear, bounded wait, fail-open on unknown/timeout) and keys up once it clears, so the AX.25 engine itself defers a keyup while another station is transmitting. Radio-agnostic — no hardware specifics in the engine; any consumer that can observe channel occupancy supplies one. Default (omitted) is the always-clear degenerate gate — byte-for-byte the prior fire-and-forget transmit path, the SDL untouched. Exports `CarrierSense`, `CarrierSenseGate`, `CarrierSenseGateOptions`. Parity with the C# `ICarrierSense` / `Ax25ListenerOptions.CarrierSense` / `CarrierSenseGate` seam (packet.net OQ-012) — the general medium-access seam is now a first-class, parity-tracked listener option on both sides.
+
 ## [0.14.0] — 2026-06-17
 
 Parity with the C# reference at packet.net **lib-v0.9.0 + lib-v0.10.0**: AX.25 v2.2-preferred CONNECT with graceful degradation, working SREJ to LinBPQ, and the per-peer capability cache's per-call dial override.
