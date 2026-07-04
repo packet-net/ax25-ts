@@ -1,4 +1,5 @@
 import { Callsign } from "./callsign.js";
+import { type CarrierSense, CarrierSenseGate } from "./carrier-sense.js";
 import {
   type Ax25Frame,
   type Ax25ParseOptions,
@@ -127,6 +128,23 @@ export interface Ax25ListenerOptions {
    * that triggered session creation.
    */
   configureSession?: (session: Ax25ListenerSession) => void;
+
+  /**
+   * Optional carrier-sense (CSMA) source the listener consults before it keys the
+   * radio: while it reports the channel busy the transmission is held, and it keys
+   * up once the channel clears (or a bounded wait expires — fail-open). This is the
+   * general medium-access seam — any consumer that can observe channel occupancy (a
+   * hardware DCD line, a squelch/RSSI reading, a KISS DCD extension) supplies one so
+   * the AX.25 stack itself defers a keyup while another station is transmitting.
+   *
+   * Omit it (the default) for the always-clear degenerate gate: transmissions are
+   * never deferred, so behaviour is byte-for-byte the same as with no carrier-sense
+   * at all. Radio-agnostic by construction — no radio/hardware specifics leak into
+   * the engine. Mirrors C# `Ax25ListenerOptions.CarrierSense` (`ICarrierSense`),
+   * packet.net OQ-012.
+   */
+  carrierSense?: CarrierSense;
+
   /**
    * Optional sink for event-handler exceptions. The listener wraps every
    * `sessionAccepted` / `frameTraced` dispatch in try/catch so a buggy
@@ -340,7 +358,10 @@ export class Ax25Listener {
   readonly myCall: Callsign;
   private readonly transport: Ax25Transport;
   private readonly options: Required<
-    Omit<Ax25ListenerOptions, "myCall" | "configureSession" | "onHandlerError" | "quirks">
+    Omit<
+      Ax25ListenerOptions,
+      "myCall" | "configureSession" | "onHandlerError" | "quirks" | "carrierSense"
+    >
   > & {
     configureSession?: (session: Ax25ListenerSession) => void;
     onHandlerError: (err: unknown) => void;
@@ -348,6 +369,14 @@ export class Ax25Listener {
     preferExtendedConnect: boolean;
     preConnectXidNegotiatesSrej: boolean;
   };
+  /**
+   * Native carrier-sense CSMA gate: consulted before every keyup, it holds the
+   * transmission while the channel is busy. With no source injected
+   * ({@link Ax25ListenerOptions.carrierSense} omitted) it is the always-clear
+   * degenerate gate, so every send is byte-for-byte the prior fire-and-forget path.
+   * Mirrors the C# listener's `carrierSenseGate`.
+   */
+  private readonly carrierSenseGate: CarrierSenseGate;
   /** Per-peer cache keyed by the peer's canonical callsign string. */
   private readonly sessions = new Map<string, CachedSession>();
   /** LRU touch-order: oldest at the front, most-recent at the back. */
@@ -385,6 +414,8 @@ export class Ax25Listener {
           console.error("Ax25Listener handler error:", err);
         }),
     };
+    // The native medium-access gate. No source ⇒ always-clear ⇒ no deferral.
+    this.carrierSenseGate = new CarrierSenseGate(options.carrierSense ?? null);
   }
 
   /** True once {@link start} has been called and the inbound pump is running. */
@@ -699,6 +730,10 @@ export class Ax25Listener {
       pid,
       isCommand: true,
     });
+    // Native carrier-sense CSMA (OQ-012): hold the keyup while the channel is busy.
+    // waitForClear resolves immediately when there is no source or the channel is
+    // clear/unknown, so this connectionless path is unchanged when no source is wired.
+    await this.carrierSenseGate.waitForClear();
     await this.transport.send(encodeFrame(frame));
     // Trace AFTER the send so the monitor's TX order matches the wire.
     try {
@@ -735,6 +770,8 @@ export class Ax25Listener {
       isCommand: true,
       pollFinal: pollFinalBit,
     });
+    // Native carrier-sense CSMA (OQ-012): hold the keyup while the channel is busy.
+    await this.carrierSenseGate.waitForClear();
     await this.transport.send(encodeFrame(frame));
     try {
       this.traceFrame(frame, "tx");
@@ -1001,17 +1038,22 @@ export class Ax25Listener {
       isCommand: false,
       pollFinal: framePollFinal(command),
     });
-    void this.transport
-      .send(encodeFrame(frame))
-      .then(() => {
-        // Trace AFTER the send so the monitor's TX order matches the wire.
-        try {
-          this.traceFrame(frame, "tx");
-        } catch (err) {
-          this.options.onHandlerError(err);
-        }
-      })
-      .catch((err) => this.options.onHandlerError(err));
+    // Native carrier-sense CSMA (OQ-012): hold the courtesy echo while the channel
+    // is busy. gatedSend runs synchronously when there is no source or the channel
+    // is clear — unchanged when no carrier-sense is wired.
+    this.carrierSenseGate.gatedSend(() => {
+      void this.transport
+        .send(encodeFrame(frame))
+        .then(() => {
+          // Trace AFTER the send so the monitor's TX order matches the wire.
+          try {
+            this.traceFrame(frame, "tx");
+          } catch (err) {
+            this.options.onHandlerError(err);
+          }
+        })
+        .catch((err) => this.options.onHandlerError(err));
+    });
   }
 
   private buildSession(peer: Callsign, allowAccept: boolean): CachedSession {
@@ -1035,7 +1077,14 @@ export class Ax25Listener {
     const sendFrame = (frame: Ax25Frame): void => {
       // Fire-and-forget — the dispatcher's frame sinks are sync.
       const bytes = encodeFrame(frame);
-      void this.transport.send(bytes);
+      // Native carrier-sense CSMA (OQ-012): hold the keyup while the channel is
+      // busy, then send. gatedSend runs the send SYNCHRONOUSLY when there is no
+      // source or the channel is clear, so with no carrier-sense wired this is the
+      // same synchronous fire-and-forget send as before — no reordering, no extra
+      // hop, and the SDL transition behaviour is untouched.
+      this.carrierSenseGate.gatedSend(() => {
+        void this.transport.send(bytes);
+      });
       try {
         this.traceFrame(frame, "tx");
       } catch (err) {

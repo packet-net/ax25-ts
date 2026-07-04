@@ -141,6 +141,11 @@ export {
   type Ax25FrameTracedEvent,
   type FrameDirection,
 } from "./listener.js";
+export {
+  type CarrierSense,
+  type CarrierSenseGateOptions,
+  CarrierSenseGate,
+} from "./carrier-sense.js";
 export type { Ax25Event } from "./sdl/events.js";
 export { classifyFrame } from "./sdl/frame-classifier.js";
 export {
