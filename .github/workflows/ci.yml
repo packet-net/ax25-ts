@@ -80,10 +80,28 @@ jobs:
             "https://x-access-token:${PACKETNET_READ_TOKEN}@github.com/m0lte/packet.net.git" "${RUNNER_TEMP}/packet.net"
           git -C "${RUNNER_TEMP}/packet.net" sparse-checkout set src/Packet.Core src/Packet.Ax25
 
+      # The Rust leg of the 3-way mirror: pico-node (packet-net/pico-node) is
+      # PUBLIC, so unlike the packet.net clone above this needs no token and is
+      # always armed. We only need its parity contract — the manifest, the
+      # vendored C# expected-inventory map, and the exceptions — so a blobless
+      # sparse checkout of the parity artifacts is enough. If this clone fails
+      # or the artifacts are absent the parity-check step's --rust leg exits
+      # non-zero and fails the job (a true gate), matching the packet.net side.
+      - name: clone packet-net/pico-node (shallow, parity artifacts)
+        run: |
+          rm -rf "${RUNNER_TEMP}/pico-node"
+          git clone --depth=1 --branch main --filter=blob:none --sparse \
+            "https://github.com/packet-net/pico-node.git" "${RUNNER_TEMP}/pico-node"
+          git -C "${RUNNER_TEMP}/pico-node" sparse-checkout set parity-manifest.toml parity-exceptions.json parity
+
       - name: parity check
         run: |
           if [ ! -d "${RUNNER_TEMP}/packet.net/src" ]; then
             echo "parity check skipped (no packet.net clone — see the warning above)."
             exit 0
           fi
-          node scripts/parity-check.mjs --csharp "${RUNNER_TEMP}/packet.net"
+          # 3-way mirror: C# (packet.net) authoritative ⊆ TS (this repo) AND
+          # ⊆ Rust (pico-node's declared coverage). Drift on any side fails here.
+          node scripts/parity-check.mjs \
+            --csharp "${RUNNER_TEMP}/packet.net" \
+            --rust "${RUNNER_TEMP}/pico-node"
