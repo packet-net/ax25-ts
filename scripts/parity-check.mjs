@@ -29,6 +29,31 @@
  * reason each — an exception is a *reviewed decision*, not a hole. The guard
  * fails on any gap that is neither aliased nor excepted.
  *
+ * ── The optional third leg: C# ⊆ Rust (pico-node) ─────────────────────
+ *
+ * With `--rust <pico-node root>` this script becomes a TRUE 3-way mirror
+ * (C# authoritative ↔ TS @packet-net/ax25 ↔ Rust pico-node). The Rust leg
+ * reuses the SAME live C# inventory extracted above (single C# source of
+ * truth — pico-node's C# side is NOT re-vendored or hard-coded here), then
+ * reads pico-node's declared position:
+ *
+ *   - parity-manifest.toml            — opted-in / declared-out vector sets
+ *                                        and the capabilities each declares;
+ *   - parity/expected-inventory.json  — the map from each C# inventory item
+ *                                        (section + name) to the vector-set /
+ *                                        capability that covers it;
+ *   - parity-exceptions.json          — reviewed, reason-carrying omissions.
+ *
+ * and asserts C#-inventory ⊆ pico-node-declared exactly as pico-node's own
+ * scripts/parity-check.mjs does: every live C# item is EITHER mapped (in
+ * expected-inventory.json) to an opted-in set whose capabilities include the
+ * named one, OR listed in parity-exceptions.json with a reason. Anything that
+ * is neither is drift and fails the build. Because the item LIST comes from
+ * live C# extraction (not pico-node's vendored snapshot), this leg also bites
+ * when C# grows an item pico-node's manifest+snapshot don't yet cover — it
+ * keeps that vendored snapshot honest. Without `--rust`, behaviour is
+ * identical to before (backward-compatible).
+ *
  * Extraction is regex-over-source on purpose: no build of either repo is
  * needed, so the check runs in seconds on a shallow sparse clone. It leans
  * on both repos' stable formatting (root-level class braces at column 0,
@@ -36,9 +61,9 @@
  * loudly with "inventory came back empty" — fix the regex, don't skip the
  * check.
  *
- * Usage: node scripts/parity-check.mjs --csharp <packet.net root> [--ts <ax25-ts root>]
+ * Usage: node scripts/parity-check.mjs --csharp <packet.net root> [--ts <ax25-ts root>] [--rust <pico-node root>]
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -49,8 +74,9 @@ function argValue(name, fallback) {
 }
 const tsRoot = argValue("--ts", join(dirname(fileURLToPath(import.meta.url)), ".."));
 const csRoot = argValue("--csharp", null);
+const rustRoot = argValue("--rust", null);
 if (!csRoot) {
-  console.error("usage: parity-check.mjs --csharp <packet.net root> [--ts <ax25-ts root>]");
+  console.error("usage: parity-check.mjs --csharp <packet.net root> [--ts <ax25-ts root>] [--rust <pico-node root>]");
   process.exit(2);
 }
 
@@ -132,17 +158,22 @@ function compare(section, csNames, tsNames, mapCsToTs, exceptionMap) {
 const csParse = read(join(csRoot, "src/Packet.Core/Ax25ParseOptions.cs"));
 const tsFrame = read(join(tsRoot, "src/frame.ts"));
 
+// The extracted C# inventories are captured into named consts so the Rust
+// leg (below) can reuse the SAME arrays — a single live C# source of truth
+// feeding both the TS comparison and the pico-node coverage check.
+const csParseFlags = csBoolProps(csParse);
 compare(
   "Ax25ParseOptions flags",
-  csBoolProps(csParse),
+  csParseFlags,
   tsInterfaceMembers(tsFrame, "Ax25ParseOptions"),
   camel,
   exceptions.parseOptionFlags ?? {},
 );
 
+const csParsePresets = csStaticPresets(csParse, "Ax25ParseOptions");
 compare(
   "Ax25ParseOptions presets",
-  csStaticPresets(csParse, "Ax25ParseOptions"),
+  csParsePresets,
   [...tsFrame.matchAll(/^export const (\w+)_PARSE\b/gm)].map((m) => `${m[1]}_PARSE`),
   (n) => `${n.toUpperCase()}_PARSE`,
   exceptions.parsePresets ?? {},
@@ -152,17 +183,19 @@ compare(
 const csQuirks = read(join(csRoot, "src/Packet.Ax25/Session/Ax25SessionQuirks.cs"));
 const tsQuirks = read(join(tsRoot, "src/sdl/session-quirks.ts"));
 
+const csQuirkFlags = csBoolProps(csQuirks);
 compare(
   "Ax25SessionQuirks flags",
-  csBoolProps(csQuirks),
+  csQuirkFlags,
   tsInterfaceMembers(tsQuirks, "Ax25SessionQuirks"),
   camel,
   exceptions.quirkFlags ?? {},
 );
 
+const csQuirkPresets = csStaticPresets(csQuirks, "Ax25SessionQuirks");
 compare(
   "Ax25SessionQuirks presets",
-  csStaticPresets(csQuirks, "Ax25SessionQuirks"),
+  csQuirkPresets,
   [...tsQuirks.matchAll(/^export const (\w+)\s*:\s*Ax25SessionQuirks/gm)].map((m) => m[1]),
   (n) => `${camel(n)}SessionQuirks`,
   exceptions.quirkPresets ?? {},
@@ -172,9 +205,10 @@ compare(
 const csXid = read(join(csRoot, "src/Packet.Ax25/Xid/XidParseOptions.cs"));
 const tsXid = read(join(tsRoot, "src/xid.ts"));
 
+const csXidFlags = csBoolProps(csXid);
 compare(
   "XidParseOptions flags",
-  csBoolProps(csXid),
+  csXidFlags,
   tsInterfaceMembers(tsXid, "XidParseOptions"),
   camel,
   exceptions.xidFlags ?? {},
@@ -218,6 +252,7 @@ const csSurface = [
   // public events
   ...[...csListenerBody.matchAll(/^\s{4}public event [\w<>?. ]+? (\w+);/gm)].map((m) => m[1]),
 ].filter((n) => n !== "Ax25Listener"); // constructors
+const csListenerSurface = [...new Set(csSurface)];
 
 const methodAlias = {
   StartAsync: "start",
@@ -239,18 +274,198 @@ const tsSurface = [
 
 compare(
   "Ax25Listener public surface",
-  [...new Set(csSurface)],
+  csListenerSurface,
   [...new Set(tsSurface)],
   (n) => methodAlias[n] ?? camel(n),
   exceptions.listenerSurface ?? {},
 );
+
+// ─── 6. (optional) C# ⊆ Rust (pico-node) ──────────────────────────────
+// The same live C# inventory, checked against pico-node's declared coverage.
+// Section keys here MUST match parity/expected-inventory.json's `section`
+// field and pico-node's own guard: parseOptionFlags, parsePresets, quirkFlags,
+// quirkPresets, xidFlags, listenerOptions, listenerSurface.
+if (rustRoot !== null) {
+  rustLeg(rustRoot);
+}
+
+function rustLeg(root) {
+  const manifestPath = join(root, "parity-manifest.toml");
+  const inventoryPath = join(root, "parity", "expected-inventory.json");
+  const exceptionsPath = join(root, "parity-exceptions.json");
+  for (const [label, p] of [
+    ["parity-manifest.toml", manifestPath],
+    ["parity/expected-inventory.json", inventoryPath],
+    ["parity-exceptions.json", exceptionsPath],
+  ]) {
+    if (!existsSync(p)) {
+      console.error(
+        `\nerror: --rust ${root} is missing ${label} (${p}). Point --rust at a ` +
+          `pico-node checkout that carries its parity manifest, expected-inventory ` +
+          `snapshot, and exceptions.`,
+      );
+      process.exit(2);
+    }
+  }
+
+  const manifest = parseToml(read(manifestPath));
+  const rustInventory = JSON.parse(read(inventoryPath));
+  const rustExceptions = JSON.parse(read(exceptionsPath));
+
+  const vectorSets = manifest.vector_sets ?? {};
+  const inventoryExceptions = rustExceptions.inventoryExceptions ?? {};
+
+  // Map (section → name → coverage) from pico-node's expected-inventory. This
+  // is ONLY the coverage MAPPING; the item LIST comes from live C# above.
+  const coverageOf = {};
+  for (const item of rustInventory.items ?? []) {
+    (coverageOf[item.section] ??= {})[item.name] = item.coverage ?? null;
+  }
+
+  // The live C# inventory, assembled from the SAME arrays the TS legs used.
+  const liveInventory = [
+    ...csParseFlags.map((name) => ["parseOptionFlags", name]),
+    ...csParsePresets.map((name) => ["parsePresets", name]),
+    ...csQuirkFlags.map((name) => ["quirkFlags", name]),
+    ...csQuirkPresets.map((name) => ["quirkPresets", name]),
+    ...csXidFlags.map((name) => ["xidFlags", name]),
+    ...csOptionNames.map((name) => ["listenerOptions", name]),
+    ...csListenerSurface.map((name) => ["listenerSurface", name]),
+  ];
+
+  console.log("\nC# ⊆ Rust (pico-node) coverage:");
+  console.log(`  manifest:  ${manifestPath}`);
+  console.log(`  inventory: ${inventoryPath}`);
+
+  const rows = [];
+  let covered = 0, excepted = 0, gaps = 0;
+  for (const [section, name] of liveInventory) {
+    // `coverage` may be: an object {set, capability?} (mapped), or absent from
+    // expected-inventory entirely (undefined → treat as unmapped).
+    const coverage =
+      section in coverageOf && name in coverageOf[section] ? coverageOf[section][name] : undefined;
+    const exceptionReason = inventoryExceptions[section]?.[name];
+
+    let status, detail;
+    if (coverage && coverage.set) {
+      const set = vectorSets[coverage.set];
+      if (!set) {
+        status = "GAP"; detail = `coverage set '${coverage.set}' not in manifest`;
+      } else if (set.in !== true) {
+        status = "GAP"; detail = `coverage set '${coverage.set}' is declared-out (in=false)`;
+      } else if (coverage.capability && !(set.capabilities ?? []).includes(coverage.capability)) {
+        status = "GAP"; detail = `set '${coverage.set}' does not declare capability '${coverage.capability}'`;
+      } else {
+        status = "OK"; detail = `${coverage.set}${coverage.capability ? " / " + coverage.capability : ""}`;
+      }
+    } else if (exceptionReason) {
+      status = "EXCEPT"; detail = exceptionReason;
+    } else if (coverage === undefined) {
+      status = "GAP"; detail = "not in pico-node expected-inventory and no exception (C# gained an item pico-node hasn't mapped)";
+    } else {
+      status = "GAP"; detail = "no coverage mapping and no exception";
+    }
+
+    // An item can be BOTH excepted and (accidentally) mapped — if mapping fails
+    // but an exception exists, honour the exception rather than failing.
+    if (status === "GAP" && exceptionReason) {
+      status = "EXCEPT"; detail = exceptionReason;
+    }
+
+    if (status === "OK") covered++;
+    else if (status === "EXCEPT") { excepted++; notes++; }
+    else { gaps++; failures++; }
+    rows.push({ status, section, name, detail });
+  }
+
+  const glyph = { OK: "✓", EXCEPT: "~", GAP: "✗" };
+  let lastSection = "";
+  for (const r of rows) {
+    if (r.section !== lastSection) { console.log(""); lastSection = r.section; }
+    const detail = r.status === "EXCEPT" && r.detail.length > 68 ? r.detail.slice(0, 65) + "..." : r.detail;
+    console.log(`  ${glyph[r.status]} ${r.section}.${r.name} — ${detail}`);
+  }
+  console.log(
+    `\n  ${gaps === 0 ? "✓" : "✗"} pico-node coverage: ${covered} covered, ${excepted} excepted, ${gaps} gap(s)`,
+  );
+}
+
+// ─── minimal TOML reader (for the optional Rust leg) ──────────────────
+// Enough for pico-node's parity-manifest.toml: top-level scalars, [a.b.c]
+// tables, and key = <bool | int | "string" | ["a", "b"]>. No external
+// dependency, matching this script's node:builtins-only posture and mirroring
+// pico-node's own scripts/parity-check.mjs reader.
+function stripComment(line) {
+  let inStr = false, q = "";
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inStr) { if (c === q) inStr = false; continue; }
+    if (c === '"' || c === "'") { inStr = true; q = c; continue; }
+    if (c === "#") return line.slice(0, i);
+  }
+  return line;
+}
+function splitTopLevel(s) {
+  const out = [];
+  let cur = "", inStr = false, q = "";
+  for (const c of s) {
+    if (inStr) { cur += c; if (c === q) inStr = false; continue; }
+    if (c === '"' || c === "'") { inStr = true; q = c; cur += c; continue; }
+    if (c === ",") { if (cur.trim()) out.push(cur.trim()); cur = ""; continue; }
+    cur += c;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+function parseValue(s) {
+  s = s.trim();
+  if (s === "true") return true;
+  if (s === "false") return false;
+  if (/^-?\d+$/.test(s)) return parseInt(s, 10);
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    return s.slice(1, -1);
+  }
+  if (s.startsWith("[")) {
+    const inner = s.slice(1, s.lastIndexOf("]"));
+    return inner.trim() ? splitTopLevel(inner).map(parseValue) : [];
+  }
+  return s; // bare fallback
+}
+function parseToml(text) {
+  const root = {};
+  let current = root;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = stripComment(raw).trim();
+    if (!line) continue;
+    if (line.startsWith("[")) {
+      const name = line.slice(1, line.indexOf("]")).trim();
+      const parts = name.split(".").map((s) => s.trim().replace(/^["']|["']$/g, ""));
+      current = root;
+      for (const p of parts) {
+        if (typeof current[p] !== "object" || current[p] === null) current[p] = {};
+        current = current[p];
+      }
+      continue;
+    }
+    const eq = line.indexOf("=");
+    if (eq < 0) continue;
+    const key = line.slice(0, eq).trim().replace(/^["']|["']$/g, "");
+    current[key] = parseValue(line.slice(eq + 1));
+  }
+  return root;
+}
 
 // ─── verdict ──────────────────────────────────────────────────────────
 console.log("");
 if (failures > 0) {
   console.log(
     `PARITY DRIFT: ${failures} gap(s). Either add the TS counterpart, or record ` +
-      `a reviewed exception (with a reason) in scripts/parity-exceptions.json.`,
+      `a reviewed exception (with a reason) in scripts/parity-exceptions.json.` +
+      (rustRoot !== null
+        ? " For a Rust-leg gap, map the C# item to an opted-in vector_set in " +
+          "pico-node's parity-manifest.toml (+ parity/expected-inventory.json), or " +
+          "record a reviewed exception in its parity-exceptions.json."
+        : ""),
   );
   process.exit(1);
 }
