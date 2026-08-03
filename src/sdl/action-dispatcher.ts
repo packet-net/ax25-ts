@@ -311,33 +311,6 @@ export class ActionDispatcher {
       }
     }
 
-    // Quirk ax25Spec38SrejSelectiveRetransmit (default on): figc4.5 draws
-    // the SREJ-received retransmit as the generic fresh-DL-DATA push +
-    // go-back-N "Invoke Retransmission", contradicting §4.3.2.4/figc4.4 and
-    // every implementation (packethacking/ax25spec#38). On an SREJ trigger
-    // we do single-frame selective retransmit instead: redirect the push to
-    // the figc4.4 "Push Old I Frame N(r) on Queue" behaviour, and skip the
-    // go-back-N. Remove once ax25sdl ships a corrected figc4.5. Mirrors the
-    // C# ActionDispatcher.Execute interception (m0lte/packet.net #228).
-    if (
-      ctx.quirks.ax25Spec38SrejSelectiveRetransmit &&
-      tx.event.name === "SREJ_received"
-    ) {
-      switch (verb) {
-        case "push_frame_on_queue":
-        case "Push on I Frame Queue":
-        case "Push on I Frame Queue (note: word order?)":
-        case "Push I Frame on I Queue":
-          // Redirect the fresh-DL-DATA push to the figc4.4 single-frame
-          // selective retransmit (the N(r) frame from storage).
-          pushOldIFrameNrOnQueue(tx);
-          return;
-        case "Invoke Retransmission":
-          // Skip the go-back-N retransmission entirely.
-          return;
-      }
-    }
-
     // Quirk ax25Spec42SrejTargetsGap (default on): figc4.4's out-of-sequence
     // I_received SREJ path (with a selective-reject exception already
     // outstanding) does `N(r) := N(s)` before SREJ — requesting the frame

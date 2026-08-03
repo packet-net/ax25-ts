@@ -61,23 +61,21 @@ jobs:
       # from packet.net main and compares them to ours, failing on any gap
       # that is not a reviewed exception in scripts/parity-exceptions.json.
       # The mirror of this check runs in packet.net's interop.yml (against its
-      # PR head + our main) — packet.net is PRIVATE, so that copy is the one
-      # that needs no credentials and is always armed; this one needs a
-      # fine-grained read-only PAT for packet.net (Contents: read) stored as
-      # the PACKETNET_READ_TOKEN secret. Without the secret the job warns and
-      # skips rather than blocking every PR — add the token to arm it.
-      - name: clone m0lte/packet.net (shallow, source only)
-        env:
-          PACKETNET_READ_TOKEN: ${{ secrets.PACKETNET_READ_TOKEN }}
+      # head + our main), so drift fails on whichever side introduces it.
+      #
+      # packet-net/packet.net is PUBLIC, so this clone needs no credentials and
+      # this side is always armed. It used to point at the pre-split private
+      # m0lte/packet.net behind a PACKETNET_READ_TOKEN secret, and when that
+      # secret was absent the step WARNED AND SKIPPED — so the C#-vs-TS leg of
+      # this guard quietly verified nothing while still reporting success. That
+      # is the same failure shape packet.net hit on its own side
+      # (packet-net/packet.net#677): a guard that looks armed while testing
+      # nothing. No token, no skip path.
+      - name: clone packet-net/packet.net (shallow, source only)
         run: |
-          if [ -z "$PACKETNET_READ_TOKEN" ]; then
-            echo "::warning title=parity drift guard not armed::PACKETNET_READ_TOKEN secret is not set, and m0lte/packet.net is private — the TS-side parity check was SKIPPED. The packet.net-side mirror (interop.yml) still enforces. To arm this side: create a fine-grained PAT with read-only Contents access to m0lte/packet.net and add it as the PACKETNET_READ_TOKEN actions secret."
-            echo "skipped=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           rm -rf "${RUNNER_TEMP}/packet.net"
           git clone --depth=1 --branch main --filter=blob:none --sparse \
-            "https://x-access-token:${PACKETNET_READ_TOKEN}@github.com/m0lte/packet.net.git" "${RUNNER_TEMP}/packet.net"
+            https://github.com/packet-net/packet.net.git "${RUNNER_TEMP}/packet.net"
           git -C "${RUNNER_TEMP}/packet.net" sparse-checkout set src/Packet.Core src/Packet.Ax25
 
       # The Rust leg of the 3-way mirror: pico-node (packet-net/pico-node) is
@@ -100,9 +98,11 @@ jobs:
 
       - name: parity check
         run: |
+          # No skip path: the clone above is unauthenticated against a public repo, so
+          # a missing checkout is a real failure, not a reason to pass quietly.
           if [ ! -d "${RUNNER_TEMP}/packet.net/src" ]; then
-            echo "parity check skipped (no packet.net clone — see the warning above)."
-            exit 0
+            echo "::error title=parity clone missing::packet.net was not cloned — the C#-vs-TS leg cannot run."
+            exit 1
           fi
           # 3-way mirror: C# (packet.net) authoritative ⊆ TS (this repo) AND
           # ⊆ Rust (pico-node's declared coverage). Drift on any side fails here.
