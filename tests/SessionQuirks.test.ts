@@ -1,13 +1,13 @@
 /**
- * The `ax25Spec38SrejSelectiveRetransmit` session quirk
- * (packethacking/ax25spec#38). figc4.5 draws SREJ-received as the generic
- * fresh-DL-DATA "Push frame onto queue" verb followed by go-back-N "Invoke
- * Retransmission", contradicting §4.3.2.4/§6.4.8, figc4.4, and every
- * implementation. With the quirk on (default) the runtime does single-frame
- * selective retransmit; with it off (strictly-faithful) it runs the figure as
- * drawn — which throws on the payload-less push.
+ * Session-quirk behaviour at the dispatcher level.
  *
- * TS port of packet.net's `Ax25SessionQuirksTests` (m0lte/packet.net #228).
+ * The `ax25Spec38SrejSelectiveRetransmit` quirk that this file was originally
+ * written for is **retired** (2026-08-03): `ax25sdl` 0.10.2 ships the corrected
+ * figc4.5, which does single-frame selective retransmit natively on all four
+ * SREJ paths, so the workaround had nothing left to rewrite. Its cases fed the
+ * dispatcher hand-authored verb lists the tables no longer emit, and went with
+ * it. What remains is `srejCommandIgnored` — the deliberate decision to keep
+ * ignoring an SREJ sent as a COMMAND (packet-net/packet.net#674).
  */
 import { describe, expect, it } from "vitest";
 import { Callsign } from "../src/callsign.js";
@@ -162,45 +162,3 @@ describe("srejCommandIgnored quirk", () => {
   });
 });
 
-describe("Ax25Spec38 SREJ selective-retransmit quirk", () => {
-  it("quirk on does single-frame selective retransmit, not go-back-N", () => {
-    const { dispatcher, ctx, wire, makeTx } = newRig(defaultSessionQuirks); // on (default)
-    const tx = makeTx(srejEvent(ctx.local, ctx.remote, 1));
-
-    // The figc4.5 SREJ-received retransmit verbs as the table draws them.
-    dispatcher.execute(
-      [
-        { verb: "push_frame_on_queue" },
-        { verb: "Invoke Retransmission" },
-      ],
-      tx,
-      "TimerRecovery",
-    );
-
-    // SREJ must selectively retransmit only the single N(r) frame, not
-    // go-back-N the whole window. The retransmit emits DIRECTLY on the wire
-    // (not via the fresh-frame queue) carrying its ORIGINAL N(s)=1 — the
-    // packet.net#231 fix; a queued retransmit would be renumbered to V(s)=3.
-    const iframes = wire.filter((f) => classify(f) === "I");
-    expect(iframes.length).toBe(1);
-    expect(getNs(iframes[0]!)).toBe(1);
-    expect(Array.from(iframes[0]!.info)).toEqual([1]);
-    // Nothing parked on the fresh-frame queue; V(s) unchanged (retransmit is
-    // a replay, not a new transmission).
-    expect(ctx.iFrameQueue.length).toBe(0);
-    expect(ctx.vs).toBe(3);
-  });
-
-  it("quirk off runs the figure as drawn and throws on the payload-less push", () => {
-    const { dispatcher, ctx, makeTx } = newRig(strictlyFaithfulSessionQuirks); // off
-    const tx = makeTx(srejEvent(ctx.local, ctx.remote, 1));
-
-    // With the quirk off the figc4.5 figure runs as drawn — the fresh-DL-DATA
-    // push carries no payload on an SREJ trigger and throws (the #38 defect,
-    // faithfully reproduced).
-    expect(() =>
-      dispatcher.execute([{ verb: "push_frame_on_queue" }], tx, "TimerRecovery"),
-    ).toThrow();
-    expect(ctx.iFrameQueue.length).toBe(0);
-  });
-});
