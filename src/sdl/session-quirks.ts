@@ -105,6 +105,34 @@ export interface Ax25SessionQuirks {
   ax25Spec38SrejSelectiveRetransmit: boolean;
 
   /**
+   * Ignore the retransmission request carried by a received SREJ sent as a
+   * **command**, while still honouring the acknowledgement it carries.
+   * Default `true` — matching every surveyed implementation.
+   *
+   * AX.25 v2.2 §4.3.2.4 says "The SREJ frame is only sent as a response", so
+   * a peer that sends one as a command is already off-spec, and no deployed
+   * stack acts on receiving one: direwolf omits the path outright
+   * (`src/ax25_link.c` `srej_frame`: "Command path has been omitted because
+   * SREJ can only be response") and linbpq gates the resend on
+   * `if (MSGFLAG & RESP)` (`L2Code.c` SFRAME). Both still process the N(R)
+   * acknowledgement, and so do we — this suppresses only the retransmission.
+   *
+   * It needed a flag because the corrected figc4.5 (`ax25sdl` 0.10.1+ ←
+   * `packethacking/ax25spec#65`) gives all four SREJ paths a native
+   * single-frame selective retransmit, which makes the command form
+   * actionable for the first time. Before that correction the command paths
+   * carried only the go-back-N `Invoke Retransmission` that
+   * {@link Ax25SessionQuirks.ax25Spec38SrejSelectiveRetransmit} skipped, so
+   * the command form retransmitted nothing *by accident*. When `false`
+   * ({@link strictlyFaithfulSessionQuirks}), the corrected figure runs
+   * exactly as drawn and the command form selectively retransmits N(r).
+   *
+   * Mirrors `Ax25SessionQuirks.SrejCommandIgnored` in packet-net/packet.net
+   * (issue #674).
+   */
+  srejCommandIgnored: boolean;
+
+  /**
    * Work around `packethacking/ax25spec#40`: figc4.4's out-of-sequence
    * `I_received` handling has no receive-window guard. Any frame whose
    * N(S) ≠ V(R) is treated as a future gap and gets SREJ'd (or REJ'd) —
@@ -449,6 +477,7 @@ export interface Ax25SessionQuirks {
 export const defaultSessionQuirks: Ax25SessionQuirks = {
   segmentFirstCarriesL3Pid: true,
   ax25Spec38SrejSelectiveRetransmit: true,
+  srejCommandIgnored: true,
   ax25Spec40DiscardOutOfWindowIFrames: true,
   ax25Spec41KarnSrtSampling: true,
   ax25Spec42SrejTargetsGap: true,
@@ -470,6 +499,7 @@ export const defaultSessionQuirks: Ax25SessionQuirks = {
 export const strictlyFaithfulSessionQuirks: Ax25SessionQuirks = {
   segmentFirstCarriesL3Pid: false,
   ax25Spec38SrejSelectiveRetransmit: false,
+  srejCommandIgnored: false,
   ax25Spec40DiscardOutOfWindowIFrames: false,
   ax25Spec41KarnSrtSampling: false,
   ax25Spec42SrejTargetsGap: false,

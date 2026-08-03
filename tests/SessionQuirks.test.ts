@@ -76,6 +76,21 @@ function newRig(quirks: Ax25SessionQuirks): {
 // peer's N(R). The dispatcher only reads N(R) (via getNr), so a REJ frame
 // with the same N(R) field is a faithful stand-in — there's no public SREJ
 // factory yet.
+function srejCommandEvent(
+  local: Callsign,
+  remote: Callsign,
+  nr: number,
+): Ax25Event {
+  const frame = rej({
+    destination: local,
+    source: remote,
+    nr,
+    isCommand: true,
+    pollFinal: true,
+  });
+  return { name: "SREJ_received", frame };
+}
+
 function srejEvent(local: Callsign, remote: Callsign, nr: number): Ax25Event {
   const frame = rej({
     destination: local,
@@ -86,6 +101,66 @@ function srejEvent(local: Callsign, remote: Callsign, nr: number): Ax25Event {
   });
   return { name: "SREJ_received", frame };
 }
+
+describe("srejCommandIgnored quirk", () => {
+  // packet-net/packet.net#674. The corrected figc4.5 (ax25sdl 0.10.1+ ←
+  // packethacking/ax25spec#65) gives the SREJ COMMAND paths a native
+  // single-frame selective retransmit, making the command form actionable for
+  // the first time. §4.3.2.4 makes SREJ response-only and no deployed stack
+  // acts on one (direwolf omits the path; linbpq gates the resend on RESP), so
+  // the default ignores the retransmission request while still processing the
+  // acknowledgement. Mirrors the C# DataLinkSrejUnderLossTests pair.
+  it("quirk on (default) does not retransmit for an SREJ COMMAND", () => {
+    const { dispatcher, ctx, wire, makeTx } = newRig(defaultSessionQuirks);
+    const tx = makeTx(srejCommandEvent(ctx.local, ctx.remote, 1));
+
+    // The corrected figc4.5 command-path tail, as the table draws it.
+    dispatcher.execute(
+      [
+        { verb: "Push Old I Frame N(r) on Queue" },
+        { verb: "LM_data_request" },
+        { verb: "Stop T3" },
+        { verb: "Start T1" },
+        { verb: "Clear Acknowledge Pending" },
+      ],
+      tx,
+      "TimerRecovery",
+    );
+
+    expect(wire.filter((f) => classify(f) === "I").length).toBe(0);
+  });
+
+  it("quirk off honours the corrected figure and retransmits N(r)", () => {
+    const { dispatcher, ctx, wire, makeTx } = newRig({
+      ...defaultSessionQuirks,
+      srejCommandIgnored: false,
+    });
+    const tx = makeTx(srejCommandEvent(ctx.local, ctx.remote, 1));
+
+    dispatcher.execute(
+      [{ verb: "Push Old I Frame N(r) on Queue" }],
+      tx,
+      "TimerRecovery",
+    );
+
+    const iframes = wire.filter((f) => classify(f) === "I");
+    expect(iframes.length).toBe(1);
+    expect(getNs(iframes[0]!)).toBe(1);
+  });
+
+  it("an SREJ RESPONSE is unaffected by the quirk", () => {
+    const { dispatcher, ctx, wire, makeTx } = newRig(defaultSessionQuirks);
+    const tx = makeTx(srejEvent(ctx.local, ctx.remote, 1));
+
+    dispatcher.execute(
+      [{ verb: "Push Old I Frame N(r) on Queue" }],
+      tx,
+      "TimerRecovery",
+    );
+
+    expect(wire.filter((f) => classify(f) === "I").length).toBe(1);
+  });
+});
 
 describe("Ax25Spec38 SREJ selective-retransmit quirk", () => {
   it("quirk on does single-frame selective retransmit, not go-back-N", () => {
