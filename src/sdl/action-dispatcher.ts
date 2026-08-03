@@ -3,6 +3,7 @@ import type { Callsign } from "../callsign.js";
 import {
   type Ax25Frame,
   disc,
+  isCommand as frameIsCommand,
   dm,
   getNr,
   getNs,
@@ -274,6 +275,41 @@ export class ActionDispatcher {
   ): void {
     const ctx = tx.context;
     const sched = tx.scheduler;
+
+    // Quirk srejCommandIgnored (default on): an SREJ sent as a COMMAND is
+    // off-spec — §4.3.2.4 makes SREJ response-only — and no deployed stack
+    // acts on receiving one (direwolf omits the path; linbpq gates the resend
+    // on RESP). Both still apply the N(R) acknowledgement, and so do we: this
+    // suppresses the RETRANSMIT TAIL only.
+    //
+    // The tail is the run of verbs the corrected figc4.5 (ax25sdl 0.10.1+,
+    // from packethacking/ax25spec#65) gives the command paths
+    // t24_srej_received_no_yes_*_no: the push onward exists solely to send the
+    // requested frame, and stop-T3 / start-T1 / clear-acknowledge-pending are
+    // the "we just transmitted" bookkeeping that must not fire when we
+    // transmit nothing. Everything before the push is acknowledgement
+    // bookkeeping and still runs. Mirrors the C# ActionDispatcher.Execute
+    // interception (packet-net/packet.net #674).
+    if (
+      ctx.quirks.srejCommandIgnored &&
+      tx.event.name === "SREJ_received" &&
+      tx.event.frame !== undefined &&
+      frameIsCommand(tx.event.frame)
+    ) {
+      switch (verb) {
+        case "Push Old I Frame N(r) on Queue":
+        case "push_frame_on_queue":
+        case "Push on I Frame Queue":
+        case "Push on I Frame Queue (note: word order?)":
+        case "Push I Frame on I Queue":
+        case "LM_data_request":
+        case "Stop T3":
+        case "Start T1":
+        case "Clear Acknowledge Pending":
+        case "Invoke Retransmission":
+          return;
+      }
+    }
 
     // Quirk ax25Spec38SrejSelectiveRetransmit (default on): figc4.5 draws
     // the SREJ-received retransmit as the generic fresh-DL-DATA push +
