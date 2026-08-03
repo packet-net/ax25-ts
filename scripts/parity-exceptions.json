@@ -6,7 +6,8 @@
   "quirkPresets": {},
   "xidFlags": {},
   "listenerOptions": {
-    "RestartT1OnTxComplete": "TX-complete→T1: re-arms a running T1 from the TNC's ACKMODE TX-completion echo (packet.net kiss.t1FromTxComplete). The echo is a TNC/node-host transport capability; no TS transport implements SendFrameWithAckAsync today, so the option would be inert. Add the TS leg when an ACKMODE-capable TS transport exists."
+    "RestartT1OnTxComplete": "TX-complete→T1: re-arms a running T1 from the TNC's ACKMODE TX-completion echo (packet.net kiss.t1FromTxComplete). The echo is a TNC/node-host transport capability; no TS transport implements SendFrameWithAckAsync today, so the option would be inert. Add the TS leg when an ACKMODE-capable TS transport exists.",
+    "PortName": "Human-readable label for the modem/port a listener is attached to (\"kiss-tcp:192.168.1.10:8001\", \"serial:/dev/ttyUSB0\"), included in packet.net's structured debug log lines so an operator running several ports can tell which modem a message came from. A diagnostics/logging label with no on-air or FSM behaviour — same class as the FrameTraced listener-surface exception. A TS consumer labels its own logs; add a TS leg only if @packet-net/ax25 grows multi-port structured logging."
   },
   "listenerSurface": {
     "UpdateSessionParameters": "Live per-listener reseed is driven by packet.net's node-host hot-reload; browser consumers reconstruct the listener instead. Revisit if a TS host needs hot reconfig.",
