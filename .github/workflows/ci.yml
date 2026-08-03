@@ -92,7 +92,11 @@ jobs:
           rm -rf "${RUNNER_TEMP}/pico-node"
           git clone --depth=1 --branch main --filter=blob:none --sparse \
             "https://github.com/packet-net/pico-node.git" "${RUNNER_TEMP}/pico-node"
-          git -C "${RUNNER_TEMP}/pico-node" sparse-checkout set parity-manifest.toml parity-exceptions.json parity
+          # --no-cone: cone mode (the default since git 2.37) only accepts DIRECTORY
+          # patterns and hard-fails on a file path ("fatal: 'parity-manifest.toml' is not
+          # a directory"), which killed this step — and with it every CI run here — from
+          # 2026-07-12. Two of the three paths we want are files, so ask for literal patterns.
+          git -C "${RUNNER_TEMP}/pico-node" sparse-checkout set --no-cone parity-manifest.toml parity-exceptions.json parity
 
       - name: parity check
         run: |
