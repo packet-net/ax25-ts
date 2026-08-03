@@ -6,6 +6,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-08-03
+
+Parity with the C# reference at packet.net **lib-v0.25.0**: the SREJ-command decision, and the retirement of the figc4.5 selective-retransmit workaround now that upstream has fixed the figure.
+
+### Added
+
+- **`srejCommandIgnored` session quirk** ([#75](https://github.com/packet-net/ax25-ts/pull/75)) — ignore the retransmission an SREJ sent as a **command** requests, while still processing the N(R) acknowledgement it carries. Default `true`; cleared by `strictlyFaithfulSessionQuirks`. AX.25 v2.2 §4.3.2.4 says "The SREJ frame is only sent as a response", so a peer sending one is already off-spec, and no deployed stack acts on receiving one — direwolf omits the path outright (`ax25_link.c` `srej_frame`: *"Command path has been omitted because SREJ can only be response"*), linbpq gates the resend on `MSGFLAG & RESP` — while both still process the ack. Parity with `Ax25SessionQuirks.SrejCommandIgnored` (packet-net/packet.net#674).
+
+### Removed
+
+- **`ax25Spec38SrejSelectiveRetransmit`** ([#76](https://github.com/packet-net/ax25-ts/pull/76)) — **breaking** for anyone who set it explicitly. The quirk rewrote figc4.5's generic push + go-back-N into the figc4.4 single-frame selective retransmit, and its exit condition was always "delete once `ax25sdl` ships a corrected figc4.5". 0.10.2 ships exactly that, doing single-frame selective **natively** on all four SREJ paths, so neither verb the quirk acted on survives in the tables and the rewrite is unreachable. **Behaviour is unchanged** — an SREJ *response* still selectively retransmits N(r); only the machinery differs, and it now comes from the figure itself.
+
+### Changed
+
+- **`ax25sdl` pinned to `^0.10.2`** ([#75](https://github.com/packet-net/ax25-ts/pull/75)) — the corrected figc4.5 tables (ax25sdl#78 ← packethacking/ax25spec#65). Without this the new quirk would have existed for inventory parity while being inert.
+- **The C#-vs-TS parity leg is armed for the first time** ([#76](https://github.com/packet-net/ax25-ts/pull/76)) — CI cloned the pre-split *private* `m0lte/packet.net` behind a `PACKETNET_READ_TOKEN` secret and, with no secret, warned, skipped, and exited 0: the check reported success while comparing nothing. `packet-net/packet.net` is public, so it now clones directly with no token gate, and a missing checkout is a hard error. Its first armed run immediately caught real drift.
+
 ## [0.15.0] — 2026-07-05
 
 Parity with the C# reference at packet.net **lib-v0.18.0**: the OQ-012 native carrier-sense (CSMA) medium-access seam, now a first-class, parity-tracked listener option on both sides.
