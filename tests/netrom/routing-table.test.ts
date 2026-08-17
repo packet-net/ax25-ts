@@ -13,9 +13,13 @@ import { describe, expect, it } from "vitest";
 import { Callsign } from "../../src/callsign.js";
 import {
   NETROM_ROUTING_DEFAULTS,
+  NETROM_NEIGHBOUR_KEY_SEPARATOR,
   NetRomRoutingTable,
   type NetRomRoutingOptions,
   combineQuality,
+  neighbourKey,
+  neighbourKeyPort,
+  neighbourKeyCallsign,
   parseNodesBroadcast,
 } from "../../src/netrom/index.js";
 import { buildNodesInfo, type NodesEntrySpec } from "../netrom-builder.js";
@@ -659,5 +663,17 @@ describe("NetRomRoutingTable - per-port neighbours ((portId, callsign) keys)", (
     const snap = table.snapshot();
     expect(snap.neighbours.find((n) => n.portId === "vhf")!.pathQuality).toBe(191); // untouched
     expect(snap.neighbours.find((n) => n.portId === "hf")!.pathQuality).toBe(160);
+  });
+
+  it("neighbourKey round-trips (portId, callsign) and rejects a portId containing the separator", () => {
+    const key = neighbourKey("vhf", NbrA);
+    expect(key).toBe(`vhf${NETROM_NEIGHBOUR_KEY_SEPARATOR}${NbrA.toString()}`);
+    expect(neighbourKeyPort(key)).toBe("vhf");
+    expect(neighbourKeyCallsign(key)).toBe(NbrA.toString());
+
+    // The split accessors slice at the first separator, so a portId that itself
+    // contained one would mis-attribute the callsign half and silently corrupt
+    // per-port teardown. neighbourKey fails fast on the misconfiguration instead.
+    expect(() => neighbourKey(`gw${NETROM_NEIGHBOUR_KEY_SEPARATOR}1`, NbrA)).toThrow(RangeError);
   });
 });

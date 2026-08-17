@@ -34,6 +34,15 @@ export function neighbourKey(
   portId: string,
   neighbour: Callsign | string,
 ): string {
+  if (portId.includes(NETROM_NEIGHBOUR_KEY_SEPARATOR)) {
+    // The split accessors below slice at the first separator, so a portId
+    // carrying one would mis-attribute the callsign half and silently corrupt
+    // per-port teardown. Fail fast on the misconfiguration rather than round-trip
+    // wrong: a port id is a short host token and legitimately never contains "|".
+    throw new RangeError(
+      `NET/ROM port id must not contain '${NETROM_NEIGHBOUR_KEY_SEPARATOR}' (got '${portId}')`,
+    );
+  }
   const call = typeof neighbour === "string" ? neighbour : neighbour.toString();
   return `${portId}${NETROM_NEIGHBOUR_KEY_SEPARATOR}${call}`;
 }
