@@ -825,7 +825,13 @@ export class Ax25Listener {
       // Mirrors the C# listener's inbound pump (packet.net#366).
       frame = decodeFrame(bytes, false, this.options.parseOptions);
     } catch {
-      return; // malformed / options-rejected wire bytes — drop quietly
+      // Second chance at mod-128, but ONLY for an address pair that already has
+      // a live extended session (see tryParseAtExtendedModuloForLiveSession).
+      const extended = this.tryParseAtExtendedModuloForLiveSession(bytes);
+      if (extended === null) {
+        return; // malformed / options-rejected wire bytes: drop quietly
+      }
+      frame = extended;
     }
     // Trace + dispatch are isolated per-step so a throwing handler can't
     // tear the pump down. A buggy consumer must not be able to DoS the
@@ -840,6 +846,46 @@ export class Ax25Listener {
     } catch (err) {
       this.options.onHandlerError(err);
     }
+  }
+
+  /**
+   * Second-chance routing parse at mod-128 for a frame the mod-8 routing parse
+   * rejected, accepted only when the peer already has a live *extended* session.
+   *
+   * The pump has to parse before it can route (the addresses precede the control
+   * field), and it cannot know the session modulo until it has routed, so it
+   * parses at mod-8. That reads an extended I frame acceptably (its second
+   * control octet lands on the PID), but an extended supervisory frame's second
+   * control octet looks like an information field on an S frame, which section
+   * 3.5 does not permit: `decodeFrame` rejects it whenever
+   * {@link Ax25ParseOptions.allowInfoOnSupervisoryFrames} is off. Under the
+   * strict preset (and xrouter, which is strict) that dropped every RR / RNR /
+   * REJ / SREJ on a mod-128 link before trace and dispatch, so a SABME link came
+   * up (U frames are one octet in both modes) and then was never acked
+   * (m0lte/packet.net#696).
+   *
+   * This is not a widening of the listener's options: the retry is honoured only
+   * for a peer whose cached session has already negotiated
+   * {@link Ax25SessionContext.isExtended}, i.e. exactly the frames whose second
+   * control octet is genuinely a control octet. A mod-8 link's frames are
+   * unaffected (they parse at mod-8 or not at all), and a strict listener stays
+   * deaf to a malformed S frame from any peer it has no extended link with.
+   * Mirrors the C# `Ax25Listener.TryParseAtExtendedModuloForLiveSession`.
+   */
+  private tryParseAtExtendedModuloForLiveSession(
+    bytes: Uint8Array,
+  ): Ax25Frame | null {
+    let extended: Ax25Frame;
+    try {
+      extended = decodeFrame(bytes, true, this.options.parseOptions);
+    } catch {
+      return null;
+    }
+    const cached = this.sessions.get(extended.source.callsign.toString());
+    if (!cached || !cached.session.context.isExtended) {
+      return null;
+    }
+    return extended;
   }
 
   private dispatchInbound(routed: Ax25Frame, bytes: Uint8Array): void {
