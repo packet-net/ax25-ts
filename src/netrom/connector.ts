@@ -501,6 +501,10 @@ export class NetRomConnector {
     // mirrors C# ConnectCircuitAsync. Bounded by the dwindling route set (each
     // failure removes a route) with a hard cap as a backstop: 1 + the
     // per-destination route cap (3).
+    // 1 + is the initial attempt; the 3 mirrors the default
+    // maxRoutesPerDestination in NETROM_ROUTING_DEFAULTS - if that option is
+    // raised, this cap must track it, or the loop can stop before every route
+    // to the destination has been tried.
     const cap = 1 + 3;
     for (let attempt = 0; attempt < cap; attempt++) {
       const live = resolveDestination(this.routing.snapshot(), destText);
