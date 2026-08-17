@@ -199,3 +199,87 @@ describe("NetRomConnector — INP3 live host wiring", () => {
     h.connector.dispose();
   });
 });
+
+// ─── per-port INP3 selected-link gate (two ports, same neighbour) ───
+//
+// The single-port `setup()` above never fires the (portId, callsign) gate in
+// dispatchInp3 / the interlinkForCallsign send seam, because a callsign only has
+// one interlink. These wire B on TWO ports and prove routing information is
+// ingested/sent only over the selected link.
+
+const SOT2 = new Callsign("GB7XXX", 0); // a second destination B advertises
+
+/** Wire a connector with B tapped on BOTH p1 and p2, a controllable clock, and the
+ *  shared table. Returns per-port listeners/sessions and a helper to seed the SNTT +
+ *  B's own 0/0 self-route on p1 (which makes p1 the routing-selected port for B). */
+function setupTwoPort() {
+  let nowMs = 100_000;
+  const now = () => nowMs;
+  const table = new NetRomRoutingTable(undefined, now);
+  const l1 = new FakeListener();
+  const l2 = new FakeListener();
+  const connector = new NetRomConnector(
+    { snapshot: () => table.snapshot() },
+    { enabled: true, now, inp3: { table, options: { enabled: true, rifIntervalMs: 5_000, positiveDebounceMs: 1_000 } } },
+  );
+  connector.attachPort("p1", A, l1);
+  connector.attachPort("p2", A, l2);
+  const s1 = new FakeSession(B);
+  const s2 = new FakeSession(B);
+  l1.accept(s1); // B on p1
+  l2.accept(s2); // the same callsign B, a second interlink on p2
+  const advance = (ms: number) => { nowMs += ms; };
+  const selectPort1 = () => {
+    // Measure the A↔B link on p1 so ingest has an SNTT for B (engine is callsign-keyed).
+    s1.deliver(Inp3L3RttFrame.build(B).toBytes());
+    connector.tick();
+    const ourProbe = l1.sent.find(
+      (s) => s.to === B.toString() && Inp3L3RttFrame.tryParse(s.bytes)?.packet.network.origin.equals(A),
+    );
+    if (ourProbe === undefined) throw new Error("expected our probe to B on p1");
+    advance(100);
+    s1.deliver(ourProbe.bytes); // reflect → SNTT(B) = 50
+    // B's own 0/0 RIP arriving on p1: a route to B *via B* on p1, so routing's
+    // selected interlink port for B is p1 (chosenInterlinkPort's self-route branch).
+    s1.deliver(rifBytes(B, 0, 0));
+    l1.sent.length = 0;
+    l2.sent.length = 0;
+  };
+  return { table, connector, l1, l2, s1, s2, advance, selectPort1 };
+}
+
+describe("NetRomConnector - per-port INP3 selected-link gate", () => {
+  it("ingests a RIF on the selected port but DROPS the same neighbour's RIF on another port", () => {
+    const h = setupTwoPort();
+    h.selectPort1(); // p1 is now B's selected interlink port
+
+    // A RIF from B on p2 (the NON-selected port) must be dropped, not ingested.
+    h.s2.deliver(rifBytes(SOT2, 1, 100));
+    expect(resolveDestination(h.table.snapshot(), SOT2.toString())).toBeNull();
+
+    // The identical RIF on p1 (the selected port) IS ingested.
+    h.s1.deliver(rifBytes(SOT2, 1, 100));
+    const dest = resolveDestination(h.table.snapshot(), SOT2.toString());
+    expect(dest).not.toBeNull();
+    expect(dest!.routes.some((r) => r.neighbour.equals(B) && r.portId === "p1")).toBe(true);
+    // and nothing landed a route to SOT2 on p2.
+    expect(dest!.routes.some((r) => r.portId === "p2")).toBe(false);
+    h.connector.dispose();
+  });
+
+  it("fans a periodic RIF out over the selected interlink only (interlinkForCallsign)", () => {
+    const h = setupTwoPort();
+    h.selectPort1();
+    h.s1.deliver(rifBytes(SOT, 1, 100)); // learn a time-route so there is something to advertise
+    h.l1.sent.length = 0;
+    h.l2.sent.length = 0;
+
+    h.advance(6_000); // past the compressed RIF interval, well under the 180 s reset
+    h.connector.tick();
+
+    const rifTo = (l: FakeListener) => l.sent.filter((s) => s.to === B.toString() && s.bytes[0] === 0xff);
+    expect(rifTo(h.l1).length).toBeGreaterThan(0); // fanned out over the selected port
+    expect(rifTo(h.l2)).toHaveLength(0); // never over the non-selected interlink to the same callsign
+    h.connector.dispose();
+  });
+});

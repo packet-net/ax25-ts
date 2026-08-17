@@ -321,4 +321,19 @@ describe("decideForward — NET/ROM L3 forwarding decision", () => {
       ),
     ).toBe(true); // equal target time + hop → lower callsign ordinal wins
   });
+
+  it("INP3 tie-break final key is port-id ordinal: same callsign on two ports, lower port wins", () => {
+    // Same neighbour audible on two ports with an identical INP3 metric (target time
+    // AND hop count AND callsign all tie): the final tie-break is the port-id ordinal,
+    // so the pick is deterministic rather than list-order dependent. Mirrors the C#
+    // NetRomForwarding.SelectInp3NextHop final key. "p1" < "p2" ordinally.
+    const byPort = inp3RoutesTo(
+      Dest,
+      { neighbour: OnwardNbr, quality: 100, targetTimeMs: 100, hop: 2, portId: "p2" },
+      { neighbour: OnwardNbr, quality: 100, targetTimeMs: 100, hop: 2, portId: "p1" },
+    );
+    const decision = decideForward(datagram(Source, Dest, 20), FromNbr, Me, byPort, 25, ForwardMode.PerFlow, true);
+    expect(decision.nextHop?.equals(OnwardNbr)).toBe(true);
+    expect(decision.nextHopPortId).toBe("p1"); // equal time + hop + callsign → lower port ordinal wins, not the first listed
+  });
 });
