@@ -17,6 +17,9 @@ import {
   type NetRomRoutingSnapshot,
   NetRomRoutingTable,
   neighbourFor,
+  neighbourKey,
+  neighbourKeyCallsign,
+  neighbourKeyPort,
   resolveDestination,
 } from "./routing-table.js";
 import {
@@ -101,16 +104,19 @@ export interface NetRomConnectorOptions {
    */
   onError?: (err: unknown) => void;
   /**
-   * The link-down failover seam: called with a neighbour the connector could not
-   * raise an interlink to (it did not answer the connect). The embedder wires this
-   * to the shared routing table's `markNeighbourDown`, so the dead neighbour's
-   * routes leave the table at once and a forward / connect fails over to an
-   * alternate next hop — instead of waiting for the obsolescence sweep. Kept as a
-   * callback (not a direct table mutation) so the connector stays read-only over
-   * the routing view (the focused-objects split). Mirrors the C#
+   * The link-down failover seam: called with the port and the neighbour the
+   * connector could not raise an interlink to (it did not answer the connect on
+   * that port). The embedder wires this to the shared routing table's
+   * `markNeighbourDown(portId, neighbour)`, so only that (portId, callsign)
+   * key's routes leave the table at once and a forward / connect fails over to
+   * the same callsign on another port or to an alternate next hop - instead of
+   * waiting for the obsolescence sweep. A failed dial on one port must not drop
+   * the other port's routes to the same callsign. Kept as a callback (not a
+   * direct table mutation) so the connector stays read-only over the routing
+   * view (the focused-objects split). Mirrors the C#
    * `NetRomService.EnsureInterlinkAsync` dial-failure path. Defaults to a no-op.
    */
-  onNeighbourDown?: (neighbour: Callsign) => void;
+  onNeighbourDown?: (portId: string, neighbour: Callsign) => void;
   /**
    * Enable the INP3 time-based routing overlay (the TS analogue of the C#
    * `NetRomService` host-integration). When set, the connector owns an
@@ -204,12 +210,13 @@ export class NetRomConnector {
   private readonly maxTimeToLive: number;
   private readonly routing: RoutingSnapshotSource;
   private readonly onError: (err: unknown) => void;
-  private readonly onNeighbourDown: (neighbour: Callsign) => void;
+  private readonly onNeighbourDown: (portId: string, neighbour: Callsign) => void;
   private readonly circuits: CircuitManager;
 
   // Port id -> attachment (the listener whose interlinks we dial + tap).
   private readonly attachments = new Map<string, PortAttachment>();
-  // Neighbour callsign string -> the live interlink session we reach it over.
+  // (portId, neighbour) compound key (neighbourKey) -> the live interlink session
+  // we reach that neighbour over on that port. One callsign can hold two links.
   private readonly interlinks = new Map<string, Interlink>();
   // Sessions whose inbound 0xCF we've already tapped (idempotency — the C# `tapped`
   // set), so dialling AND OnSessionAccepted firing for the same session is harmless.
@@ -286,9 +293,16 @@ export class NetRomConnector {
       // 180 s reflection-timeout teardown of an INP3-capable neighbour: drop its
       // routes from the shared table (so forward / connect re-routes at once) AND
       // signal the embedder's failover hook, then refresh the capable fan-out set.
+      // TODO: the INP3 engine is still callsign-keyed, so this teardown drops the
+      // callsign's routes on EVERY port (markNeighbourDownAllPorts); per-port INP3
+      // keying is the documented follow-up, not this change.
       engine.onNeighbourDown((e) => {
-        this.inp3Table?.markNeighbourDown(e.neighbour);
-        this.onNeighbourDown(e.neighbour);
+        this.inp3Table?.markNeighbourDownAllPorts(e.neighbour);
+        for (const [key] of this.interlinks) {
+          if (neighbourKeyCallsign(key) === e.neighbour.toString()) {
+            this.onNeighbourDown(neighbourKeyPort(key), e.neighbour);
+          }
+        }
         this.refreshInp3Capable();
       });
       // RIF advertise: build the poison-reversed RIF for this neighbour from the
@@ -329,16 +343,18 @@ export class NetRomConnector {
     return this.circuits;
   }
 
-  /** Neighbour callsign strings we currently hold a live interlink to (snapshot). */
+  /** The (portId, callsign) compound keys ({@link neighbourKey}) of the neighbours
+   *  we currently hold a live interlink to (snapshot). One callsign heard on two
+   *  ports can hold two keys, one per port. */
   get interlinkNeighbours(): readonly string[] {
     return [...this.interlinks.keys()];
   }
 
-  /** The live interlink AX.25 sessions (snapshot), keyed by neighbour callsign
-   *  string. A node host disposing gracefully DISCs these (while the listeners are
-   *  still alive) so a neighbour isn't left a half-open interlink — the seam the C#
-   *  `NetRomService.DisposeAsync` uses. Read-only; the sessions are owned by their
-   *  listeners. */
+  /** The live interlink AX.25 sessions (snapshot), keyed by the (portId, callsign)
+   *  compound key ({@link neighbourKey}). A node host disposing gracefully DISCs
+   *  these (while the listeners are still alive) so a neighbour isn't left a
+   *  half-open interlink - the seam the C# `NetRomService.DisposeAsync` uses.
+   *  Read-only; the sessions are owned by their listeners. */
   get interlinkSessions(): ReadonlyMap<string, Ax25ListenerSession> {
     const out = new Map<string, Ax25ListenerSession>();
     for (const [nbr, link] of this.interlinks) {
@@ -475,13 +491,16 @@ export class NetRomConnector {
     }
     const destText = destination.destination.toString();
 
-    // Failover loop: try the best route; if the interlink to its neighbour can't be
-    // raised, ensureInterlink has signalled onNeighbourDown — which (via the embedder)
-    // drops that neighbour's routes — so re-resolve the destination's now-best route
-    // and try again, until one connects or the destination has no routes left. The
-    // link-down failover signal at the connect path; mirrors C# ConnectCircuitAsync.
-    // Bounded by the dwindling route set (each failure removes a route) with a hard
-    // cap as a backstop: 1 + the per-destination route cap (3).
+    // Failover loop: try the best route; if the interlink to its (port,
+    // neighbour) key can't be raised, ensureInterlink has signalled
+    // onNeighbourDown for THAT KEY ONLY - which (via the embedder) drops that
+    // key's routes - so re-resolve the destination's now-best route and try
+    // again, until one connects or the destination has no routes left. The next
+    // pick may be the SAME callsign on another port (per-port failover) or a
+    // different neighbour. The link-down failover signal at the connect path;
+    // mirrors C# ConnectCircuitAsync. Bounded by the dwindling route set (each
+    // failure removes a route) with a hard cap as a backstop: 1 + the
+    // per-destination route cap (3).
     const cap = 1 + 3;
     for (let attempt = 0; attempt < cap; attempt++) {
       const live = resolveDestination(this.routing.snapshot(), destText);
@@ -492,8 +511,10 @@ export class NetRomConnector {
       }
 
       try {
-        // Ensure the interlink to the best neighbour is up before originating.
-        await this.ensureInterlink(best.neighbour);
+        // Ensure the interlink to the best route's (port, neighbour) key is up
+        // before originating. Egress uses the chosen route's OWN port, never a
+        // substitute.
+        await this.ensureInterlink(best.portId, best.neighbour);
       } catch {
         // onNeighbourDown already fired; loop to the next-best route. If that was the
         // last route, the next resolve returns null → the throw above surfaces it.
@@ -566,42 +587,42 @@ export class NetRomConnector {
   // ─── Internals ────────────────────────────────────────────────────
 
   /**
-   * Ensure a live interlink (CONNECTED-mode AX.25 session, PID-0xCF) to `neighbour`
-   * exists, dialling it if not. Picks the port we last heard the neighbour on (else
-   * the first attached port). Taps the resulting session for inbound NET/ROM and
-   * records it. Mirrors the C# `EnsureInterlinkAsync`.
+   * Ensure a live interlink (CONNECTED-mode AX.25 session, PID-0xCF) to
+   * `neighbour` ON `portId` exists, dialling it if not. The port is the caller's
+   * chosen route's port - egress never substitutes another band: if the port is
+   * not attached the dial FAILS (the old first-attached-port fallback is
+   * removed), so route selection can re-pick. Taps the resulting session for
+   * inbound NET/ROM and records it under the (portId, callsign) key. Mirrors the
+   * C# `EnsureInterlinkAsync`.
    */
-  private async ensureInterlink(neighbour: Callsign): Promise<void> {
-    const existing = this.interlinks.get(neighbour.toString());
+  private async ensureInterlink(portId: string, neighbour: Callsign): Promise<void> {
+    const key = neighbourKey(portId, neighbour);
+    const existing = this.interlinks.get(key);
     if (
       existing !== undefined &&
       existing.session.state !== "Disconnected"
     ) {
-      return; // already up
+      return; // already up on this (port, neighbour) key
     }
 
-    // Dial on the port we last heard the neighbour on (else the first port).
-    const nbr = neighbourFor(this.routing.snapshot(), neighbour);
-    let portId: string | undefined;
-    let attachment: PortAttachment | undefined;
-    if (nbr !== null && this.attachments.has(nbr.portId)) {
-      portId = nbr.portId;
-      attachment = this.attachments.get(nbr.portId);
-    } else {
-      const first = this.attachments.entries().next().value;
-      if (first !== undefined) {
-        [portId, attachment] = first;
-      }
-    }
-    if (attachment === undefined || portId === undefined) {
-      throw new Error("no NET/ROM port available to open an interlink.");
+    const attachment = this.attachments.get(portId);
+    if (attachment === undefined) {
+      // The selected route's port is not attached. Fail the dial rather than
+      // silently dialling the neighbour on another band - the failover loop above
+      // re-resolves and may pick a route whose port IS attached.
+      this.onNeighbourDown(portId, neighbour);
+      throw new Error(
+        `no NET/ROM port '${portId}' attached to open an interlink to ${neighbour}.`,
+      );
     }
 
-    // A dial that fails (the neighbour never answered the connect) is the link-down
-    // signal: tell the embedder to mark the neighbour down so its now-dead routes
-    // leave the table and the caller (forward / connect failover) re-routes. Only
-    // the dial is guarded — the pre-dial "no port" throw above is a local-config
-    // fault, not a neighbour-down. Mirrors C# EnsureInterlinkAsync.
+    // A dial that fails (the neighbour never answered the connect on this port)
+    // is the link-down signal for THIS KEY ONLY: tell the embedder to mark the
+    // (portId, neighbour) key down so its now-dead routes leave the table and
+    // the caller (forward / connect failover) re-routes - the same callsign on
+    // another port keeps its routes. Only the dial is guarded - the pre-dial
+    // "no port" throw above also signals the key down, since the route is just
+    // as unusable. Mirrors C# EnsureInterlinkAsync.
     let session: Awaited<ReturnType<NetRomInterlinkListener["connect"]>>;
     try {
       // NET/ROM interlinks dial v2.0 (SABM) explicitly — NOT the listener's
@@ -613,13 +634,13 @@ export class NetRomConnector {
       // NetRomService / PortSupervisor interlink dials.
       session = await attachment.listener.connect(neighbour, false);
     } catch (err) {
-      this.onNeighbourDown(neighbour);
+      this.onNeighbourDown(portId, neighbour);
       throw err;
     }
     // Tap the session for inbound NET/ROM (idempotent — the tap guards itself, so
     // sessionAccepted firing for this dial too is harmless), then record it.
     this.tapInterlinkSession(portId, attachment.listener, session);
-    this.interlinks.set(neighbour.toString(), {
+    this.interlinks.set(key, {
       portId,
       listener: attachment.listener,
       session,
@@ -631,8 +652,10 @@ export class NetRomConnector {
    * feeds PID-0xCF DL-DATA indications into the circuit manager; a node-console
    * session over the same port ignores 0xCF, so the two coexist. The session is
    * recorded as an interlink only when it actually carries NET/ROM (on the first
-   * 0xCF datagram), so a plain console session is never mistaken for one. On the
-   * session's disconnect, the tap + interlink entry are dropped.
+   * 0xCF datagram), keyed by (the arrival port, the peer callsign), so a plain
+   * console session is never mistaken for one and the same peer on two ports
+   * holds two links. On the session's disconnect, the tap + interlink entry are
+   * dropped.
    *
    * Mirrors the C# `NetRomService.OnSessionAccepted`.
    */
@@ -645,16 +668,18 @@ export class NetRomConnector {
       return;
     }
     this.tapped.add(session);
-    const peerKey = session.to.toString();
+    // The (arrival port, peer callsign) key: an inbound session is an interlink
+    // on the port it landed on.
+    const peerKey = neighbourKey(portId, session.to);
 
     session.onDataLinkSignal((sig: DataLinkSignal) => {
       if (sig.type === "DL_DATA_indication" && sig.pid === PID_NET_ROM) {
         // First 0xCF data → this is an interlink; remember the session so our
-        // outbound datagrams to this neighbour reuse it.
+        // outbound datagrams to this (port, neighbour) key reuse it.
         if (!this.interlinks.has(peerKey)) {
           this.interlinks.set(peerKey, { portId, listener, session });
         }
-        this.onInterlinkData(session, sig.data);
+        this.onInterlinkData(session, portId, sig.data);
       } else if (
         sig.type === "DL_DISCONNECT_indication" ||
         sig.type === "DL_DISCONNECT_confirm"
@@ -675,13 +700,14 @@ export class NetRomConnector {
    */
   private onInterlinkData(
     session: Ax25ListenerSession,
+    arrivalPortId: string,
     info: Uint8Array,
   ): void {
     try {
       // INP3 peel (mirrors the C# `DispatchInp3`, the load-bearing precedence): when
       // the overlay is on, a RIF (0xFF-led) or an L3RTT is consumed BEFORE the L4
       // path so it can never reach circuits / forwarding. Returns true when consumed.
-      if (this.inp3Engine !== null && this.dispatchInp3(session.to, info)) {
+      if (this.inp3Engine !== null && this.dispatchInp3(session.to, arrivalPortId, info)) {
         return;
       }
       const packet = tryParseNetRomPacket(info);
@@ -712,20 +738,40 @@ export class NetRomConnector {
    * to `L3RTT-0` is timed/reflected by the engine and consumed. Anything else is not
    * INP3 → returns false so the caller runs the existing L4 dispatch. Observing the
    * neighbour here makes every 0xCF-speaking peer a probe target (optimistic probing).
+   *
+   * **Selected-link gate.** INP3 observe / probe / ingest happens on the neighbour's
+   * SELECTED interlink only: a routing-information frame arriving on a link whose
+   * port is not the port routing selects for that callsign is dropped (a RIF is
+   * still consumed, never re-fed to the L4 path). A neighbour with no known
+   * selected port (a peer that never broadcast NODES) accepts the link it talks on.
    */
-  private dispatchInp3(fromNeighbour: Callsign, info: Uint8Array): boolean {
+  private dispatchInp3(
+    fromNeighbour: Callsign,
+    arrivalPortId: string,
+    info: Uint8Array,
+  ): boolean {
     const engine = this.inp3Engine;
     if (engine === null) {
       return false;
     }
+
+    const isRif = info.length >= 1 && info[0] === INP3_RIF_SIGNATURE;
+
+    const chosenPort = this.chosenInterlinkPort(fromNeighbour);
+    if (chosenPort !== null && chosenPort !== arrivalPortId) {
+      // Not the selected link for this callsign: drop the routing information
+      // (consume a RIF so it is never retried as L4, but ingest nothing).
+      return isRif;
+    }
+
     engine.observeNeighbour(fromNeighbour);
 
     // (A) RIF? — the single-byte 0xFF signature is a total, unambiguous discriminator
     // (a 0xFF first byte can't be a valid AX.25-shifted callsign).
-    if (info.length >= 1 && info[0] === INP3_RIF_SIGNATURE) {
+    if (isRif) {
       const rif = parseInp3Rif(info);
       if (rif !== null) {
-        this.ingestInp3Rif(fromNeighbour, rif);
+        this.ingestInp3Rif(fromNeighbour, arrivalPortId, rif);
       }
       return true; // consumed either way (malformed 0xFF-led frame dropped, never L4).
     }
@@ -740,13 +786,33 @@ export class NetRomConnector {
   }
 
   /**
+   * The port routing selects for the interlink to `neighbour`: the port of the
+   * destination's best route when that route forwards via the neighbour itself
+   * (the assumed direct route), else the best directly-heard port for it. `null`
+   * when the table knows no way to reach the neighbour (a peer that never
+   * broadcast NODES) - the caller then accepts the link the peer talks on.
+   */
+  private chosenInterlinkPort(neighbour: Callsign): string | null {
+    const snap = this.routing.snapshot();
+    const dest = resolveDestination(snap, neighbour.toString());
+    if (
+      dest !== null &&
+      dest.bestRoute !== null &&
+      dest.bestRoute.neighbour.equals(neighbour)
+    ) {
+      return dest.bestRoute.portId;
+    }
+    return neighbourFor(snap, neighbour)?.portId ?? null;
+  }
+
+  /**
    * Ingest a parsed RIF into the shared table as time-routes, supplying the engine's
    * measured SNTT for the carrying link. Any destination that loses its last INP3
    * route lands in the table's recently-withdrawn set; it is NOT escalated here — the
    * next {@link tick} drains the set atomically and fans it out, so this pump path
    * never races the fan-out round (the C# host-thread race fix).
    */
-  private ingestInp3Rif(from: Callsign, rif: Inp3Rif): void {
+  private ingestInp3Rif(from: Callsign, portId: string, rif: Inp3Rif): void {
     if (
       this.nodeCall === null ||
       this.inp3Table === null ||
@@ -759,6 +825,7 @@ export class NetRomConnector {
     this.inp3Table.ingestRif(
       from,
       this.nodeCall,
+      portId,
       sntt,
       rif,
       this.inp3Options.hopLimit,
@@ -766,13 +833,47 @@ export class NetRomConnector {
   }
 
   /** Send raw INP3 bytes (an L3RTT or a RIF) over a neighbour's interlink if one is
-   *  up. Cold-interlink: drop, don't dial (the engine simply won't measure/advertise
-   *  over an absent link) — mirrors the C# `TrySendOverInterlinkBytes`. */
+   *  up. The SELECTED link (the port routing picks for the callsign) is used when
+   *  known; else any live link to the callsign. TODO: the INP3 engine is still
+   *  callsign-keyed, so this resolves the per-port key here at the send seam; the
+   *  engine rekey is the documented follow-up. Cold-interlink: drop, don't dial
+   *  (the engine simply won't measure/advertise over an absent link) - mirrors the
+   *  C# `TrySendOverInterlinkBytes`. */
   private sendInp3Bytes(neighbour: Callsign, bytes: Uint8Array): void {
-    const link = this.interlinks.get(neighbour.toString());
+    const link = this.interlinkForCallsign(neighbour.toString());
     if (link !== undefined) {
       link.listener.sendData(link.session, bytes, PID_NET_ROM);
     }
+  }
+
+  /** The live interlink to use for a callsign: the one on routing's selected port
+   *  (the best route's port when that route forwards via the callsign itself) when
+   *  known, else the first live link to the callsign in stable (key-ordinal)
+   *  order. `undefined` when no link to the callsign is up. */
+  private interlinkForCallsign(callText: string): Interlink | undefined {
+    const dest = resolveDestination(this.routing.snapshot(), callText);
+    if (
+      dest !== null &&
+      dest.bestRoute !== null &&
+      dest.bestRoute.neighbour.toString() === callText
+    ) {
+      const selected = this.interlinks.get(
+        neighbourKey(dest.bestRoute.portId, callText),
+      );
+      if (selected !== undefined) {
+        return selected;
+      }
+    }
+    let fallback: { key: string; link: Interlink } | undefined;
+    for (const [key, link] of this.interlinks) {
+      if (neighbourKeyCallsign(key) !== callText) {
+        continue;
+      }
+      if (fallback === undefined || key < fallback.key) {
+        fallback = { key, link };
+      }
+    }
+    return fallback?.link;
   }
 
   /** Reconcile the scheduler's fan-out target set from the engine's INP3-capable
@@ -848,19 +949,21 @@ export class NetRomConnector {
     }
 
     const neighbour = decision.nextHop;
-    const neighbourKey = neighbour.toString();
+    const portId = decision.nextHopPortId;
+    const key = neighbourKey(portId!, neighbour);
     const bytes = encodeNetRomPacket(decision.packet);
 
-    const link = this.interlinks.get(neighbourKey);
+    const link = this.interlinks.get(key);
     if (link !== undefined) {
       link.listener.sendData(link.session, bytes, PID_NET_ROM);
       return;
     }
 
-    // No interlink yet — establish it, then send (a transit cold-start).
-    void this.ensureInterlink(neighbour)
+    // No interlink yet - establish it on the chosen route's port, then send (a
+    // transit cold-start).
+    void this.ensureInterlink(portId!, neighbour)
       .then(() => {
-        const established = this.interlinks.get(neighbourKey);
+        const established = this.interlinks.get(key);
         if (established !== undefined) {
           established.listener.sendData(established.session, bytes, PID_NET_ROM);
         }
@@ -885,33 +988,48 @@ export class NetRomConnector {
   private sendNetRomPacket(packet: NetRomPacket): void {
     try {
       const dest = packet.network.destination;
-      const destKey = dest.toString();
+      const destText = dest.toString();
 
-      let neighbourKey: string | null = null;
-      if (this.interlinks.has(destKey)) {
-        neighbourKey = destKey;
-      } else {
+      // Next-hop order (mirrors the C# `SendNetRomPacket`): (1) a direct
+      // interlink to the destination node itself; (2) the best route in the
+      // routing table, on that route's OWN port; (3) the destination as a
+      // directly-heard neighbour, on its best port. With per-port keys one
+      // callsign can hold several links; each step picks deterministically.
+      let link: Interlink | undefined;
+      let resolved = false;
+
+      link = this.interlinkForCallsign(destText);
+      if (link === undefined) {
         const snap = this.routing.snapshot();
-        const resolved = resolveDestination(snap, destKey);
+        const destination = resolveDestination(snap, destText);
         const active =
-          resolved === null ? null : selectActiveRoute(resolved, this.preferInp3);
+          destination === null
+            ? null
+            : selectActiveRoute(destination, this.preferInp3);
         if (active !== null) {
-          neighbourKey = active.neighbour.toString();
-        } else if (neighbourFor(snap, dest) !== null) {
-          neighbourKey = destKey;
+          resolved = true;
+          link = this.interlinks.get(neighbourKey(active.portId, active.neighbour));
+        } else {
+          const nbr = neighbourFor(snap, dest);
+          if (nbr !== null) {
+            resolved = true;
+            link = this.interlinks.get(neighbourKey(nbr.portId, dest));
+          }
         }
       }
 
-      if (neighbourKey === null) {
-        this.onError(new Error(`NET/ROM: no route to ${destKey} for outbound datagram.`));
-        return;
-      }
-
-      const link = this.interlinks.get(neighbourKey);
       if (link === undefined) {
-        // No interlink yet — ensureInterlink establishes it before the first
-        // datagram on the outbound path, so a missing link here is a transit edge.
-        this.onError(new Error(`NET/ROM: no interlink to ${neighbourKey} for outbound datagram.`));
+        // A datagram with no resolvable next hop, or whose interlink isn't up, is
+        // dropped (logged via onError) - the ensureInterlink path establishes the
+        // link before the first outbound datagram, so a missing link here is a
+        // transit/edge case, not the common path.
+        this.onError(
+          new Error(
+            resolved
+              ? `NET/ROM: no interlink to ${destText} for outbound datagram.`
+              : `NET/ROM: no route to ${destText} for outbound datagram.`,
+          ),
+        );
         return;
       }
 

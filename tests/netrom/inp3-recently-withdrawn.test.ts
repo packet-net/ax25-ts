@@ -65,26 +65,26 @@ function withdrawnStrings(table: NetRomRoutingTable): string[] {
 describe("Inp3 recently-withdrawn — population: where an INP3 route fully leaves", () => {
   it("ingesting a horizon rip withdraws the last inp3 route and records it", () => {
     const table = newTable();
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
     expect(table.recentlyWithdrawn()).toHaveLength(0); // learning is not a withdrawal
 
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, INP3_HORIZON_MS)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, INP3_HORIZON_MS)));
 
     expect(withdrawnStrings(table)).toEqual([DestSot.toString()]);
   });
 
   it("markNeighbourDown records a destination that loses its last inp3 route", () => {
     const table = newTable();
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
 
-    table.markNeighbourDown(NbrA);
+    table.markNeighbourDown("vhf", NbrA);
 
     expect(withdrawnStrings(table)).toEqual([DestSot.toString()]);
   });
 
   it("sweep records a destination whose last inp3 route ages out", () => {
     const table = newTable();
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
 
     // OBSINIT default is 6 → sweep it down to 0 to purge the route.
     for (let i = 0; i < 6; i++) {
@@ -97,21 +97,21 @@ describe("Inp3 recently-withdrawn — population: where an INP3 route fully leav
   it("a destination that keeps another inp3 route is NOT withdrawn", () => {
     const table = newTable();
     // SOT reachable via BOTH neighbours. Dropping one leaves the other → not withdrawn.
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
-    table.ingestRif(NbrB, Me, 20, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrB, Me, "vhf", 20, rif(rip(DestSot, 1, 100)));
 
-    table.markNeighbourDown(NbrA);
+    table.markNeighbourDown("vhf", NbrA);
 
     expect(table.recentlyWithdrawn()).toHaveLength(0);
   });
 
   it("withdrawing one route when another inp3 route survives does not record", () => {
     const table = newTable();
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
-    table.ingestRif(NbrB, Me, 20, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrB, Me, "vhf", 20, rif(rip(DestSot, 1, 100)));
 
     // Withdraw only the NbrA route at the horizon — NbrB's INP3 route survives.
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, INP3_HORIZON_MS)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, INP3_HORIZON_MS)));
 
     expect(table.recentlyWithdrawn()).toHaveLength(0);
   });
@@ -126,7 +126,7 @@ describe("Inp3 recently-withdrawn — the default-off guard (design §7.1)", () 
       { dest: DestSot, destAlias: "SOT", neighbour: NbrA, quality: 200 },
     ]));
 
-    table.markNeighbourDown(NbrA);
+    table.markNeighbourDown("vhf", NbrA);
 
     expect(table.recentlyWithdrawn()).toHaveLength(0);
   });
@@ -150,11 +150,11 @@ describe("Inp3 recently-withdrawn — the default-off guard (design §7.1)", () 
     table.ingest(NbrA, Me, "vhf", nodes("RDG", [
       { dest: DestSot, destAlias: "SOT", neighbour: NbrA, quality: 200 },
     ]));
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
 
     // Withdraw the INP3 metric at the horizon. The quality route SURVIVES (SOT stays
     // in the table for NODES) but SOT has left the INP3 time-space → recorded.
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, INP3_HORIZON_MS)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, INP3_HORIZON_MS)));
 
     expect(withdrawnStrings(table)).toEqual([DestSot.toString()]);
     expect(
@@ -166,8 +166,8 @@ describe("Inp3 recently-withdrawn — the default-off guard (design §7.1)", () 
 describe("Inp3 recently-withdrawn — buildRif emits from the host-drained snapshot", () => {
   it("buildRif emits one horizon rip for each withdrawn destination in the snapshot", () => {
     const table = newTable();
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
-    table.markNeighbourDown(NbrA); // SOT withdrawn
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
+    table.markNeighbourDown("vhf", NbrA); // SOT withdrawn
 
     // The host hands buildRif the snapshot (here peeked, to keep this single-RIF case
     // simple). One explicit one-shot horizon withdrawal per entry.
@@ -181,8 +181,8 @@ describe("Inp3 recently-withdrawn — buildRif emits from the host-drained snaps
 
   it("buildRif with no snapshot omits withdrawals", () => {
     const table = newTable();
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
-    table.markNeighbourDown(NbrA); // SOT withdrawn, but…
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
+    table.markNeighbourDown("vhf", NbrA); // SOT withdrawn, but…
 
     // …a buildRif that is NOT handed the withdrawn snapshot (the default) appends no
     // withdrawal RIPs. The set is unaffected (buildRif never touches it).
@@ -194,8 +194,8 @@ describe("Inp3 recently-withdrawn — buildRif emits from the host-drained snaps
 
   it("the drained snapshot carries the withdrawal to every neighbour", () => {
     const table = newTable();
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
-    table.markNeighbourDown(NbrA); // SOT withdrawn
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
+    table.markNeighbourDown("vhf", NbrA); // SOT withdrawn
 
     // The host drains ONCE at the round start (snapshot+clear), then fans the SAME
     // snapshot out to every neighbour. Both RIFs carry the horizon withdrawal, and
@@ -215,8 +215,8 @@ describe("Inp3 recently-withdrawn — buildRif emits from the host-drained snaps
 
   it("drainRecentlyWithdrawn returns then empties so a later rif omits the withdrawal", () => {
     const table = newTable();
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
-    table.markNeighbourDown(NbrA);
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
+    table.markNeighbourDown("vhf", NbrA);
 
     const drained = table.drainRecentlyWithdrawn();
     expect(drained.map((c) => c.toString())).toEqual([DestSot.toString()]);
@@ -237,15 +237,15 @@ describe("Inp3 recently-withdrawn — buildRif emits from the host-drained snaps
   it("a re-learned destination is carried finite not poisoned in the same round", () => {
     const table = newTable();
     // SOT withdrawn via NbrA…
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
-    table.markNeighbourDown(NbrA);
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
+    table.markNeighbourDown("vhf", NbrA);
     expect(withdrawnStrings(table)).toContain(DestSot.toString());
 
     // …then re-learned via NbrB in the SAME round (before the host drains). It now
     // holds a finite INP3 route again, so buildRif must carry it FINITE, not as a
     // horizon withdrawal — the emitted-finite-dest is excluded from the horizon-RIP
     // pass even though it is still in the withdrawn snapshot the host passes.
-    table.ingestRif(NbrB, Me, 20, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrB, Me, "vhf", 20, rif(rip(DestSot, 1, 100)));
 
     // toward NbrA: SOT is NOT via NbrA anymore → finite, not poisoned
     const rifOut = table.buildRif(Me, NbrA, table.recentlyWithdrawn());
@@ -257,8 +257,8 @@ describe("Inp3 recently-withdrawn — buildRif emits from the host-drained snaps
 
   it("the own node is never emitted as a withdrawal", () => {
     const table = newTable();
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
-    table.markNeighbourDown(NbrA);
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
+    table.markNeighbourDown("vhf", NbrA);
 
     const rifOut = table.buildRif(Me, NbrB, table.recentlyWithdrawn());
     const own = rifOut.rips.filter((r) => r.destination.equals(Me));
@@ -269,14 +269,14 @@ describe("Inp3 recently-withdrawn — buildRif emits from the host-drained snaps
 
   it("re-withdrawing after a drain re-populates the set", () => {
     const table = newTable();
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
-    table.markNeighbourDown(NbrA);
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
+    table.markNeighbourDown("vhf", NbrA);
     table.drainRecentlyWithdrawn();
     expect(table.recentlyWithdrawn()).toHaveLength(0);
 
     // A fresh learn-then-withdraw cycle re-populates it (the next round re-advertises).
-    table.ingestRif(NbrB, Me, 20, rif(rip(DestSot, 1, 100)));
-    table.markNeighbourDown(NbrB);
+    table.ingestRif(NbrB, Me, "vhf", 20, rif(rip(DestSot, 1, 100)));
+    table.markNeighbourDown("vhf", NbrB);
 
     expect(withdrawnStrings(table)).toEqual([DestSot.toString()]);
   });
@@ -286,10 +286,11 @@ describe("Inp3 recently-withdrawn — buildRif emits from the host-drained snaps
     table.ingestRif(
       NbrA,
       Me,
+      "vhf",
       50,
       rif(rip(DestSot, 1, 100), rip(DestMnc, 1, 100)),
     );
-    table.markNeighbourDown(NbrA); // both lose their last INP3 route
+    table.markNeighbourDown("vhf", NbrA); // both lose their last INP3 route
 
     // GB7MNC < GB7SOT ordinally.
     expect(withdrawnStrings(table)).toEqual([

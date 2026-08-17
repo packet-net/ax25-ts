@@ -16,6 +16,7 @@ import {
   NetRomCircuitState,
   type NetRomConnection,
   NetRomConnector,
+  neighbourKey,
   NetRomNoRouteError,
   NetRomRoutingTable,
   parseNodesBroadcast,
@@ -32,6 +33,7 @@ import {
   ConnectHarness,
   END_ALIAS,
   END_NODE,
+  PORT_ID,
 } from "./connect-harness.js";
 
 const BUDGET = 2000;
@@ -51,8 +53,11 @@ describe("NetRomConnector — connect <alias> outbound routing (TS-4)", () => {
       connection.onData((chunk) => received.push(chunk));
 
       // 1. The interlink AX.25 session to B is up (A dialled GB7BBB, the best
-      //    neighbour — NOT the END node, which A has no direct RF path to).
-      expect(harness.a.connector.interlinkNeighbours).toContain(B_NODE.toString());
+      //    neighbour - NOT the END node, which A has no direct RF path to). The
+      //    interlink key is the (portId, callsign) pair.
+      expect(harness.a.connector.interlinkNeighbours).toContain(
+        neighbourKey(PORT_ID, B_NODE),
+      );
 
       // 2. The L4 circuit reached Connected on both ends.
       expect(connection.circuit.state).toBe(NetRomCircuitState.Connected);
@@ -119,9 +124,11 @@ describe("NetRomConnector — connect <alias> outbound routing (TS-4)", () => {
 
       expect(c1.circuit.state).toBe(NetRomCircuitState.Connected);
       expect(c2.circuit.state).toBe(NetRomCircuitState.Connected);
-      // Still exactly one interlink neighbour (B) — the second connect reused it.
-      expect(neighboursAfterFirst).toEqual([B_NODE.toString()]);
-      expect(harness.a.connector.interlinkNeighbours).toEqual([B_NODE.toString()]);
+      // Still exactly one interlink neighbour (B on p1) - the second connect
+      // reused it.
+      const expectedKey = neighbourKey(PORT_ID, B_NODE);
+      expect(neighboursAfterFirst).toEqual([expectedKey]);
+      expect(harness.a.connector.interlinkNeighbours).toEqual([expectedKey]);
       // Two distinct circuits on A.
       expect(harness.a.connector.circuitManager.circuits.length).toBe(2);
       expect(c1.circuit).not.toBe(c2.circuit);
@@ -218,7 +225,7 @@ describe("NetRomConnector — connect <alias> outbound routing (TS-4)", () => {
 
     const connector = new NetRomConnector(
       { snapshot: () => table.snapshot() },
-      { enabled: true, onNeighbourDown: (n) => table.markNeighbourDown(n) },
+      { enabled: true, onNeighbourDown: (portId, n) => table.markNeighbourDown(portId, n) },
     );
     connector.attachPort("p1", A_NODE, fakeListener);
 
@@ -226,6 +233,119 @@ describe("NetRomConnector — connect <alias> outbound routing (TS-4)", () => {
 
     expect(dialed).toEqual([nb1.toString(), nb2.toString()]); // best first, then failed over
     expect(resolveDestination(table.snapshot(), END_NODE.toString())).toBeNull(); // both marked down
+    connector.dispose();
+  });
+
+  it("a dial failure on one port fails over to the SAME callsign on the other port", () => {
+    // One neighbour, two ports: the best route runs on p1, a weaker one on p2.
+    // The p1 dial fails; marking ONLY the (p1, neighbour) key down must leave
+    // the p2 route intact, so the next selection dials the same callsign on p2.
+    const nb = new Callsign("GB7DUL", 0);
+    const table = new NetRomRoutingTable();
+    for (const [portId, q] of [["p1", 250], ["p2", 150]] as const) {
+      const bc = parseNodesBroadcast(
+        buildNodesInfo("DUAL", [
+          { dest: END_NODE, destAlias: END_ALIAS, neighbour: nb, quality: q },
+        ]),
+      );
+      if (bc === null) throw new Error("seed parse failed");
+      table.ingest(nb, A_NODE, portId, bc);
+    }
+
+    const dialed: string[] = [];
+    let tableAtSecondDial: ReturnType<NetRomRoutingTable["snapshot"]> | null = null;
+    const failingListener = {
+      connect: (neighbour: Callsign) => {
+        if (dialed.length === 1) {
+          // At the second dial the (p1, nb) key is already marked down but the
+          // p2 route must still be in the table.
+          tableAtSecondDial = table.snapshot();
+        }
+        dialed.push(neighbour.toString());
+        return Promise.reject(new Error(`${neighbour} did not answer`));
+      },
+      sendData: () => {},
+      onSessionAccepted: () => {},
+    };
+
+    const connector = new NetRomConnector(
+      { snapshot: () => table.snapshot() },
+      { enabled: true, onNeighbourDown: (portId, n) => table.markNeighbourDown(portId, n) },
+    );
+    connector.attachPort("p1", A_NODE, failingListener);
+    connector.attachPort("p2", A_NODE, failingListener);
+
+    return connector.connect(END_NODE.toString()).then(
+      () => {
+        throw new Error("connect should have failed: both dials reject");
+      },
+      () => {
+        // Both ports were dialed, best (p1) first, then the SAME callsign on p2.
+        expect(dialed).toEqual([nb.toString(), nb.toString()]);
+        // Per-key isolation: when the p2 dial ran, the p1 route was gone but the
+        // p2 route was still there.
+        const end = tableAtSecondDial!.destinations.find((d) =>
+          d.destination.equals(END_NODE),
+        )!;
+        expect(end.routes).toHaveLength(1);
+        expect(end.routes[0]!.portId).toBe("p2");
+        // Both keys down at the end.
+        expect(resolveDestination(table.snapshot(), END_NODE.toString())).toBeNull();
+        connector.dispose();
+      },
+    );
+  });
+
+  it("one neighbour on two ports holds two interlinks, one per (port, callsign) key", () => {
+    // Two inbound interlink sessions from the same callsign, one per port: each
+    // records under its arrival port's key, so the map holds two entries.
+    const nb = new Callsign("GB7DUL", 0);
+    const table = new NetRomRoutingTable();
+    const connector = new NetRomConnector(
+      { snapshot: () => table.snapshot() },
+      { enabled: true },
+    );
+
+    const sessions: {
+      port: string;
+      cb: ((sig: unknown) => void) | null;
+      to: Callsign;
+    }[] = [];
+    const makeListener = (port: string) => ({
+      connect: () => Promise.reject(new Error("not used")),
+      sendData: () => {},
+      onSessionAccepted: (cb: (s: unknown) => void) => {
+        // Immediately accept a fake inbound session from `nb` on this port.
+        const entry = { port, cb: null as ((sig: unknown) => void) | null, to: nb };
+        sessions.push(entry);
+        cb({
+          to: nb,
+          onDataLinkSignal: (sigCb: (sig: unknown) => void) => {
+            entry.cb = sigCb;
+          },
+        });
+      },
+    });
+    connector.attachPort("p1", A_NODE, makeListener("p1"));
+    connector.attachPort("p2", A_NODE, makeListener("p2"));
+
+    // First 0xCF data on each session registers its (port, callsign) interlink.
+    for (const s of sessions) {
+      s.cb!({
+        type: "DL_DATA_indication",
+        pid: 0xcf,
+        data: new Uint8Array([0x00]),
+      });
+    }
+
+    expect(connector.interlinkNeighbours.slice().sort()).toEqual(
+      [neighbourKey("p1", nb), neighbourKey("p2", nb)].sort(),
+    );
+    expect(connector.interlinkSessions.size).toBe(2);
+
+    // Detaching a port drops only that port's interlink key.
+    connector.detachPort("p1");
+    expect(connector.interlinkNeighbours).toEqual([neighbourKey("p2", nb)]);
     connector.dispose();
   });
 

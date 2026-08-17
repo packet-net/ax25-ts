@@ -81,7 +81,7 @@ function nodes(
 describe("Inp3 ingest — upsert", () => {
   it("ingesting a rif learns an inp3 time-route via the carrying neighbour", () => {
     const table = newTable();
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100, "SOT")));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100, "SOT")));
 
     const route = routeVia(table, DestSot, NbrA);
     expect(route).toBeDefined();
@@ -95,7 +95,7 @@ describe("Inp3 ingest — upsert", () => {
 
   it("a pure inp3 route has quality zero so it is invisible to the quality path", () => {
     const table = newTable();
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
 
     const route = routeVia(table, DestSot, NbrA)!;
     expect(route.quality).toBe(0);
@@ -104,8 +104,8 @@ describe("Inp3 ingest — upsert", () => {
 
   it("re-ingesting the same dest via the same neighbour refreshes the metric in place", () => {
     const table = newTable();
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 300)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 300)));
 
     const dest = table
       .snapshot()
@@ -119,7 +119,7 @@ describe("Inp3 ingest — target-time accumulation", () => {
   it("local target time is peer time plus link sntt plus ten ms per hop", () => {
     const table = newTable();
     // peer says 100 ms to SOT in 2 hops; our link to the neighbour measures 75 ms.
-    table.ingestRif(NbrA, Me, 75, rif(rip(DestSot, 2, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 75, rif(rip(DestSot, 2, 100)));
 
     const route = routeVia(table, DestSot, NbrA)!;
     expect(route.inp3!.targetTimeMs).toBe(100 + 75 + 10);
@@ -129,7 +129,7 @@ describe("Inp3 ingest — target-time accumulation", () => {
   it("per-hop increment keeps target time strictly increasing across a zero ms link", () => {
     const table = newTable();
     // A same-host / loopback link measures ~0 ms and the peer advertises 0 ms.
-    table.ingestRif(NbrA, Me, 0, rif(rip(DestSot, 0, 0)));
+    table.ingestRif(NbrA, Me, "vhf", 0, rif(rip(DestSot, 0, 0)));
 
     const route = routeVia(table, DestSot, NbrA)!;
     expect(route.inp3!.targetTimeMs).toBe(10); // the +10 ms per-hop floor
@@ -139,7 +139,7 @@ describe("Inp3 ingest — target-time accumulation", () => {
   it("full millisecond precision is kept not requantised to the ten ms granule", () => {
     const table = newTable();
     // Wire target time is always a 10 ms multiple, but the SNTT need not be — 73 ms here.
-    table.ingestRif(NbrA, Me, 73, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 73, rif(rip(DestSot, 1, 100)));
 
     const route = routeVia(table, DestSot, NbrA)!;
     expect(route.inp3!.targetTimeMs).toBe(183); // 100 + 73 + 10 — full ms
@@ -148,8 +148,8 @@ describe("Inp3 ingest — target-time accumulation", () => {
   it("best inp3 route per destination is the lowest target time", () => {
     const table = newTable();
     // Two neighbours both reach SOT; via NbrB is the faster path.
-    table.ingestRif(NbrA, Me, 200, rif(rip(DestSot, 1, 100))); // 310
-    table.ingestRif(NbrB, Me, 20, rif(rip(DestSot, 1, 100))); // 130
+    table.ingestRif(NbrA, Me, "vhf", 200, rif(rip(DestSot, 1, 100))); // 310
+    table.ingestRif(NbrB, Me, "vhf", 20, rif(rip(DestSot, 1, 100))); // 130
 
     const dest = table
       .snapshot()
@@ -170,11 +170,11 @@ describe("Inp3 ingest — target-time accumulation", () => {
 describe("Inp3 ingest — horizon withdraws", () => {
   it("a rip at or over the horizon is a withdrawal clearing the inp3 metric", () => {
     const table = newTable();
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
     expect(routeVia(table, DestSot, NbrA)!.inp3).toBeDefined();
 
     // The peer now advertises SOT at the 600 s horizon → withdrawal.
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, INP3_HORIZON_MS)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, INP3_HORIZON_MS)));
 
     expect(routeVia(table, DestSot, NbrA)).toBeUndefined();
     expect(
@@ -184,11 +184,11 @@ describe("Inp3 ingest — horizon withdraws", () => {
 
   it("a computed target time reaching the horizon also withdraws", () => {
     const table = newTable();
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
 
     // peer target just under the horizon, but the link SNTT pushes the computed
     // value to/over it → withdrawal even though rip.isHorizon is false.
-    table.ingestRif(NbrA, Me, 100, rif(rip(DestSot, 1, INP3_HORIZON_MS - 10)));
+    table.ingestRif(NbrA, Me, "vhf", 100, rif(rip(DestSot, 1, INP3_HORIZON_MS - 10)));
 
     expect(routeVia(table, DestSot, NbrA)).toBeUndefined();
   });
@@ -199,13 +199,13 @@ describe("Inp3 ingest — horizon withdraws", () => {
     table.ingest(NbrA, Me, "vhf", nodes("RDG", [
       { dest: DestSot, destAlias: "SOT", neighbour: NbrA, quality: 200 },
     ]));
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
     const both = routeVia(table, DestSot, NbrA)!;
     expect(both.quality).toBeGreaterThan(0);
     expect(both.inp3).toBeDefined();
 
     // Withdraw via the horizon — the quality route must survive, the INP3 metric cleared.
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, INP3_HORIZON_MS)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, INP3_HORIZON_MS)));
 
     const after = routeVia(table, DestSot, NbrA);
     expect(after).toBeDefined();
@@ -221,7 +221,7 @@ describe("Inp3 ingest — horizon withdraws", () => {
     ]));
 
     // A non-horizon RIP arrives but the link is un-probed: skip — do NOT withdraw.
-    table.ingestRif(NbrA, Me, SNTT_UNSET, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", SNTT_UNSET, rif(rip(DestSot, 1, 100)));
 
     const route = routeVia(table, DestSot, NbrA);
     expect(route).toBeDefined();
@@ -231,11 +231,11 @@ describe("Inp3 ingest — horizon withdraws", () => {
 
   it("a horizon rip withdraws even when the link is unmeasured", () => {
     const table = newTable();
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
     expect(routeVia(table, DestSot, NbrA)!.inp3).toBeDefined();
 
     // Even with no current SNTT measurement, an explicit horizon RIP is a withdrawal.
-    table.ingestRif(NbrA, Me, SNTT_UNSET, rif(rip(DestSot, 1, INP3_HORIZON_MS)));
+    table.ingestRif(NbrA, Me, "vhf", SNTT_UNSET, rif(rip(DestSot, 1, INP3_HORIZON_MS)));
 
     expect(routeVia(table, DestSot, NbrA)).toBeUndefined();
   });
@@ -245,7 +245,7 @@ describe("Inp3 ingest — hop limit", () => {
   it("a rip whose local hop count exceeds the hop limit is not learned", () => {
     const table = newTable();
     // hopLimit 5: a RIP at 5 hops becomes 6 local → over the limit → not learned.
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 5, 100)), 5);
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 5, 100)), 5);
 
     expect(routeVia(table, DestSot, NbrA)).toBeUndefined();
   });
@@ -253,7 +253,7 @@ describe("Inp3 ingest — hop limit", () => {
   it("a rip at exactly the hop limit is learned", () => {
     const table = newTable();
     // hopLimit 5: a RIP at 4 hops becomes 5 local → at the limit → learned.
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 4, 100)), 5);
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 4, 100)), 5);
 
     const route = routeVia(table, DestSot, NbrA);
     expect(route).toBeDefined();
@@ -264,8 +264,8 @@ describe("Inp3 ingest — hop limit", () => {
     expect(NetRomRoutingTable.DEFAULT_HOP_LIMIT).toBe(30);
     const table = newTable();
     // 29 hops → 30 local, learned at the default; 30 hops → 31 local, dropped.
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 29, 100)));
-    table.ingestRif(NbrB, Me, 50, rif(rip(DestMnc, 30, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 29, 100)));
+    table.ingestRif(NbrB, Me, "vhf", 50, rif(rip(DestMnc, 30, 100)));
 
     expect(routeVia(table, DestSot, NbrA)).toBeDefined();
     expect(routeVia(table, DestMnc, NbrB)).toBeUndefined();
@@ -275,7 +275,7 @@ describe("Inp3 ingest — hop limit", () => {
 describe("Inp3 ingest — trivial-loop guard", () => {
   it("a rip whose destination is us is skipped", () => {
     const table = newTable();
-    table.ingestRif(NbrA, Me, 50, rif(rip(Me, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(Me, 1, 100)));
 
     expect(
       table.snapshot().destinations.some((d) => d.destination.equals(Me)),
@@ -292,9 +292,9 @@ describe("Inp3 ingest — route cap", () => {
     const n3 = new Callsign("GB7CCC", 0);
 
     // Three INP3-only routes (all quality 0) to SOT via three neighbours → capped to 2.
-    table.ingestRif(n1, Me, 10, rif(rip(DestSot, 1, 100)));
-    table.ingestRif(n2, Me, 20, rif(rip(DestSot, 1, 100)));
-    table.ingestRif(n3, Me, 30, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(n1, Me, "vhf", 10, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(n2, Me, "vhf", 20, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(n3, Me, "vhf", 30, rif(rip(DestSot, 1, 100)));
 
     const dest = table
       .snapshot()
@@ -310,7 +310,7 @@ describe("Inp3 ingest — route cap", () => {
     table.ingest(NbrA, Me, "vhf", nodes("RDG", [
       { dest: DestSot, destAlias: "SOT", neighbour: NbrA, quality: 200 },
     ]));
-    table.ingestRif(NbrB, Me, 10, rif(rip(DestSot, 1, 1)));
+    table.ingestRif(NbrB, Me, "vhf", 10, rif(rip(DestSot, 1, 1)));
 
     const dest = table
       .snapshot()
@@ -331,7 +331,7 @@ describe("Inp3 ingest — coexistence with quality routes", () => {
     const q = qualityOnly.quality;
     const obs = qualityOnly.obsolescence;
 
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
 
     const both = routeVia(table, DestSot, NbrA)!;
     expect(both.quality).toBe(q);
@@ -345,7 +345,7 @@ describe("Inp3 ingest — coexistence with quality routes", () => {
     table.ingest(NbrA, Me, "vhf", nodes("RDG", [
       { dest: DestSot, destAlias: "SOT", neighbour: NbrA, quality: 200 },
     ]));
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
     expect(routeVia(table, DestSot, NbrA)!.inp3).toBeDefined();
 
     // A later NODES broadcast refreshes the quality — the time metric must survive.
@@ -365,7 +365,7 @@ describe("Inp3 ingest — coexistence with quality routes", () => {
     table.ingest(NbrA, Me, "vhf", nodes("RDG", [
       { dest: DestSot, destAlias: "SOT", neighbour: NbrA, quality: 200 },
     ]));
-    table.ingestRif(NbrB, Me, 20, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrB, Me, "vhf", 20, rif(rip(DestSot, 1, 100)));
 
     const dest = table
       .snapshot()

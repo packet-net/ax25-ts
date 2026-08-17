@@ -79,8 +79,8 @@ describe("Inp3 buildRif — own-node source RIP (invariant Source)", () => {
 
   it("own-node rip is always first and is zero/zero regardless of table state", () => {
     const table = newTable();
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
-    table.ingestRif(NbrB, Me, 20, rif(rip(DestMnc, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrB, Me, "vhf", 20, rif(rip(DestMnc, 1, 100)));
 
     for (const toward of [NbrA, NbrB]) {
       const rifOut = table.buildRif(Me, toward);
@@ -94,7 +94,7 @@ describe("Inp3 buildRif — own-node source RIP (invariant Source)", () => {
   it("a rif built toward us never poisons our own node", () => {
     // Degenerate: building toward ourselves (the loop-guard identity == target neighbour).
     const table = newTable();
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
 
     const rifOut = table.buildRif(Me, Me);
 
@@ -109,7 +109,7 @@ describe("Inp3 buildRif — content (§1.1)", () => {
   it("each selected inp3 route becomes one destination rip at its quantised target time", () => {
     const table = newTable();
     // 100 + 73 + 10 = 183 ms stored; emitted floored to the 10 ms wire granule → 180.
-    table.ingestRif(NbrA, Me, 73, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 73, rif(rip(DestSot, 1, 100)));
 
     const rifOut = table.buildRif(Me, NbrB); // toward a DIFFERENT neighbour → no poison
 
@@ -136,8 +136,8 @@ describe("Inp3 buildRif — content (§1.1)", () => {
   it("destination rips are ordered by ascending target time then callsign after the own-node rip", () => {
     const table = newTable();
     // Two destinations, faster via the same neighbour so neither is poisoned toward NbrB.
-    table.ingestRif(NbrA, Me, 200, rif(rip(DestSot, 1, 100))); // 310
-    table.ingestRif(NbrA, Me, 20, rif(rip(DestMnc, 1, 100))); // 130
+    table.ingestRif(NbrA, Me, "vhf", 200, rif(rip(DestSot, 1, 100))); // 310
+    table.ingestRif(NbrA, Me, "vhf", 20, rif(rip(DestMnc, 1, 100))); // 130
 
     const rifOut = table.buildRif(Me, NbrB);
 
@@ -151,7 +151,7 @@ describe("Inp3 buildRif — poison-reverse (invariant P)", () => {
   it("a dest via N is poisoned at the horizon in the rif toward N", () => {
     const table = newTable();
     // SOT is reached via NbrA. The RIF toward NbrA must poison SOT.
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
 
     const towardA = table.buildRif(Me, NbrA);
 
@@ -163,7 +163,7 @@ describe("Inp3 buildRif — poison-reverse (invariant P)", () => {
   it("the same dest is finite in the rif toward a different neighbour", () => {
     const table = newTable();
     // SOT via NbrA: poisoned toward NbrA, but advertised at its real time toward NbrB.
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100)));
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100)));
 
     const towardA = table.buildRif(Me, NbrA);
     const towardB = table.buildRif(Me, NbrB);
@@ -178,8 +178,8 @@ describe("Inp3 buildRif — poison-reverse (invariant P)", () => {
     // SOT reachable via BOTH neighbours. The shipped multi-route LB forwards SOT
     // traffic over BOTH, so advertising SOT back at a finite metric to EITHER seeds
     // a loop — both must be poisoned, not just the faster/best one.
-    table.ingestRif(NbrA, Me, 200, rif(rip(DestSot, 1, 100))); // 310 via NbrA
-    table.ingestRif(NbrB, Me, 20, rif(rip(DestSot, 1, 100))); // 130 via NbrB
+    table.ingestRif(NbrA, Me, "vhf", 200, rif(rip(DestSot, 1, 100))); // 310 via NbrA
+    table.ingestRif(NbrB, Me, "vhf", 20, rif(rip(DestSot, 1, 100))); // 130 via NbrB
 
     expect(inp3RipIsHorizon(ripFor(table.buildRif(Me, NbrA), DestSot))).toBe(true);
     expect(inp3RipIsHorizon(ripFor(table.buildRif(Me, NbrB), DestSot))).toBe(true);
@@ -203,9 +203,9 @@ describe("Inp3 buildRif — invariant (P'): never finite back to a route's own n
     const d2 = new Callsign("GB7EEE", 0);
     const d3 = new Callsign("GB7FFF", 0);
 
-    table.ingestRif(n1, Me, 10, rif(rip(d1, 1, 100))); // d1 via n1
-    table.ingestRif(n2, Me, 10, rif(rip(d2, 1, 100))); // d2 via n2
-    table.ingestRif(n1, Me, 10, rif(rip(d3, 1, 100))); // d3 via n1
+    table.ingestRif(n1, Me, "vhf", 10, rif(rip(d1, 1, 100))); // d1 via n1
+    table.ingestRif(n2, Me, "vhf", 10, rif(rip(d2, 1, 100))); // d2 via n2
+    table.ingestRif(n1, Me, "vhf", 10, rif(rip(d3, 1, 100))); // d3 via n1
 
     for (const toward of [n1, n2]) {
       const rifOut = table.buildRif(Me, toward);
@@ -235,7 +235,7 @@ describe("Inp3 buildRif — emission is holding-based, independent of forwarding
     const table = newTable();
     // Emission advertises every destination we HOLD an INP3 time-route for, so
     // neighbours learn the time topology — even on a node that forwards by quality.
-    table.ingestRif(NbrA, Me, 50, rif(rip(DestSot, 1, 100))); // 160 via NbrA
+    table.ingestRif(NbrA, Me, "vhf", 50, rif(rip(DestSot, 1, 100))); // 160 via NbrA
 
     const rifOut = table.buildRif(Me, NbrB); // toward a different neighbour → finite
 

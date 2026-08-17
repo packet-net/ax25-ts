@@ -16,6 +16,39 @@ import {
 import { SNTT_UNSET } from "./inp3-sntt.js";
 
 /**
+ * The separator inside a {@link neighbourKey} compound key. A port id never
+ * contains it in practice (ids are short tokens like `vhf` / `p1`), and the
+ * callsign half is a canonical `Callsign.toString()` which cannot contain it
+ * either, so the key splits unambiguously.
+ */
+export const NETROM_NEIGHBOUR_KEY_SEPARATOR = "|";
+
+/**
+ * The compound identity of a NET/ROM neighbour: the (portId, callsign) pair a
+ * neighbour is heard on, as a single map key. A neighbour heard on two ports is
+ * TWO keys, each with its own path quality, its own routes, and its own
+ * interlink, so a dial failure on one port never touches the other port's view
+ * of the same callsign. Mirrors the C# `(PortId, Callsign)` neighbour key.
+ */
+export function neighbourKey(
+  portId: string,
+  neighbour: Callsign | string,
+): string {
+  const call = typeof neighbour === "string" ? neighbour : neighbour.toString();
+  return `${portId}${NETROM_NEIGHBOUR_KEY_SEPARATOR}${call}`;
+}
+
+/** The port-id half of a {@link neighbourKey} compound key. */
+export function neighbourKeyPort(key: string): string {
+  return key.slice(0, key.indexOf(NETROM_NEIGHBOUR_KEY_SEPARATOR));
+}
+
+/** The callsign half (canonical `Callsign.toString()` text) of a {@link neighbourKey}. */
+export function neighbourKeyCallsign(key: string): string {
+  return key.slice(key.indexOf(NETROM_NEIGHBOUR_KEY_SEPARATOR) + 1);
+}
+
+/**
  * The configurable knobs of NET/ROM route maintenance. These exist because
  * **NET/ROM has no single normative standard** — the canonical appendix names
  * defaults (OBSINIT 6, three routes per destination), but real nodes set the
@@ -116,6 +149,12 @@ export interface Inp3RouteMetric {
 export interface NetRomRoute {
   /** The neighbour we forward through for this route. */
   readonly neighbour: Callsign;
+  /**
+   * The listener port id this route's neighbour is reached on. A route's full
+   * identity is the (portId, neighbour) pair: the same neighbour callsign heard
+   * on two ports yields two routes, each with its own quality and interlink.
+   */
+  readonly portId: string;
   /** Our derived quality for this route (0..255), best first within a destination. */
   readonly quality: number;
   /** Obsolescence count; decremented each sweep, purged at 0. */
@@ -131,8 +170,9 @@ export interface NetRomRoute {
 
 /**
  * A destination known to the table — its callsign + alias and its kept routes
- * (≤ {@link NetRomRoutingOptions.maxRoutesPerDestination}, sorted by quality,
- * best first). The active route is {@link bestRoute}.
+ * (≤ {@link NetRomRoutingOptions.maxRoutesPerDestination}, sorted best first:
+ * highest quality, ties broken by canonical port order then neighbour callsign).
+ * The active route is {@link bestRoute}.
  *
  * Mirrors `Packet.NetRom.Routing.NetRomDestination` on the C# side.
  */
@@ -150,9 +190,11 @@ export interface NetRomDestination {
 /**
  * A directly-heard NET/ROM neighbour — a node whose NODES broadcast we received
  * firsthand, with the path quality we assume to it and the port we heard it on.
- * Mirrors the canonical neighbour list (the `ROUTES` command), restricted to
- * what read-only ingest can know (we don't probe links, so quality is the
- * assumed default-port quality, and there are no digipeaters or lock state).
+ * Its identity is the (portId, callsign) pair: a neighbour heard on two ports is
+ * two entries, each carrying its own port's quality. Mirrors the canonical
+ * neighbour list (the `ROUTES` command), restricted to what read-only ingest can
+ * know (we don't probe links, so quality is the assumed default-port quality,
+ * and there are no digipeaters or lock state).
  *
  * Mirrors `Packet.NetRom.Routing.NetRomNeighbour` on the C# side.
  */
@@ -180,7 +222,10 @@ export interface NetRomNeighbour {
 export interface NetRomRoutingSnapshot {
   /** Known destinations (ordering: alias/callsign, ascending). */
   readonly destinations: readonly NetRomDestination[];
-  /** Directly-heard neighbours (ordering: callsign, ascending). */
+  /**
+   * Directly-heard neighbours (ordering: callsign ascending, then canonical port
+   * order). A callsign heard on two ports appears twice, once per port.
+   */
   readonly neighbours: readonly NetRomNeighbour[];
   /** When this snapshot was taken (epoch ms). */
   readonly generatedAt: number;
@@ -233,8 +278,9 @@ export function resolveDestination(
 
 /**
  * The directly-heard neighbour entry for `neighbour` in `snapshot`, or `null` if it
- * is not a known neighbour. Used to find the port an interlink to that neighbour
- * should run on.
+ * is not a known neighbour. When the same callsign is heard on several ports this
+ * is the entry on the best port (the snapshot lists a callsign's entries in
+ * canonical port order), the port an interlink to that neighbour should run on.
  *
  * Mirrors `NetRomRoutingSnapshot.NeighbourFor` on the C# side.
  */
@@ -254,6 +300,8 @@ export function neighbourFor(
 
 interface RouteState {
   neighbour: Callsign;
+  /** The port this route's neighbour is reached on (half of the route's key). */
+  portId: string;
   quality: number;
   obsolescence: number;
   /**
@@ -268,11 +316,12 @@ interface RouteState {
 
 interface DestinationState {
   alias: string;
-  // keyed by via-neighbour callsign string
+  // keyed by the (portId, via-neighbour) compound key, see neighbourKey()
   routes: Map<string, RouteState>;
 }
 
 interface NeighbourState {
+  neighbour: Callsign;
   alias: string;
   portId: string;
   pathQuality: number;
@@ -349,12 +398,14 @@ export class NetRomRoutingTable {
 
   private readonly options: NetRomRoutingOptions;
   private readonly now: () => number;
+  private readonly portRank: ((portId: string) => number) | undefined;
 
   // destination callsign string -> its entry (alias + per-neighbour routes).
   private readonly destinations = new Map<string, DestinationState>();
-  // neighbour callsign string -> directly-heard neighbour state.
+  // (portId, neighbour) compound key (neighbourKey) -> directly-heard neighbour
+  // state. A neighbour heard on two ports holds two entries.
   private readonly neighbours = new Map<string, NeighbourState>();
-  // destination/neighbour callsign string -> the Callsign object (for snapshot reconstruction).
+  // destination callsign string -> the Callsign object (for snapshot reconstruction).
   private readonly callsignByKey = new Map<string, Callsign>();
 
   // INP3 invariant (W): destinations that have lost their LAST Inp3-bearing route
@@ -375,13 +426,22 @@ export class NetRomRoutingTable {
    *   {@link NETROM_ROUTING_DEFAULTS}.
    * @param now Injected clock returning epoch ms (last-heard stamps). Defaults
    *   to `Date.now`.
+   * @param portRank The host's canonical port order, as a rank per port id
+   *   (lower ranks first). It is the ONLY tie-break input the table cannot know
+   *   itself: when two routes to a destination have equal quality, the route on
+   *   the lower-ranked port wins, then the neighbour callsign (ordinal). Omitted
+   *   (`undefined`) means a stable string-ordinal comparison of the port ids,
+   *   byte-for-byte deterministic without any host configuration. The table
+   *   never hardcodes a port order.
    */
   constructor(
     options: NetRomRoutingOptions = NETROM_ROUTING_DEFAULTS,
     now: () => number = Date.now,
+    portRank?: (portId: string) => number,
   ) {
     this.options = options;
     this.now = now;
+    this.portRank = portRank;
   }
 
   /**
@@ -402,9 +462,12 @@ export class NetRomRoutingTable {
    *   means the table-wide {@link NetRomRoutingOptions.defaultNeighbourQuality},
    *   byte-for-byte the prior behaviour. When supplied it overrides that default
    *   for routes learned on this port, so a mixed-grade node advertises an
-   *   accurate per-port quality. Clamped to 0..255. The cached neighbour path
-   *   quality is refreshed to this value on every ingest, so a per-port quality
-   *   change (or a neighbour moving ports) takes effect on the next broadcast.
+   *   accurate per-port quality. Clamped to 0..255. The cached path quality of
+   *   the (portId, originator) neighbour entry is refreshed to this value on
+   *   every ingest, so a per-port quality change takes effect on the next
+   *   broadcast. A neighbour reappearing on a DIFFERENT port is a different
+   *   neighbour key, learned at that port's quality; the existing entry is
+   *   untouched and ages out by obsolescence if the broadcasts stop.
    * @param minQuality The worst quality a learned route may have and still be
    *   kept on this port (the BPQ per-port `MINQUAL`). Omitted (`undefined`) means
    *   the table-wide {@link NetRomRoutingOptions.minQuality}, byte-for-byte the
@@ -436,20 +499,19 @@ export class NetRomRoutingTable {
     // supplied, else the table-wide default. Clamped defensively to 0..255 so the
     // floor comparison is total.
     const floor = clampQuality(minQuality ?? this.options.minQuality);
-    const originatorKey = originator.toString();
-    this.callsignByKey.set(originatorKey, originator);
+    const originatorKey = neighbourKey(portId, originator);
 
-    // Heuristic 3: ensure a neighbour-list entry for the originator, created with
-    // the (per-port or default) path quality. Refresh its alias + last-heard each
-    // time, and its path quality too, so a per-port QUALITY edit reflects on the
-    // next broadcast.
+    // Heuristic 3: ensure a neighbour-list entry for the (portId, originator)
+    // key, created with the (per-port or default) path quality. Refresh its
+    // alias + last-heard each time, and its path quality too, so a per-port
+    // QUALITY edit reflects on the next broadcast. A broadcast heard on ANOTHER
+    // port touches that port's own key only, never this entry.
     let nbr = this.neighbours.get(originatorKey);
     if (!nbr) {
-      nbr = { alias: "", portId, pathQuality, lastHeard: now };
+      nbr = { neighbour: originator, alias: "", portId, pathQuality, lastHeard: now };
       this.neighbours.set(originatorKey, nbr);
     }
     nbr.alias = broadcast.senderAlias;
-    nbr.portId = portId;
     nbr.pathQuality = pathQuality;
     nbr.lastHeard = now;
     const originatorPathQuality = nbr.pathQuality;
@@ -461,6 +523,7 @@ export class NetRomRoutingTable {
     this.upsertRoute(
       originator,
       broadcast.senderAlias,
+      portId,
       originator,
       originatorPathQuality,
       floor,
@@ -487,6 +550,7 @@ export class NetRomRoutingTable {
       this.upsertRoute(
         entry.destination,
         entry.destinationAlias,
+        portId,
         originator,
         quality,
         floor,
@@ -536,6 +600,11 @@ export class NetRomRoutingTable {
    *   next-hop (via) for every route this RIF teaches.
    * @param myCall Our own node callsign — a RIP whose destination is us is skipped
    *   (the trivial-loop guard).
+   * @param portId The interlink port the RIF arrived on - the port half of the
+   *   (portId, via-neighbour) key every learned route gets. The host only ingests
+   *   a RIF arriving on the neighbour's SELECTED interlink (a RIF arriving on a
+   *   non-selected link to the same callsign is dropped upstream), so the learned
+   *   routes are keyed by the port they actually traverse.
    * @param neighbourSnttMs The smoothed transport time to `receivedFromNeighbour`
    *   in milliseconds; {@link SNTT_UNSET} (`0xffffffff`) means "no measurement
    *   yet" — every RIP is then skipped (no time-route learned, none withdrawn).
@@ -547,6 +616,7 @@ export class NetRomRoutingTable {
   ingestRif(
     receivedFromNeighbour: Callsign,
     myCall: Callsign,
+    portId: string,
     neighbourSnttMs: number,
     rif: Inp3Rif,
     hopLimit: number = NetRomRoutingTable.DEFAULT_HOP_LIMIT,
@@ -576,7 +646,7 @@ export class NetRomRoutingTable {
         inp3RipIsHorizon(rip) ||
         (linkMeasured && localTargetTime >= INP3_HORIZON_MS)
       ) {
-        this.withdrawInp3(rip.destination, receivedFromNeighbour);
+        this.withdrawInp3(rip.destination, portId, receivedFromNeighbour);
         continue;
       }
 
@@ -596,6 +666,7 @@ export class NetRomRoutingTable {
       this.upsertInp3Route(
         rip.destination,
         inp3RipAlias(rip) ?? "",
+        portId,
         receivedFromNeighbour,
         {
           targetTimeMs: localTargetTime,
@@ -663,23 +734,26 @@ export class NetRomRoutingTable {
   }
 
   /**
-   * React to a neighbour going down — its interlink could not be raised (it did
-   * not answer the connect) or its quality collapsed — by immediately dropping
-   * every route that forwards through it, and the neighbour entry itself. This is
-   * the explicit link-down failover signal: instead of waiting for the
-   * obsolescence {@link sweep} to age the now-dead routes out over the broadcast
-   * interval (during which forwarding / connect-routing would keep choosing a
-   * route that can't carry traffic), the dead routes leave the table at once, so
-   * the very next forward or connect decision fails over to an alternate next hop.
-   * A destination that loses all its routes is removed; it and the neighbour
-   * re-learn naturally from the next NODES broadcast if the neighbour returns.
-   * Idempotent — marking an unknown / already-removed neighbour down is a no-op
-   * returning 0. Mirrors C# `NetRomRoutingTable.MarkNeighbourDown`.
+   * React to a neighbour going down ON A GIVEN PORT - its interlink could not be
+   * raised (it did not answer the connect) or its quality collapsed - by
+   * immediately dropping every route that forwards through the (portId,
+   * neighbour) key, and that neighbour entry itself. A dial failure on one port
+   * must NOT drop the other port's routes to the same callsign: only the one key
+   * is touched, so the very next forward or connect decision fails over to the
+   * same callsign on another port or to an alternate next hop. This is the
+   * explicit link-down failover signal: instead of waiting for the obsolescence
+   * {@link sweep} to age the now-dead routes out over the broadcast interval
+   * (during which forwarding / connect-routing would keep choosing a route that
+   * can't carry traffic), the dead routes leave the table at once. A destination
+   * that loses all its routes is removed; it and the neighbour re-learn
+   * naturally from the next NODES broadcast if the neighbour returns. Idempotent
+   * - marking an unknown / already-removed key down is a no-op returning 0.
+   * Mirrors C# `NetRomRoutingTable.MarkNeighbourDown`.
    *
    * @returns the number of routes dropped (across all destinations).
    */
-  markNeighbourDown(neighbour: Callsign): number {
-    const viaKey = neighbour.toString();
+  markNeighbourDown(portId: string, neighbour: Callsign): number {
+    const viaKey = neighbourKey(portId, neighbour);
     let dropped = 0;
     const emptyDestinations: string[] = [];
 
@@ -716,24 +790,119 @@ export class NetRomRoutingTable {
   }
 
   /**
+   * Drop every route forwarded through `neighbour` on EVERY port, plus every
+   * neighbour entry for it. TODO: the INP3 engine is still callsign-keyed (its
+   * 180 s reflection-timeout teardown names a callsign, not a (port, callsign)
+   * key); this all-ports variant is its wiring until the INP3 engine rekey lands
+   * as a follow-up. The L4 dial-failure path uses the per-port
+   * {@link markNeighbourDown} instead. Idempotent.
+   *
+   * @returns the number of routes dropped (across all destinations and ports).
+   */
+  markNeighbourDownAllPorts(neighbour: Callsign): number {
+    const callText = neighbour.toString();
+    let dropped = 0;
+    for (const portId of this.portsForCallsign(callText)) {
+      dropped += this.markNeighbourDown(portId, neighbour);
+    }
+    return dropped;
+  }
+
+  /**
+   * Drop every neighbour row heard on `portId` and every route that forwards
+   * through that port, in one pass (the port-detach path): a port going away
+   * takes its whole per-port view with it at once, instead of waiting for
+   * obsolescence to age rows that can never refresh. A destination that loses
+   * its last route is removed. The same callsign's rows on other ports are
+   * untouched. Idempotent - an unknown port is a no-op returning 0.
+   *
+   * @returns the number of routes dropped (across all destinations).
+   */
+  markPortDown(portId: string): number {
+    let dropped = 0;
+    const emptyDestinations: string[] = [];
+
+    for (const [destKey, dest] of this.destinations) {
+      let hadInp3Before = false;
+      for (const route of dest.routes.values()) {
+        if (route.inp3 !== undefined) {
+          hadInp3Before = true;
+          break;
+        }
+      }
+
+      let removedInp3 = false;
+      for (const [viaKey, route] of [...dest.routes]) {
+        if (route.portId !== portId) {
+          continue;
+        }
+        if (route.inp3 !== undefined) {
+          removedInp3 = true;
+        }
+        dest.routes.delete(viaKey);
+        dropped++;
+      }
+      if (dest.routes.size === 0) {
+        emptyDestinations.push(destKey);
+      }
+
+      // Invariant (W), the same guard as sweep / markNeighbourDown: only a drop
+      // that actually removed an Inp3-bearing route can cost the destination its
+      // last time-route (the default-off guard, design §7.1).
+      if (removedInp3 && hadInp3Before && !this.hasAnyInp3Route(destKey)) {
+        this.recentlyWithdrawnSet.set(destKey, this.callsignByKey.get(destKey)!);
+      }
+    }
+
+    for (const dc of emptyDestinations) {
+      this.destinations.delete(dc);
+    }
+
+    for (const key of [...this.neighbours.keys()]) {
+      if (neighbourKeyPort(key) === portId) {
+        this.neighbours.delete(key);
+      }
+    }
+    this.pruneOrphanNeighbours();
+    return dropped;
+  }
+
+  // The distinct ports on which neighbour keys for `callText` exist (neighbour
+  // rows or kept routes), for the all-ports teardown path.
+  private portsForCallsign(callText: string): string[] {
+    const ports = new Set<string>();
+    for (const key of this.neighbours.keys()) {
+      if (neighbourKeyCallsign(key) === callText) {
+        ports.add(neighbourKeyPort(key));
+      }
+    }
+    for (const dest of this.destinations.values()) {
+      for (const key of dest.routes.keys()) {
+        if (neighbourKeyCallsign(key) === callText) {
+          ports.add(neighbourKeyPort(key));
+        }
+      }
+    }
+    return [...ports];
+  }
+
+  /**
    * Take an immutable snapshot of the current table — destinations with their
    * best-first routes, and the directly-heard neighbours. Ordering is stable
-   * (alias-or-callsign for destinations, callsign for neighbours) so the surfaced
-   * output is deterministic.
+   * (alias-or-callsign for destinations; callsign then canonical port order for
+   * neighbours; routes best-quality first with the port-order tie-break) so the
+   * surfaced output is deterministic.
    */
   snapshot(): NetRomRoutingSnapshot {
     const dests: NetRomDestination[] = [];
     for (const [destKey, dest] of this.destinations) {
       const destination = this.callsignByKey.get(destKey)!;
       const routes = [...dest.routes.values()]
-        .sort(
-          (a, b) =>
-            b.quality - a.quality ||
-            compareOrdinal(a.neighbour.toString(), b.neighbour.toString()),
-        )
+        .sort(this.routeOrder())
         .slice(0, this.options.maxRoutesPerDestination)
         .map((r) => ({
           neighbour: r.neighbour,
+          portId: r.portId,
           quality: r.quality,
           obsolescence: r.obsolescence,
           inp3: r.inp3,
@@ -755,15 +924,19 @@ export class NetRomRoutingTable {
         ) || compareOrdinal(a.destination.toString(), b.destination.toString()),
     );
 
-    const nbrs: NetRomNeighbour[] = [...this.neighbours.entries()]
-      .map(([key, n]) => ({
-        neighbour: this.callsignByKey.get(key)!,
+    const nbrs: NetRomNeighbour[] = [...this.neighbours.values()]
+      .map((n) => ({
+        neighbour: n.neighbour,
         alias: n.alias,
         portId: n.portId,
         pathQuality: n.pathQuality,
         lastHeard: n.lastHeard,
       }))
-      .sort((a, b) => compareOrdinal(a.neighbour.toString(), b.neighbour.toString()));
+      .sort(
+        (a, b) =>
+          compareOrdinal(a.neighbour.toString(), b.neighbour.toString()) ||
+          this.comparePorts(a.portId, b.portId),
+      );
 
     return { destinations: dests, neighbours: nbrs, generatedAt: this.now() };
   }
@@ -797,15 +970,13 @@ export class NetRomRoutingTable {
     const entries: NodesBroadcastEntry[] = [];
     for (const [destKey, dest] of this.destinations) {
       const destination = this.callsignByKey.get(destKey)!;
-      // The best route: highest quality, then highest obsolescence (freshest).
+      // The best route: highest quality, then highest obsolescence (freshest),
+      // then canonical port order, then neighbour callsign - the last two make
+      // the pick deterministic now that one callsign can hold several per-port
+      // routes at the same quality.
       let best: RouteState | null = null;
       for (const route of dest.routes.values()) {
-        if (
-          best === null ||
-          route.quality > best.quality ||
-          (route.quality === best.quality &&
-            route.obsolescence > best.obsolescence)
-        ) {
+        if (best === null || this.advertPrecedence(route, best) > 0) {
           best = route;
         }
       }
@@ -818,6 +989,9 @@ export class NetRomRoutingTable {
       if (best.obsolescence < obsoleteMinimum) {
         continue; // OBSMIN: decayed below the advertise threshold
       }
+      // The wire keeps exactly one entry per destination carrying the best
+      // route's neighbour CALLSIGN and quality - there is no port field on the
+      // NODES wire, so the port stays a local-table concern.
       entries.push({
         destination,
         destinationAlias: dest.alias,
@@ -1049,19 +1223,20 @@ export class NetRomRoutingTable {
 
   // ─── Internals ────────────────────────────────────────────────────
 
-  // Add or refresh a route to `destination` via `viaNeighbour`. Applies the
-  // quality-0 / MINQUAL floor (heuristic 8), resets obsolescence to OBSINIT,
-  // enforces the per-destination route cap (heuristic 7) and the destination cap
-  // (heuristic 9).
+  // Add or refresh a route to `destination` via `viaNeighbour` on `portId`.
+  // Applies the quality-0 / MINQUAL floor (heuristic 8), resets obsolescence to
+  // OBSINIT, enforces the per-destination route cap (heuristic 7) and the
+  // destination cap (heuristic 9).
   private upsertRoute(
     destination: Callsign,
     alias: string,
+    portId: string,
     viaNeighbour: Callsign,
     quality: number,
     minQuality: number,
   ): void {
     const destKey = destination.toString();
-    const viaKey = viaNeighbour.toString();
+    const viaKey = neighbourKey(portId, viaNeighbour);
 
     // A quality-0 route is never usable / kept; likewise anything under the
     // effective floor (the caller-supplied per-port MINQUAL when this ingest
@@ -1095,14 +1270,14 @@ export class NetRomRoutingTable {
       return;
     }
 
-    // Preserve any INP3 metric already learned for this (dest via neighbour)
-    // route — a NODES quality refresh must not wipe a coexisting time-route (the
-    // two metric spaces are independent; see ingestRif). Mirrors the C#
+    // Preserve any INP3 metric already learned for this (dest via neighbour on
+    // port) route - a NODES quality refresh must not wipe a coexisting time-route
+    // (the two metric spaces are independent; see ingestRif). Mirrors the C#
     // `existing?.Inp3` carry-over in `UpsertRoute`.
     const existing = dest.routes.get(viaKey);
-    this.callsignByKey.set(viaKey, viaNeighbour);
     dest.routes.set(viaKey, {
       neighbour: viaNeighbour,
+      portId,
       quality,
       obsolescence: this.options.obsoleteInitial,
       inp3: existing?.inp3,
@@ -1112,48 +1287,47 @@ export class NetRomRoutingTable {
   }
 
   // Heuristic 7 (and its INP3 analogue): keep only the N best routes per
-  // destination. When the cap is exceeded, evict by the SAME key the quality
-  // selection orders by — highest-quality-first, ties by neighbour callsign — so
-  // a node that never prefers INP3 routes evicts byte-identically to the
-  // quality-only world; an INP3-only route (quality 0) sorts as a quality-0 route
-  // for eviction ordering only (design AMBIGUITY-I3-2). The kept route objects are
-  // carried verbatim, so a surviving route's INP3 metric is preserved across
-  // eviction. Mirrors the C# `EnforceRouteCap`.
+  // destination. When the cap is exceeded, evict by the SAME order the quality
+  // selection uses - highest-quality-first, ties by canonical port order then
+  // neighbour callsign - so a node that never prefers INP3 routes evicts
+  // byte-identically to the quality-only world; an INP3-only route (quality 0)
+  // sorts as a quality-0 route for eviction ordering only (design
+  // AMBIGUITY-I3-2). The kept route objects are carried verbatim, so a surviving
+  // route's INP3 metric is preserved across eviction. Mirrors the C#
+  // `EnforceRouteCap`.
   private enforceRouteCap(dest: DestinationState): void {
     if (dest.routes.size <= this.options.maxRoutesPerDestination) {
       return;
     }
     const keep = [...dest.routes.values()]
-      .sort(
-        (a, b) =>
-          b.quality - a.quality ||
-          compareOrdinal(a.neighbour.toString(), b.neighbour.toString()),
-      )
+      .sort(this.routeOrder())
       .slice(0, this.options.maxRoutesPerDestination);
     const kept = new Map<string, RouteState>();
     for (const r of keep) {
-      kept.set(r.neighbour.toString(), r);
+      kept.set(neighbourKey(r.portId, r.neighbour), r);
     }
     dest.routes = kept;
   }
 
   // Attach (or refresh) an INP3 time-route metric on the (destination via
-  // viaNeighbour) route — the time-space analogue of upsertRoute. If the route
-  // already exists (as a quality route, or a prior time-route) the metric is set in
-  // place, preserving its quality + obsolescence; if it does not exist the route is
-  // created as a pure time-route (quality 0, obsolescence OBSINIT). The per-dest cap
-  // is then enforced by the same quality-first eviction key as the quality path
-  // (AMBIGUITY-I3-2). Honours the destination cap exactly as upsertRoute does.
-  // (Floor/horizon/hop/loop gating is done by ingestRif before here, so this only
-  // ever stores a live, finite, in-horizon metric.) Mirrors the C# `UpsertInp3Route`.
+  // viaNeighbour on portId) route - the time-space analogue of upsertRoute. If
+  // the route already exists (as a quality route, or a prior time-route) the
+  // metric is set in place, preserving its quality + obsolescence; if it does not
+  // exist the route is created as a pure time-route (quality 0, obsolescence
+  // OBSINIT). The per-dest cap is then enforced by the same quality-first
+  // eviction order as the quality path (AMBIGUITY-I3-2). Honours the destination
+  // cap exactly as upsertRoute does. (Floor/horizon/hop/loop gating is done by
+  // ingestRif before here, so this only ever stores a live, finite, in-horizon
+  // metric.) Mirrors the C# `UpsertInp3Route`.
   private upsertInp3Route(
     destination: Callsign,
     alias: string,
+    portId: string,
     viaNeighbour: Callsign,
     metric: Inp3RouteMetric,
   ): void {
     const destKey = destination.toString();
-    const viaKey = viaNeighbour.toString();
+    const viaKey = neighbourKey(portId, viaNeighbour);
 
     let dest = this.destinations.get(destKey);
     if (!dest) {
@@ -1167,7 +1341,6 @@ export class NetRomRoutingTable {
       dest.alias = alias;
     }
 
-    this.callsignByKey.set(viaKey, viaNeighbour);
     const existing = dest.routes.get(viaKey);
     if (existing) {
       // Refresh the time-route in place: keep the route's quality (its other metric
@@ -1184,6 +1357,7 @@ export class NetRomRoutingTable {
       // the quality path / never advertised, exactly as intended.
       dest.routes.set(viaKey, {
         neighbour: viaNeighbour,
+        portId,
         quality: NETROM_QUALITY_MIN,
         obsolescence: this.options.obsoleteInitial,
         inp3: metric,
@@ -1193,14 +1367,19 @@ export class NetRomRoutingTable {
     this.enforceRouteCap(dest);
   }
 
-  // Withdraw the INP3 metric of the (destination via viaNeighbour) route (a horizon
-  // withdrawal). Clears inp3 only — a coexisting quality route stays. A route left
-  // with neither a usable quality (≤ MINQUAL / 0) nor an INP3 metric is removed; a
-  // destination left with no route is removed. A no-op if the route / destination is
-  // unknown or the route had no INP3 metric. Mirrors the C# `WithdrawInp3`.
-  private withdrawInp3(destination: Callsign, viaNeighbour: Callsign): void {
+  // Withdraw the INP3 metric of the (destination via viaNeighbour on portId)
+  // route (a horizon withdrawal). Clears inp3 only - a coexisting quality route
+  // stays. A route left with neither a usable quality (≤ MINQUAL / 0) nor an INP3
+  // metric is removed; a destination left with no route is removed. A no-op if
+  // the route / destination is unknown or the route had no INP3 metric. Mirrors
+  // the C# `WithdrawInp3`.
+  private withdrawInp3(
+    destination: Callsign,
+    portId: string,
+    viaNeighbour: Callsign,
+  ): void {
     const destKey = destination.toString();
-    const viaKey = viaNeighbour.toString();
+    const viaKey = neighbourKey(portId, viaNeighbour);
 
     const dest = this.destinations.get(destKey);
     if (!dest) {
@@ -1249,6 +1428,45 @@ export class NetRomRoutingTable {
       }
     }
     return false;
+  }
+
+  // The canonical route order: best quality first; ties broken by canonical port
+  // order, then neighbour callsign (ordinal). Deterministic for any port set.
+  private routeOrder(): (a: RouteState, b: RouteState) => number {
+    return (a, b) =>
+      b.quality - a.quality ||
+      this.comparePorts(a.portId, b.portId) ||
+      compareOrdinal(a.neighbour.toString(), b.neighbour.toString());
+  }
+
+  // Canonical port order: the host's injected portRank when supplied, else a
+  // stable string-ordinal comparison of the port ids. Never a hardcoded order.
+  private comparePorts(a: string, b: string): number {
+    const rank = this.portRank;
+    if (rank !== undefined) {
+      return rank(a) - rank(b);
+    }
+    return compareOrdinal(a, b);
+  }
+
+  // Positive when `candidate` outranks `incumbent` as a destination's advertised
+  // best route: highest quality, then highest obsolescence (the existing
+  // freshness tie-break), then canonical port order, then neighbour callsign.
+  private advertPrecedence(candidate: RouteState, incumbent: RouteState): number {
+    if (candidate.quality !== incumbent.quality) {
+      return candidate.quality - incumbent.quality;
+    }
+    if (candidate.obsolescence !== incumbent.obsolescence) {
+      return candidate.obsolescence - incumbent.obsolescence;
+    }
+    const byPort = this.comparePorts(candidate.portId, incumbent.portId);
+    if (byPort !== 0) {
+      return -byPort; // lower port rank outranks
+    }
+    return -compareOrdinal(
+      candidate.neighbour.toString(),
+      incumbent.neighbour.toString(),
+    );
   }
 
   // Drop neighbours that are no longer the next hop for any kept route. (A

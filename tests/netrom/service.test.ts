@@ -162,7 +162,7 @@ describe("NetRomService — lifecycle + disabled", () => {
     await listener.dispose();
   });
 
-  it("detachPort unsubscribes the tap; learned routes survive", async () => {
+  it("detachPort unsubscribes the tap and drops the port's rows (the port-down path)", async () => {
     const transport = new LoopbackTransport();
     const listener = new Ax25Listener(transport, { myCall: NodeCall });
     const netRom = new NetRomService();
@@ -171,16 +171,19 @@ describe("NetRomService — lifecycle + disabled", () => {
 
     broadcastNodes(transport);
     await waitFor(() => netRom.snapshot().neighbours.length > 0, 2000);
-    const before = netRom.snapshot().neighbours.length;
 
     netRom.detachPort("p1");
     expect(netRom.attachedPorts).toHaveLength(0);
 
-    // Further broadcasts are not heard (tap unsubscribed), but the already-learned
-    // table is untouched.
+    // Detach is the markPortDown path: the detached port's neighbour rows and
+    // routes leave the table at once (nothing on it can refresh them again).
+    expect(netRom.snapshot().neighbours).toHaveLength(0);
+    expect(netRom.snapshot().destinations).toHaveLength(0);
+
+    // And further broadcasts are not heard (tap unsubscribed).
     broadcastNodes(transport);
     await new Promise((r) => setTimeout(r, 50));
-    expect(netRom.snapshot().neighbours.length).toBe(before);
+    expect(netRom.snapshot().neighbours).toHaveLength(0);
 
     await listener.dispose();
   });

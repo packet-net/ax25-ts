@@ -112,6 +112,11 @@ export class NetRomService {
       ...NETROM_ROUTING_DEFAULTS,
       ...options.routing,
     };
+    // TODO: the routing table accepts an optional portRank comparator (the host's
+    // canonical port order, the route tie-break) as a constructor parameter, but
+    // threading it here would add a new named field to NetRomServiceOptions, which
+    // this per-port neighbour rekey deliberately avoids. The service's table runs
+    // the default string-ordinal port order until that option is introduced.
     this.table = new NetRomRoutingTable(routing, options.now ?? Date.now);
   }
 
@@ -169,8 +174,11 @@ export class NetRomService {
 
   /**
    * Stop hearing NODES broadcasts on a port and unsubscribe its tap. No-op if the
-   * port was not attached. Learned routes survive — a torn-down port doesn't wipe
-   * the table; obsolescence ages its neighbours out naturally.
+   * port was not attached. Detaching is the table's port-down path: the port's
+   * neighbour rows and every route that forwards through it are dropped in one
+   * pass ({@link NetRomRoutingTable.markPortDown}), since nothing on a detached
+   * port can ever refresh or carry traffic again. The same callsign's rows on
+   * other ports survive.
    */
   detachPort(portId: string): void {
     const attachment = this.attachments.get(portId);
@@ -179,6 +187,7 @@ export class NetRomService {
     }
     this.attachments.delete(portId);
     attachment.listener.offFrameTraced(attachment.handler);
+    this.table.markPortDown(portId);
   }
 
   /**

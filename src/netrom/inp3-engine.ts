@@ -11,13 +11,14 @@ import type { NetRomPacket } from "./packet.js";
 /**
  * Carries an INP3 link-down signal to an {@link Inp3Engine.onNeighbourDown}
  * handler: a previously-INP3-capable neighbour went silent past the reset window.
- * The handler wires it to `NetRomRoutingTable.markNeighbourDown(neighbour)` + a
- * DISC / re-establish of the interlink.
+ * The handler wires it to `NetRomRoutingTable.markNeighbourDownAllPorts(neighbour)`
+ * + a DISC / re-establish of the interlink (the engine is callsign-keyed; per-port
+ * keying is its documented follow-up).
  *
  * Mirrors `Packet.NetRom.Transport.Inp3NeighbourDownEventArgs` on the C# side.
  */
 export interface Inp3NeighbourDownEvent {
-  /** The neighbour to `markNeighbourDown`. */
+  /** The neighbour to mark down (on every port). */
   readonly neighbour: Callsign;
   /** How long since its last reflection (≥ the reset window), in ms. */
   readonly silentForMs: number;
@@ -61,7 +62,7 @@ export interface Inp3NeighbourTiming {
  * {@link Inp3L3RttFrame} / {@link NetRomPacket} in and out. The host supplies a
  * {@link sendL3Rtt} sink (wrap the frame in a PID-0xCF I-frame on the neighbour's
  * interlink session) and subscribes {@link onNeighbourDown} (wired to
- * `NetRomRoutingTable.markNeighbourDown` + a DISC / re-establish).
+ * `NetRomRoutingTable.markNeighbourDownAllPorts` + a DISC / re-establish).
  *
  * **Monotonic clock.** The engine is RTT-centric, so it measures every interval
  * as elapsed milliseconds since construction — `now() - startMs` — never a raw
