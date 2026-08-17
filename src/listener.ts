@@ -970,7 +970,25 @@ export class Ax25Listener {
       const isReconnectSabm =
         wasDisconnected &&
         (event.name === "SABM_received" || event.name === "SABME_received");
-      cached.session.postEvent(event);
+
+      // A CACHED session sitting in Disconnected is the same figc4.1 situation as
+      // a peer we have never seen: the figure's per-frame-type inputs cover DISC /
+      // UI / UA / SABM(E), and everything else falls to the t05 / t06 catch-alls.
+      // The classifier's specific events (RR_received, I_frame_received, ...) have
+      // no transition in Disconnected, so posting them raw made the session
+      // silently swallow the frame: no DM. That is observable on the air. A peer
+      // whose link we have already torn down (its DISC / our UA lost, or we
+      // restarted) polls us with RR(P) and gets silence, so it burns its whole
+      // retry budget (LinBPQ: RETRIES x FRACK = 30 s of pointless polling) instead
+      // of clearing the link on the first DM. Sessions survive disconnect in this
+      // cache, so this was the COMMON case, while a peer we had evicted got the
+      // correct DM. Reclassify exactly as the no-cached-session path does, so a
+      // peer's experience does not depend on whether it happens to still be in our
+      // LRU. Mirrors the C# TryRouteToCachedSession (m0lte/packet.net#735).
+      const toPost = wasDisconnected
+        ? reclassifyForDisconnectedCatchAll(event, parsed)
+        : event;
+      cached.session.postEvent(toPost);
       const stateAfter: string = cached.session.state;
       if (isReconnectSabm && stateAfter === "Connected") {
         this.raiseSessionAccepted(cached.session);
@@ -1297,11 +1315,21 @@ function reparseAtSessionModulo(
 /**
  * Map an inbound classified event to the event the Disconnected SDL knows
  * how to handle. Specific events handled in Disconnected (DISC/UI/UA/SABM/SABME)
- * pass through unchanged; everything else (RR/RNR/REJ/SREJ/I/FRMR/XID, plus
- * the spec-violation error events) becomes `all_other_commands` so the SDL's t05
- * catch-all emits DM. See figc4.1 — the catch-all is named "all other commands"
- * precisely for this case. Mirrors the C# `ReclassifyForDisconnectedCatchAll`
- * helper, which switches on the classified event type (#143 carry-over).
+ * pass through unchanged; everything else (RR/RNR/REJ/SREJ/I/FRMR/XID, plus the
+ * spec-violation error events) falls to a figc4.1 catch-all, which one depending
+ * on the command/response bit:
+ *
+ *   • a *command* becomes `all_other_commands`, so t05 answers DM (F := P), the
+ *     polite "I don't have this link" that lets the peer clear it immediately;
+ *   • a *response* becomes `all_other_primitives__from_lower_layer`, so t06
+ *     discards it. The figure has no DM-emitting input for a response, and
+ *     answering one would be worse than noise: a DM is itself a response, so two
+ *     disconnected stations that both answered would trade DMs forever.
+ *
+ * (TEST is connectionless and never routed into a session, see the intercept in
+ * {@link Ax25Listener.dispatchInbound}.) Mirrors the C#
+ * `ReclassifyForDisconnectedCatchAll` helper, which switches on the classified
+ * event type (#143 carry-over; the command/response split is packet.net#735).
  */
 function reclassifyForDisconnectedCatchAll(
   event: Ax25Event,
@@ -1315,6 +1343,8 @@ function reclassifyForDisconnectedCatchAll(
     case "UA_received":
       return event;
     default:
-      return { name: "all_other_commands", frame };
+      return frameIsCommand(frame)
+        ? { name: "all_other_commands", frame }
+        : { name: "all_other_primitives__from_lower_layer", frame };
   }
 }
