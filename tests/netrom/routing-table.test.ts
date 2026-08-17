@@ -96,6 +96,33 @@ describe("NetRomRoutingTable — ingest heuristics", () => {
     ).toBe(false);
   });
 
+  it("an advertisement of us via a third node is not learned or re-advertised", () => {
+    const { table } = newTable();
+    // RDG advertises US (M0LTE) as a destination reachable via XYZ, a third
+    // node, so the best-neighbour loop guard (which only catches "via us") does
+    // not fire. We must still never learn a route to ourselves, or our own
+    // callsign ends up in our own NODES broadcast (LinBPQ L3Code.c:456 skips
+    // destination == MYCALL).
+    table.ingest(NbrA, Me, "vhf", broadcast("RDGBPQ", [
+      { dest: Me, destAlias: "MYNODE", neighbour: NbrB, quality: 200 },
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrB, quality: 200 },
+    ]));
+
+    // a route to ourselves is never learned
+    expect(
+      table.snapshot().destinations.some((d) => d.destination.equals(Me)),
+    ).toBe(false);
+    // and so never re-advertised
+    expect(
+      table.buildAdvertisement(0).some((e) => e.destination.equals(Me)),
+    ).toBe(false);
+
+    // The rest of the broadcast is unaffected.
+    expect(
+      table.buildAdvertisement(0).some((e) => e.destination.equals(DestSot)),
+    ).toBe(true);
+  });
+
   it("keeps only the three best routes per destination", () => {
     const { table } = newTable();
     // Four distinct originators each advertise SOT at different qualities → four
@@ -231,6 +258,186 @@ describe("NetRomRoutingTable — MINQUAL floor", () => {
 
     table.ingest(NbrA, Me, "vhf", broadcast("RDG", [{ dest: DestSot, destAlias: "SOT", neighbour: NbrB, quality: 80 }])); // derived 60 — below floor
     expect(table.snapshot().destinations.some((d) => d.destination.equals(DestSot))).toBe(false);
+  });
+});
+
+describe("NetRomRoutingTable - per-port QUALITY (neighbourQuality)", () => {
+  it("a per-port quality overrides the default for a neighbour on that port", () => {
+    const { table } = newTable();
+    // This port advertises quality 191 (e.g. a slightly worse-grade link).
+    table.ingest(NbrA, Me, "hf", broadcast("RDGBPQ"), 191);
+
+    const snap = table.snapshot();
+    expect(snap.neighbours).toHaveLength(1);
+    expect(snap.neighbours[0]!.pathQuality).toBe(191);
+    const direct = snap.destinations.find((d) => d.destination.equals(NbrA))!;
+    expect(direct.bestRoute!.quality).toBe(191);
+  });
+
+  it("an omitted per-port quality falls back to the table default", () => {
+    const { table } = newTable();
+    table.ingest(NbrA, Me, "vhf", broadcast("RDGBPQ"));
+
+    expect(table.snapshot().neighbours[0]!.pathQuality).toBe(192); // the canonical default
+  });
+
+  it("a mixed-grade node advertises the correct quality per port", () => {
+    // A GB7RDG-style mixed-grade node: 191 on one port, 192 on another. Two
+    // neighbours heard on two different-grade ports learn their port's quality
+    // independently, and a destination learned via each is combined against that
+    // port's basis.
+    const { table } = newTable();
+    table.ingest(NbrA, Me, "port-191", broadcast("RDG", [
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrB, quality: 200 },
+    ]), 191);
+    table.ingest(NbrB, Me, "port-192", broadcast("XYZ", [
+      { dest: DestMnc, destAlias: "MNC", neighbour: NbrA, quality: 200 },
+    ]), 192);
+
+    const snap = table.snapshot();
+    expect(snap.neighbours.find((n) => n.neighbour.equals(NbrA))!.pathQuality).toBe(191);
+    expect(snap.neighbours.find((n) => n.neighbour.equals(NbrB))!.pathQuality).toBe(192);
+    expect(
+      snap.destinations.find((d) => d.destination.equals(DestSot))!.bestRoute!.quality,
+    ).toBe(combineQuality(200, 191));
+    expect(
+      snap.destinations.find((d) => d.destination.equals(DestMnc))!.bestRoute!.quality,
+    ).toBe(combineQuality(200, 192));
+  });
+
+  it("a per-port quality change is reflected on the next broadcast", () => {
+    // A QUALITY edit (hot-reload) takes effect on the next NODES ingest: the
+    // cached neighbour path quality is refreshed, not pinned to first-heard.
+    const { table } = newTable();
+    table.ingest(NbrA, Me, "hf", broadcast("RDGBPQ"), 191);
+    expect(table.snapshot().neighbours[0]!.pathQuality).toBe(191);
+
+    table.ingest(NbrA, Me, "hf", broadcast("RDGBPQ"), 200);
+    expect(table.snapshot().neighbours[0]!.pathQuality).toBe(200);
+  });
+
+  it("a per-port quality of 255 yields higher direct + derived qualities than the default", () => {
+    const entries: NodesEntrySpec[] = [
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrB, quality: 200 },
+    ];
+
+    const dflt = newTable();
+    dflt.table.ingest(NbrA, Me, "vhf", broadcast("RDG", entries));
+    const best = newTable();
+    best.table.ingest(NbrA, Me, "vhf", broadcast("RDG", entries), 255);
+
+    const directDefault = dflt.table
+      .snapshot()
+      .destinations.find((d) => d.destination.equals(NbrA))!.bestRoute!.quality;
+    const directBest = best.table
+      .snapshot()
+      .destinations.find((d) => d.destination.equals(NbrA))!.bestRoute!.quality;
+    expect(directDefault).toBe(192);
+    expect(directBest).toBe(255);
+
+    const derivedDefault = dflt.table
+      .snapshot()
+      .destinations.find((d) => d.destination.equals(DestSot))!.bestRoute!.quality;
+    const derivedBest = best.table
+      .snapshot()
+      .destinations.find((d) => d.destination.equals(DestSot))!.bestRoute!.quality;
+    expect(derivedDefault).toBe(combineQuality(200, 192));
+    expect(derivedBest).toBe(combineQuality(200, 255));
+    expect(derivedBest).toBeGreaterThan(derivedDefault);
+  });
+});
+
+describe("NetRomRoutingTable - per-port MINQUAL (minQuality)", () => {
+  it("a per-port MINQUAL drops a route the table default would keep", () => {
+    // RDG advertises SOT via XYZ at quality 80 -> derived (80*192+128)/256 = 60.
+    const entries: NodesEntrySpec[] = [
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrB, quality: 80 },
+    ];
+
+    // Table-wide floor is the default 0; with no per-port override it is kept.
+    const dflt = newTable();
+    dflt.table.ingest(NbrA, Me, "vhf", broadcast("RDG", entries));
+    expect(
+      dflt.table.snapshot().destinations.some((d) => d.destination.equals(DestSot)),
+    ).toBe(true);
+
+    // The SAME table default, but a per-port MINQUAL of 200 on this ingest: the
+    // derived 60 is below the per-port floor, so the route is NOT kept.
+    const perPort = newTable();
+    perPort.table.ingest(NbrA, Me, "rf", broadcast("RDG", entries), undefined, 200);
+    expect(
+      perPort.table.snapshot().destinations.some((d) => d.destination.equals(DestSot)),
+    ).toBe(false);
+  });
+
+  it("an omitted per-port MINQUAL falls back to the table floor", () => {
+    // Table-wide MINQUAL 128, per-port unset means the table floor applies, so the
+    // derived-60 route is dropped exactly as the table-wide case would.
+    const { table } = newTable({ ...NETROM_ROUTING_DEFAULTS, minQuality: 128 });
+    table.ingest(NbrA, Me, "vhf", broadcast("RDG", [
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrB, quality: 80 },
+    ]));
+    expect(
+      table.snapshot().destinations.some((d) => d.destination.equals(DestSot)),
+    ).toBe(false);
+  });
+
+  it("a per-port MINQUAL overrides a higher table floor to keep a route", () => {
+    // Table-wide MINQUAL 128 would drop a derived-60 route, but this port relaxes
+    // the floor to 0, so the route IS kept on that port (per-port wins both ways).
+    const { table } = newTable({ ...NETROM_ROUTING_DEFAULTS, minQuality: 128 });
+    table.ingest(NbrA, Me, "open", broadcast("RDG", [
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrB, quality: 80 },
+    ]), undefined, 0);
+    expect(
+      table.snapshot().destinations.some((d) => d.destination.equals(DestSot)),
+    ).toBe(true);
+  });
+
+  it("a re-advertisement below the per-port floor removes an existing route", () => {
+    const { table } = newTable();
+    // First a strong advert (derived 187) is kept under the per-port floor of 100.
+    table.ingest(NbrA, Me, "rf", broadcast("RDG", [
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrB, quality: 250 },
+    ]), undefined, 100);
+    expect(
+      table.snapshot().destinations.some((d) => d.destination.equals(DestSot)),
+    ).toBe(true);
+
+    // A weaker re-advert (derived 60) on the same port now falls below the
+    // per-port floor, so the existing route is removed.
+    table.ingest(NbrA, Me, "rf", broadcast("RDG", [
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrB, quality: 80 },
+    ]), undefined, 100);
+    expect(
+      table.snapshot().destinations.some((d) => d.destination.equals(DestSot)),
+    ).toBe(false);
+  });
+
+  it("omitting both per-port parameters keeps today's behaviour", () => {
+    // The regression guard for the optional-parameter mirror: a 4-argument ingest
+    // is byte-for-byte what it always was.
+    const entries: NodesEntrySpec[] = [
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrB, quality: 200 },
+    ];
+    const bare = newTable();
+    bare.table.ingest(NbrA, Me, "vhf", broadcast("RDG", entries));
+    const explicitDefaults = newTable();
+    explicitDefaults.table.ingest(
+      NbrA,
+      Me,
+      "vhf",
+      broadcast("RDG", entries),
+      NETROM_ROUTING_DEFAULTS.defaultNeighbourQuality,
+      NETROM_ROUTING_DEFAULTS.minQuality,
+    );
+
+    expect(bare.table.snapshot()).toEqual(explicitDefaults.table.snapshot());
+    expect(bare.table.snapshot().neighbours[0]!.pathQuality).toBe(192);
+    expect(
+      bare.table.snapshot().destinations.find((d) => d.destination.equals(DestSot))!
+        .bestRoute!.quality,
+    ).toBe(combineQuality(200, 192));
   });
 });
 

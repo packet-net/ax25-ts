@@ -825,7 +825,13 @@ export class Ax25Listener {
       // Mirrors the C# listener's inbound pump (packet.net#366).
       frame = decodeFrame(bytes, false, this.options.parseOptions);
     } catch {
-      return; // malformed / options-rejected wire bytes — drop quietly
+      // Second chance at mod-128, but ONLY for an address pair that already has
+      // a live extended session (see tryParseAtExtendedModuloForLiveSession).
+      const extended = this.tryParseAtExtendedModuloForLiveSession(bytes);
+      if (extended === null) {
+        return; // malformed / options-rejected wire bytes: drop quietly
+      }
+      frame = extended;
     }
     // Trace + dispatch are isolated per-step so a throwing handler can't
     // tear the pump down. A buggy consumer must not be able to DoS the
@@ -842,9 +848,63 @@ export class Ax25Listener {
     }
   }
 
+  /**
+   * Second-chance routing parse at mod-128 for a frame the mod-8 routing parse
+   * rejected, accepted only when the peer already has a live *extended* session.
+   *
+   * The pump has to parse before it can route (the addresses precede the control
+   * field), and it cannot know the session modulo until it has routed, so it
+   * parses at mod-8. That reads an extended I frame acceptably (its second
+   * control octet lands on the PID), but an extended supervisory frame's second
+   * control octet looks like an information field on an S frame, which section
+   * 3.5 does not permit: `decodeFrame` rejects it whenever
+   * {@link Ax25ParseOptions.allowInfoOnSupervisoryFrames} is off. Under the
+   * strict preset (and xrouter, which is strict) that dropped every RR / RNR /
+   * REJ / SREJ on a mod-128 link before trace and dispatch, so a SABME link came
+   * up (U frames are one octet in both modes) and then was never acked
+   * (m0lte/packet.net#696).
+   *
+   * This is not a widening of the listener's options: the retry is honoured only
+   * for a peer whose cached session has already negotiated
+   * {@link Ax25SessionContext.isExtended}, i.e. exactly the frames whose second
+   * control octet is genuinely a control octet. A mod-8 link's frames are
+   * unaffected (they parse at mod-8 or not at all), and a strict listener stays
+   * deaf to a malformed S frame from any peer it has no extended link with.
+   * Mirrors the C# `Ax25Listener.TryParseAtExtendedModuloForLiveSession`.
+   */
+  private tryParseAtExtendedModuloForLiveSession(
+    bytes: Uint8Array,
+  ): Ax25Frame | null {
+    let extended: Ax25Frame;
+    try {
+      extended = decodeFrame(bytes, true, this.options.parseOptions);
+    } catch {
+      return null;
+    }
+    const cached = this.sessions.get(extended.source.callsign.toString());
+    if (!cached || !cached.session.context.isExtended) {
+      return null;
+    }
+    return extended;
+  }
+
   private dispatchInbound(routed: Ax25Frame, bytes: Uint8Array): void {
     // Frames not addressed to us: monitor-only (trace already fired).
     if (!routed.destination.callsign.equals(this.myCall)) {
+      return;
+    }
+
+    // Sections 3.12.4 / 4.2.2: the has-been-repeated (H) bit on a repeater slot
+    // says the frame has already passed through that digipeater. A frame whose
+    // LAST repeater slot still has H=0 is in transit TO a digipeater, not at its
+    // destination: we are only overhearing it. Acting on it answers a frame that
+    // has not been delivered yet, and the digi's repeat (H=1) is then processed a
+    // second time, so one SABM drew two UAs (m0lte/packet.net#696). Monitor-only
+    // here: the trace has already fired in the pump, so a promiscuous consumer
+    // still sees it, exactly like LinBPQ / direwolf, which discard a
+    // not-fully-repeated frame at this point. Mirrors the C# DispatchInbound.
+    const lastDigi = routed.digipeaters[routed.digipeaters.length - 1];
+    if (lastDigi !== undefined && !lastDigi.crhBit) {
       return;
     }
 
@@ -924,7 +984,25 @@ export class Ax25Listener {
       const isReconnectSabm =
         wasDisconnected &&
         (event.name === "SABM_received" || event.name === "SABME_received");
-      cached.session.postEvent(event);
+
+      // A CACHED session sitting in Disconnected is the same figc4.1 situation as
+      // a peer we have never seen: the figure's per-frame-type inputs cover DISC /
+      // UI / UA / SABM(E), and everything else falls to the t05 / t06 catch-alls.
+      // The classifier's specific events (RR_received, I_frame_received, ...) have
+      // no transition in Disconnected, so posting them raw made the session
+      // silently swallow the frame: no DM. That is observable on the air. A peer
+      // whose link we have already torn down (its DISC / our UA lost, or we
+      // restarted) polls us with RR(P) and gets silence, so it burns its whole
+      // retry budget (LinBPQ: RETRIES x FRACK = 30 s of pointless polling) instead
+      // of clearing the link on the first DM. Sessions survive disconnect in this
+      // cache, so this was the COMMON case, while a peer we had evicted got the
+      // correct DM. Reclassify exactly as the no-cached-session path does, so a
+      // peer's experience does not depend on whether it happens to still be in our
+      // LRU. Mirrors the C# TryRouteToCachedSession (m0lte/packet.net#735).
+      const toPost = wasDisconnected
+        ? reclassifyForDisconnectedCatchAll(event, parsed)
+        : event;
+      cached.session.postEvent(toPost);
       const stateAfter: string = cached.session.state;
       if (isReconnectSabm && stateAfter === "Connected") {
         this.raiseSessionAccepted(cached.session);
@@ -1251,11 +1329,21 @@ function reparseAtSessionModulo(
 /**
  * Map an inbound classified event to the event the Disconnected SDL knows
  * how to handle. Specific events handled in Disconnected (DISC/UI/UA/SABM/SABME)
- * pass through unchanged; everything else (RR/RNR/REJ/SREJ/I/FRMR/XID, plus
- * the spec-violation error events) becomes `all_other_commands` so the SDL's t05
- * catch-all emits DM. See figc4.1 — the catch-all is named "all other commands"
- * precisely for this case. Mirrors the C# `ReclassifyForDisconnectedCatchAll`
- * helper, which switches on the classified event type (#143 carry-over).
+ * pass through unchanged; everything else (RR/RNR/REJ/SREJ/I/FRMR/XID, plus the
+ * spec-violation error events) falls to a figc4.1 catch-all, which one depending
+ * on the command/response bit:
+ *
+ *   • a *command* becomes `all_other_commands`, so t05 answers DM (F := P), the
+ *     polite "I don't have this link" that lets the peer clear it immediately;
+ *   • a *response* becomes `all_other_primitives__from_lower_layer`, so t06
+ *     discards it. The figure has no DM-emitting input for a response, and
+ *     answering one would be worse than noise: a DM is itself a response, so two
+ *     disconnected stations that both answered would trade DMs forever.
+ *
+ * (TEST is connectionless and never routed into a session, see the intercept in
+ * {@link Ax25Listener.dispatchInbound}.) Mirrors the C#
+ * `ReclassifyForDisconnectedCatchAll` helper, which switches on the classified
+ * event type (#143 carry-over; the command/response split is packet.net#735).
  */
 function reclassifyForDisconnectedCatchAll(
   event: Ax25Event,
@@ -1269,6 +1357,8 @@ function reclassifyForDisconnectedCatchAll(
     case "UA_received":
       return event;
     default:
-      return { name: "all_other_commands", frame };
+      return frameIsCommand(frame)
+        ? { name: "all_other_commands", frame }
+        : { name: "all_other_primitives__from_lower_layer", frame };
   }
 }

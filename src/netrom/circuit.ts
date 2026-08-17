@@ -1,4 +1,8 @@
 import { Callsign } from "../callsign.js";
+import {
+  buildConnectAckInfo,
+  tryReadAcceptedWindow,
+} from "./connect-ack-info.js";
 import { buildConnectRequestInfo } from "./connect-request-info.js";
 import {
   NetRomCircuitCloseReason,
@@ -300,7 +304,7 @@ export class NetRomCircuit {
         this.onConnectRequest(t);
         break;
       case NetRomOpcode.ConnectAcknowledge:
-        this.onConnectAcknowledge(t);
+        this.onConnectAcknowledge(t, packet.payload);
         break;
       case NetRomOpcode.DisconnectRequest:
         this.onDisconnectRequest(t);
@@ -433,7 +437,10 @@ export class NetRomCircuit {
 
   // ─── FSM handlers ───────────────────────────────────────────────────
 
-  private onConnectAcknowledge(t: NetRomTransportHeader): void {
+  private onConnectAcknowledge(
+    t: NetRomTransportHeader,
+    info: Uint8Array,
+  ): void {
     if (this._state !== NetRomCircuitState.Connecting) {
       return;
     }
@@ -452,11 +459,17 @@ export class NetRomCircuit {
       return;
     }
 
-    // Window negotiation: our Connect Request proposed options.windowSize and we
-    // keep that as our send ceiling. (The far end has independently accepted a
-    // window ≤ its own proposal; vanilla NET/ROM does not require us to shrink
-    // ours below what we proposed, and our send window is bounded by `window`
-    // either way.)
+    // Window negotiation: our Connect Request proposed options.windowSize; the
+    // far end replies with the window it ACCEPTED in info[0] (base NET/ROM:
+    // LinBPQ L4Code.c:2287 assigns L4WINDOW = L4DATA[0] unconditionally, Linux
+    // reads skb->data[20]). Clamp our send ceiling down to it: sending more than
+    // the peer agreed to hold overruns its receive queue. A terse peer that sends
+    // no info field (or an out-of-range octet) leaves our proposal standing.
+    const acceptedWindow = tryReadAcceptedWindow(info);
+    if (acceptedWindow !== null) {
+      this._window = Math.min(this._window, acceptedWindow);
+    }
+
     this._state = NetRomCircuitState.Connected;
     this.fireConnected();
     this.pumpSendQueue();
@@ -597,7 +610,19 @@ export class NetRomCircuit {
       opcode: NetRomOpcode.ConnectAcknowledge,
       flags: refused ? NetRomTransportFlags.Choke : NetRomTransportFlags.None,
     };
-    this.emit(t, EMPTY_PAYLOAD);
+
+    // The ACCEPTED WINDOW is base NET/ROM and rides every acknowledgement: LinBPQ
+    // writes L4DATA[0] = L4WINDOW and sends LENGTH = MSGHDDRLEN + 22, a 21-byte
+    // vanilla Connect Acknowledge (L4Code.c:1768,1824), and reads it back
+    // unconditionally (:2287); Linux af_netrom emits nr->window with
+    // NR_CONNACK_LEN 1. A peer that never sees the octet reads buffer residue for
+    // our window (BPQ then chokes forever at 0, or overruns us on a large one), so
+    // we always tell it. A REFUSAL accepts nothing, so it carries no info field,
+    // matching Linux's nr_transmit_refusal (a bare 20-byte frame); the originator
+    // closes on the choke bit before any window is read either way. (LinBPQ's
+    // second, TTL/compression octet is not mirrored: this library has no
+    // compression option to agree to; see connect-ack-info.)
+    this.emit(t, refused ? EMPTY_PAYLOAD : buildConnectAckInfo(this._window));
   }
 
   private sendDisconnectRequest(): void {

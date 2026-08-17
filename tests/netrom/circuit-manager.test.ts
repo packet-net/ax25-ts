@@ -9,8 +9,11 @@
 import { describe, expect, it } from "vitest";
 import { Callsign } from "../../src/callsign.js";
 import {
+  buildConnectRequestInfo,
   CircuitManager,
+  type IncomingCircuitEvent,
   NetRomCircuitCloseReason,
+  NetRomCircuitState,
   type NetRomPacket,
   NetRomOpcode,
   NetRomTransportFlags,
@@ -18,6 +21,29 @@ import {
 import { ascii, asciiStr, CircuitPairHarness } from "./circuit-pair-harness.js";
 
 const User = new Callsign("M0LTE", 0);
+const Local = new Callsign("GB7XXX", 0);
+const Peer = new Callsign("GB7YYY", 0);
+const Third = new Callsign("GB7ZZZ", 0);
+
+/** A Connect Request from `origin` naming ITS OWN circuit `(index,id)`. */
+function connectRequestFrom(
+  origin: Callsign,
+  index: number,
+  id: number,
+): NetRomPacket {
+  return {
+    network: { origin, destination: Local, timeToLive: 25 },
+    transport: {
+      circuitIndex: index,
+      circuitId: id,
+      txSequence: 0,
+      rxSequence: 0,
+      opcode: NetRomOpcode.ConnectRequest,
+      flags: NetRomTransportFlags.None,
+    },
+    payload: buildConnectRequestInfo(4, User, origin),
+  };
+}
 
 describe("CircuitManager", () => {
   it("Two_concurrent_circuits_demultiplex_independently", () => {
@@ -78,6 +104,43 @@ describe("CircuitManager", () => {
     expect(a.connected).toBe(true); // the re-ack from the deduped circuit completes the connect
     expect(h.b.circuits).toHaveLength(1); // the retransmit re-acked the existing circuit, no duplicate
     expect(accepted).toHaveLength(1); // IncomingCircuit fired exactly once
+  });
+
+  it("A_connect_request_whose_key_collides_with_a_live_local_circuit_is_still_routed_to_the_peer", () => {
+    // Circuit keys are per-node and every node allocates from (0,0), so a third
+    // node's FIRST connect carries the same (index,id) as our own first circuit.
+    // A connect names the PEER's circuit, so it must be routed by
+    // (origin,index,id), never demuxed onto ours, which would swallow it (no
+    // incoming-circuit event) or, once our circuit is up, ack the wrong node.
+    const manager = new CircuitManager(Local);
+    const sent: NetRomPacket[] = [];
+    manager.sendPacket = (p) => sent.push(p);
+    const incoming: IncomingCircuitEvent[] = [];
+    manager.onIncomingCircuit((e) => {
+      incoming.push(e);
+      CircuitManager.acceptIncoming(e);
+    });
+
+    // Our own outbound circuit to GB7YYY takes the first key, (0,0), and is live.
+    const ours = manager.openCircuit(Peer);
+    ours.connect(User);
+    expect([ours.localIndex, ours.localId]).toEqual([0, 0]);
+    sent.length = 0;
+
+    // A THIRD node's fresh circuit is (0,0) too; its Connect Request names it.
+    manager.onPacket(connectRequestFrom(Third, 0, 0));
+
+    // the colliding connect must mint an inbound circuit
+    expect(incoming).toHaveLength(1);
+    expect(incoming[0]!.remoteNode.equals(Third)).toBe(true);
+    expect(sent).toHaveLength(1);
+    const ack = sent[0]!;
+    expect(ack.transport.opcode).toBe(NetRomOpcode.ConnectAcknowledge);
+    // the acknowledgement goes to the node that connected
+    expect(ack.network.destination.equals(Third)).toBe(true);
+    expect(ack.transport.circuitIndex).toBe(0); // addressed to the peer's own circuit
+    // our colliding circuit is untouched
+    expect(ours.state).toBe(NetRomCircuitState.Connecting);
   });
 
   it("An_inbound_connect_with_no_listener_is_refused", () => {

@@ -171,21 +171,16 @@ export class CircuitManager {
    */
   onPacket(packet: NetRomPacket): void {
     const t = packet.transport;
-    const key = localKey(t.circuitIndex, t.circuitId);
 
-    const circuit = this.byLocalKey.get(key);
-    if (circuit !== undefined) {
-      circuit.onPacket(packet);
-      return;
-    }
-
-    // No existing circuit. Only a Connect Request creates one; everything else is
-    // for a circuit we don't have (a late/duplicate datagram) — drop it, except a
-    // Disconnect Request, which we courteously disconnect-ack so the peer stops
-    // retransmitting.
+    // OPCODE FIRST. A Connect Request's index/id name the PEER's circuit, not
+    // ours (we have none yet), so it must never be demuxed through byLocalKey:
+    // keys are per-node and both ends allocate from (0,0), so a fresh peer's
+    // first connect collides with our own first circuit and would be swallowed
+    // by it (ignored while Connecting, or re-acked to the WRONG node once
+    // Connected; the circuit never checks network.origin). Route it by the
+    // peer's identity instead: (origin node, its index, its id).
     if (t.opcode === NetRomOpcode.ConnectRequest) {
-      // Dedup a retransmitted Connect Request (its header names the peer's
-      // circuit, so it never matches byLocalKey): if we already minted a circuit
+      // Dedup a retransmitted Connect Request: if we already minted a circuit
       // for this peer-circuit identity, hand the retransmit to it (it re-acks)
       // rather than minting a duplicate.
       const peerKey = peerKeyFor(packet.network.origin, t.circuitIndex, t.circuitId);
@@ -195,7 +190,23 @@ export class CircuitManager {
         return;
       }
       this.mintInbound(packet);
-    } else if (t.opcode === NetRomOpcode.DisconnectRequest) {
+      return;
+    }
+
+    // Every other opcode is addressed to a circuit of OURS: demux on the
+    // (index,id) we handed the peer at connect time.
+    const key = localKey(t.circuitIndex, t.circuitId);
+
+    const circuit = this.byLocalKey.get(key);
+    if (circuit !== undefined) {
+      circuit.onPacket(packet);
+      return;
+    }
+
+    // Nothing matched: the datagram is for a circuit we don't have (a late or
+    // duplicate one); drop it, except a Disconnect Request, which we
+    // courteously disconnect-ack so the peer stops retransmitting.
+    if (t.opcode === NetRomOpcode.DisconnectRequest) {
       // Reflect a Disconnect Acknowledge addressed to the peer's circuit (carried
       // in this request's index/id) so a half-open peer settles.
       const network: NetRomNetworkHeader = {

@@ -390,23 +390,59 @@ export class NetRomRoutingTable {
    * maintenance — never transmits.
    *
    * @param originator The AX.25 source callsign of the UI frame (the broadcasting neighbour).
-   * @param myCall Our own node callsign — an advertised best-neighbour matching this is loop-guarded to quality 0.
+   * @param myCall Our own node callsign. An advertised entry whose *destination*
+   *   is us is skipped outright (we never learn, and so never re-advertise, a
+   *   route to ourselves: LinBPQ `L3Code.c:456`, and the same guard
+   *   {@link ingestRif} applies), and an advertised best-neighbour matching this
+   *   is loop-guarded to quality 0.
    * @param portId The listener port id the broadcast was heard on.
    * @param broadcast The parsed broadcast content.
+   * @param neighbourQuality The path quality to assume for the directly-heard
+   *   neighbour on this port (the BPQ per-port `QUALITY`). Omitted (`undefined`)
+   *   means the table-wide {@link NetRomRoutingOptions.defaultNeighbourQuality},
+   *   byte-for-byte the prior behaviour. When supplied it overrides that default
+   *   for routes learned on this port, so a mixed-grade node advertises an
+   *   accurate per-port quality. Clamped to 0..255. The cached neighbour path
+   *   quality is refreshed to this value on every ingest, so a per-port quality
+   *   change (or a neighbour moving ports) takes effect on the next broadcast.
+   * @param minQuality The worst quality a learned route may have and still be
+   *   kept on this port (the BPQ per-port `MINQUAL`). Omitted (`undefined`) means
+   *   the table-wide {@link NetRomRoutingOptions.minQuality}, byte-for-byte the
+   *   prior behaviour. When supplied it overrides that floor for routes *learned
+   *   via this ingest* (a NODES broadcast heard on this port), so a node can keep
+   *   only high-grade routes off a busy port (e.g. `MINQUAL 100` on RF) while
+   *   keeping everything off another. Clamped to 0..255. A re-advertisement that
+   *   derives below the effective floor removes an existing route, exactly as the
+   *   table-wide floor does. Note this gates the *direct* route to the originator
+   *   too: a neighbour whose own assumed path quality is below the floor is not
+   *   kept.
+   *
+   * Mirrors `NetRomRoutingTable.Ingest` on the C# side (its `int?` per-port
+   * arguments become optional TS parameters).
    */
   ingest(
     originator: Callsign,
     myCall: Callsign,
     portId: string,
     broadcast: NodesBroadcast,
+    neighbourQuality?: number,
+    minQuality?: number,
   ): void {
     const now = this.now();
-    const pathQuality = clampQuality(this.options.defaultNeighbourQuality);
+    const pathQuality = clampQuality(
+      neighbourQuality ?? this.options.defaultNeighbourQuality,
+    );
+    // The effective MINQUAL floor for this ingest: the per-port override if
+    // supplied, else the table-wide default. Clamped defensively to 0..255 so the
+    // floor comparison is total.
+    const floor = clampQuality(minQuality ?? this.options.minQuality);
     const originatorKey = originator.toString();
     this.callsignByKey.set(originatorKey, originator);
 
     // Heuristic 3: ensure a neighbour-list entry for the originator, created with
-    // the default-port path quality. Refresh its alias + last-heard each time.
+    // the (per-port or default) path quality. Refresh its alias + last-heard each
+    // time, and its path quality too, so a per-port QUALITY edit reflects on the
+    // next broadcast.
     let nbr = this.neighbours.get(originatorKey);
     if (!nbr) {
       nbr = { alias: "", portId, pathQuality, lastHeard: now };
@@ -414,6 +450,7 @@ export class NetRomRoutingTable {
     }
     nbr.alias = broadcast.senderAlias;
     nbr.portId = portId;
+    nbr.pathQuality = pathQuality;
     nbr.lastHeard = now;
     const originatorPathQuality = nbr.pathQuality;
 
@@ -421,16 +458,39 @@ export class NetRomRoutingTable {
     // quality. (The originator may also appear as a destination in its own list
     // with a different quality — that is merged as a normal indirect route below;
     // the direct route via itself usually wins.)
-    this.upsertRoute(originator, broadcast.senderAlias, originator, originatorPathQuality);
+    this.upsertRoute(
+      originator,
+      broadcast.senderAlias,
+      originator,
+      originatorPathQuality,
+      floor,
+    );
 
     // Heuristic 5/6/7/8: each advertised destination becomes a route via this
     // neighbour at the combined quality, loop-guarded against us.
     for (const entry of broadcast.entries) {
+      if (entry.destination.equals(myCall)) {
+        // Trivial-loop guard: never learn (and so never re-advertise) a route to
+        // OURSELVES. The best-neighbour guard below only catches the direct case
+        // (a neighbour advertising us back with our own call as its next hop); an
+        // advertisement of us via a THIRD node slips past it and puts our own
+        // callsign into our own NODES broadcast. LinBPQ skips
+        // destination == MYCALL outright (L3Code.c:456), and ingestRif has the
+        // same guard.
+        continue;
+      }
+
       const quality = entry.bestNeighbour.equals(myCall)
         ? NETROM_QUALITY_MIN // trivial-loop guard
         : combineQuality(entry.bestQuality, originatorPathQuality);
 
-      this.upsertRoute(entry.destination, entry.destinationAlias, originator, quality);
+      this.upsertRoute(
+        entry.destination,
+        entry.destinationAlias,
+        originator,
+        quality,
+        floor,
+      );
     }
   }
 
@@ -998,15 +1058,17 @@ export class NetRomRoutingTable {
     alias: string,
     viaNeighbour: Callsign,
     quality: number,
+    minQuality: number,
   ): void {
     const destKey = destination.toString();
     const viaKey = viaNeighbour.toString();
 
     // A quality-0 route is never usable / kept; likewise anything under the
-    // configured floor. If such a route already existed (from a prior, better
-    // advertisement), a now-too-low re-advertisement removes it.
-    const acceptable =
-      quality > NETROM_QUALITY_MIN && quality >= this.options.minQuality;
+    // effective floor (the caller-supplied per-port MINQUAL when this ingest
+    // carried one, else the table-wide options.minQuality). If such a route
+    // already existed (from a prior, better advertisement), a now-too-low
+    // re-advertisement removes it.
+    const acceptable = quality > NETROM_QUALITY_MIN && quality >= minQuality;
 
     let dest = this.destinations.get(destKey);
     if (!dest) {
