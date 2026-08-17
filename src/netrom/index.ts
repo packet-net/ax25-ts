@@ -66,6 +66,14 @@ export {
 } from "./connect-request-info.js";
 
 export {
+  // L4 Connect Acknowledge info field (1-octet accepted window) builder + reader
+  CONNECT_ACK_INFO_VANILLA_LENGTH,
+  CONNECT_ACK_MAX_WINDOW,
+  buildConnectAckInfo,
+  tryReadAcceptedWindow,
+} from "./connect-ack-info.js";
+
+export {
   // L3 network header (15-octet) — origin/destination nodes + TTL
   NETWORK_HEADER_ENCODED_LENGTH,
   DEFAULT_TIME_TO_LIVE,

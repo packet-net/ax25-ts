@@ -11,12 +11,61 @@
 import { describe, expect, it } from "vitest";
 import { Callsign } from "../../src/callsign.js";
 import {
+  buildConnectRequestInfo,
+  CircuitManager,
+  CONNECT_ACK_INFO_VANILLA_LENGTH,
+  encodeNetRomPacket,
   NetRomCircuitCloseReason,
   NetRomCircuitState,
+  NetRomOpcode,
+  type NetRomPacket,
+  NetRomTransportFlags,
 } from "../../src/netrom/index.js";
 import { ascii, CircuitPairHarness } from "./circuit-pair-harness.js";
 
 const User = new Callsign("M0LTE", 0);
+
+/**
+ * Feed one Connect Request into a lone manager for `local` and return every
+ * Connect Acknowledge it emitted, so the acknowledgement's info field can be
+ * inspected on the wire.
+ */
+function connectAcksFor(
+  local: Callsign,
+  windowSize: number,
+  accept: boolean,
+  proposedWindow = 7,
+): NetRomPacket[] {
+  const remote = new Callsign("GB7AAA", 0);
+  const acks: NetRomPacket[] = [];
+  const manager = new CircuitManager(local, { windowSize });
+  manager.sendPacket = (p) => {
+    if (p.transport.opcode === NetRomOpcode.ConnectAcknowledge) {
+      acks.push(p);
+    }
+  };
+  manager.onIncomingCircuit((e) => {
+    if (accept) {
+      CircuitManager.acceptIncoming(e);
+    } else {
+      manager.refuseIncoming(e);
+    }
+  });
+
+  manager.onPacket({
+    network: { origin: remote, destination: local, timeToLive: 25 },
+    transport: {
+      circuitIndex: 7,
+      circuitId: 3,
+      txSequence: 0,
+      rxSequence: 0,
+      opcode: NetRomOpcode.ConnectRequest,
+      flags: NetRomTransportFlags.None,
+    },
+    payload: buildConnectRequestInfo(proposedWindow, User, remote),
+  });
+  return acks;
+}
 
 describe("NetRomCircuit — behavioural FSM", () => {
   it("Connect_then_acknowledge_brings_both_ends_up", () => {
@@ -48,6 +97,83 @@ describe("NetRomCircuit — behavioural FSM", () => {
     expect(accepted).toHaveLength(1);
     // B accepts at most its own ceiling, below A's proposed 8
     expect(accepted[0]!.circuit.window).toBe(2);
+  });
+
+  it("The_originator_clamps_its_send_window_to_the_accepted_window", () => {
+    // The other half of the negotiation: B's Connect Acknowledge reports the
+    // window it ACCEPTED (info[0]) and the originator must come down to it.
+    // Sending more frames than the far end agreed to hold overruns its receive
+    // queue. LinBPQ does exactly this on receipt: L4->L4WINDOW = L3MSG->L4DATA[0]
+    // (L4Code.c:2287).
+    const h = new CircuitPairHarness({ windowSize: 8 }, { windowSize: 2 });
+    h.autoAcceptOnB();
+
+    const a = h.openFromA();
+    a.circuit.connect(User);
+    h.pump();
+
+    expect(a.connected).toBe(true);
+    // the acknowledgement's window octet caps our proposed 8
+    expect(a.circuit.window).toBe(2);
+  });
+
+  it("An_acknowledgement_with_no_window_octet_leaves_our_proposal_standing", () => {
+    // A terse peer that sends a bare 20-byte Connect Acknowledge tells us
+    // nothing, so our proposed window stands (never silently zeroed).
+    const aNode = new Callsign("GB7AAA", 0);
+    const bNode = new Callsign("GB7BBB", 0);
+    const manager = new CircuitManager(aNode, { windowSize: 4 });
+    const sent: NetRomPacket[] = [];
+    manager.sendPacket = (p) => sent.push(p);
+
+    const circuit = manager.openCircuit(bNode);
+    circuit.connect(User);
+    expect(sent).toHaveLength(1);
+
+    manager.onPacket({
+      network: { origin: bNode, destination: aNode, timeToLive: 25 },
+      transport: {
+        circuitIndex: circuit.localIndex,
+        circuitId: circuit.localId,
+        txSequence: 1,
+        rxSequence: 1,
+        opcode: NetRomOpcode.ConnectAcknowledge,
+        flags: NetRomTransportFlags.None,
+      },
+      payload: new Uint8Array(0),
+    });
+
+    expect(circuit.state).toBe(NetRomCircuitState.Connected);
+    expect(circuit.window).toBe(4); // no octet to clamp to, so the proposal stands
+  });
+
+  it("A_vanilla_connect_acknowledge_is_21_bytes_carrying_the_accepted_window", () => {
+    // The accepted-window octet is base NET/ROM, not a compression extension:
+    // LinBPQ's SendConACK writes L4DATA[0] = L4WINDOW and sends
+    // LENGTH = MSGHDDRLEN + 22, a 21-byte vanilla ack (L4Code.c:1768,1824), and
+    // Linux emits nr->window with NR_CONNACK_LEN 1. Without it the peer reads
+    // buffer residue for our window.
+    const acks = connectAcksFor(new Callsign("GB7BBB", 0), 4, true);
+
+    expect(acks).toHaveLength(1);
+    const ack = acks[0]!;
+    // the vanilla ack carries the window octet and nothing else
+    expect(ack.payload).toHaveLength(CONNECT_ACK_INFO_VANILLA_LENGTH);
+    expect(ack.payload[0]).toBe(4); // the accepted window: our ceiling, below the proposed 7
+    // 20-byte NET/ROM header + the accepted-window octet
+    expect(encodeNetRomPacket(ack)).toHaveLength(21);
+  });
+
+  it("A_refusing_connect_acknowledge_carries_no_info_field", () => {
+    // A refusal accepts nothing, so it carries no window octet, matching Linux's
+    // nr_transmit_refusal (a bare 20-byte frame); the originator closes on the
+    // choke bit before any window is read either way.
+    const acks = connectAcksFor(new Callsign("GB7BBB", 0), 4, false);
+
+    expect(acks).toHaveLength(1);
+    const ack = acks[0]!;
+    expect(ack.payload).toHaveLength(0);
+    expect(encodeNetRomPacket(ack)).toHaveLength(20);
   });
 
   it("Information_flows_with_piggybacked_acks", () => {
