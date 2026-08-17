@@ -44,11 +44,13 @@ export enum ForwardMode {
 
 /** The outcome of a forwarding decision. When {@link ForwardOutcome.ForwardTo},
  *  {@link packet} carries the rewritten (TTL-decremented) datagram to send to
- *  {@link nextHop}. */
+ *  {@link nextHop} over the {@link nextHopPortId} port's interlink. */
 export interface ForwardDecision {
   readonly outcome: ForwardOutcome;
   readonly packet: NetRomPacket;
   readonly nextHop: Callsign | null;
+  /** The port the chosen route's neighbour is reached on (`null` unless forwarding). */
+  readonly nextHopPortId: string | null;
 }
 
 /** True if the decision is to forward. */
@@ -91,7 +93,7 @@ export function decideForward(
   const ttl = packet.network.timeToLive;
   const decremented = ttl === 0 ? 0 : ttl - 1;
   if (decremented === 0) {
-    return { outcome: ForwardOutcome.DropTtlExpired, packet, nextHop: null };
+    return { outcome: ForwardOutcome.DropTtlExpired, packet, nextHop: null, nextHopPortId: null };
   }
 
   // 2. Cap the TTL on everything sent, so a buggy/hostile peer can't make a frame
@@ -101,43 +103,51 @@ export function decideForward(
   // 3. Loop guard: a datagram whose origin is this node has come back to its start —
   //    forwarding it again just loops.
   if (packet.network.origin.equals(nodeCall)) {
-    return { outcome: ForwardOutcome.DropLooped, packet, nextHop: null };
+    return { outcome: ForwardOutcome.DropLooped, packet, nextHop: null, nextHopPortId: null };
   }
 
   // 4. Next hop: the destination's best route (best-first) whose neighbour is not
-  //    the one it arrived from. When INP3 is preferred and the destination holds a
-  //    time-route, the lowest-target-time INP3 route wins; otherwise (knob off, or
-  //    no usable INP3 route) the quality next-hop, exactly as today.
+  //    the one it arrived from. The exclusion is callsign-based on purpose: the
+  //    same neighbour callsign on ANOTHER port is still the same node the datagram
+  //    came from, so bouncing it there loops just the same. When INP3 is preferred
+  //    and the destination holds a time-route, the lowest-target-time INP3 route
+  //    wins; otherwise (knob off, or no usable INP3 route) the quality next-hop,
+  //    exactly as today.
   const resolved = routing.destinations.find((d) => d.destination.equals(packet.network.destination));
-  let nextHop: Callsign | null = null;
+  let onward: NetRomRoute | null = null;
   if (resolved !== undefined) {
     if (preferInp3Routes) {
-      nextHop = selectInp3NextHop(resolved.routes, receivedFrom);
+      onward = selectInp3NextHop(resolved.routes, receivedFrom);
     }
-    if (nextHop === null) {
-      nextHop = selectNextHop(resolved.routes, receivedFrom, mode, packet);
+    if (onward === null) {
+      onward = selectNextHop(resolved.routes, receivedFrom, mode, packet);
     }
   }
 
-  if (nextHop === null) {
-    return { outcome: ForwardOutcome.DropNoRoute, packet, nextHop: null };
+  if (onward === null) {
+    return { outcome: ForwardOutcome.DropNoRoute, packet, nextHop: null, nextHopPortId: null };
   }
 
   const forwarded: NetRomPacket = {
     ...packet,
     network: { ...packet.network, timeToLive: cappedTtl },
   };
-  return { outcome: ForwardOutcome.ForwardTo, packet: forwarded, nextHop };
+  return {
+    outcome: ForwardOutcome.ForwardTo,
+    packet: forwarded,
+    nextHop: onward.neighbour,
+    nextHopPortId: onward.portId,
+  };
 }
 
-/** The next-hop neighbour for a destination under the active mode, excluding the
- *  neighbour the datagram arrived from. `routes` is best-first. */
+/** The onward route for a destination under the active mode, excluding routes via
+ *  the neighbour the datagram arrived from. `routes` is best-first. */
 function selectNextHop(
   routes: readonly NetRomRoute[],
   receivedFrom: Callsign,
   mode: ForwardMode,
   packet: NetRomPacket,
-): Callsign | null {
+): NetRomRoute | null {
   return mode === ForwardMode.PerFlow
     ? selectWeighted(routes, receivedFrom, flowHash(packet))
     : selectBest(routes, receivedFrom);
@@ -152,8 +162,8 @@ function selectNextHop(
  *  `null` when the destination holds no usable INP3 route (every time-route is the way it
  *  came, or there are none), at which point {@link decideForward} falls back to the
  *  quality next-hop. Tie-break: target time, then hop count, then neighbour callsign
- *  ordinal — mirroring the C# `NetRomForwarding.SelectInp3NextHop`. */
-function selectInp3NextHop(routes: readonly NetRomRoute[], receivedFrom: Callsign): Callsign | null {
+ *  ordinal, then port id ordinal - mirroring the C# `NetRomForwarding.SelectInp3NextHop`. */
+function selectInp3NextHop(routes: readonly NetRomRoute[], receivedFrom: Callsign): NetRomRoute | null {
   let best: NetRomRoute | null = null;
   for (const route of routes) {
     const m = route.inp3;
@@ -167,20 +177,24 @@ function selectInp3NextHop(routes: readonly NetRomRoute[], receivedFrom: Callsig
       (m.targetTimeMs === b.targetTimeMs && m.hopCount < b.hopCount) ||
       (m.targetTimeMs === b.targetTimeMs &&
         m.hopCount === b.hopCount &&
-        compareOrdinal(route.neighbour.toString(), best!.neighbour.toString()) < 0);
+        compareOrdinal(route.neighbour.toString(), best!.neighbour.toString()) < 0) ||
+      (m.targetTimeMs === b.targetTimeMs &&
+        m.hopCount === b.hopCount &&
+        route.neighbour.toString() === best!.neighbour.toString() &&
+        compareOrdinal(route.portId, best!.portId) < 0);
     if (better) {
       best = route;
     }
   }
-  return best === null ? null : best.neighbour;
+  return best;
 }
 
 /** The single best usable route — the first in the best-first list that isn't the way
  *  the datagram came. */
-function selectBest(routes: readonly NetRomRoute[], receivedFrom: Callsign): Callsign | null {
+function selectBest(routes: readonly NetRomRoute[], receivedFrom: Callsign): NetRomRoute | null {
   for (const route of routes) {
     if (!route.neighbour.equals(receivedFrom)) {
-      return route.neighbour;
+      return route;
     }
   }
   return null;
@@ -189,7 +203,7 @@ function selectBest(routes: readonly NetRomRoute[], receivedFrom: Callsign): Cal
 /** A per-flow, quality-weighted pick among the eligible routes (not the way it came,
  *  quality > 0): all datagrams of one circuit hash to the same route, while distinct
  *  circuits spread across the kept routes in proportion to quality. Stateless. */
-function selectWeighted(routes: readonly NetRomRoute[], receivedFrom: Callsign, flowHashValue: number): Callsign | null {
+function selectWeighted(routes: readonly NetRomRoute[], receivedFrom: Callsign, flowHashValue: number): NetRomRoute | null {
   let total = 0;
   for (const route of routes) {
     if (!route.neighbour.equals(receivedFrom) && route.quality > 0) {
@@ -206,7 +220,7 @@ function selectWeighted(routes: readonly NetRomRoute[], receivedFrom: Callsign, 
       continue;
     }
     if (target < route.quality) {
-      return route.neighbour;
+      return route;
     }
     target -= route.quality;
   }

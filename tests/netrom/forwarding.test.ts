@@ -43,11 +43,12 @@ function datagram(origin: Callsign, dest: Callsign, timeToLive: number): NetRomP
 
 function routesTo(
   dest: Callsign,
-  ...routes: Array<{ neighbour: Callsign; quality: number }>
+  ...routes: Array<{ neighbour: Callsign; quality: number; portId?: string }>
 ): NetRomRoutingSnapshot {
   // routes passed best-first (decideForward trusts the snapshot's ordering)
   const list: NetRomRoute[] = routes.map((r) => ({
     neighbour: r.neighbour,
+    portId: r.portId ?? "p1",
     quality: r.quality,
     obsolescence: 6,
   }));
@@ -69,15 +70,31 @@ const noRoutes: NetRomRoutingSnapshot = {
 describe("decideForward — NET/ROM L3 forwarding decision", () => {
   it("forwards a transit datagram to the best next hop with the TTL decremented", () => {
     const packet = datagram(Source, Dest, 10);
-    const decision = decideForward(packet, FromNbr, Me, routesTo(Dest, { neighbour: OnwardNbr, quality: 200 }), 25);
+    const decision = decideForward(packet, FromNbr, Me, routesTo(Dest, { neighbour: OnwardNbr, quality: 200, portId: "hf" }), 25);
 
     expect(decision.outcome).toBe(ForwardOutcome.ForwardTo);
     expect(decision.nextHop?.equals(OnwardNbr)).toBe(true);
+    expect(decision.nextHopPortId).toBe("hf"); // the chosen route's port rides with the decision
     expect(decision.packet.network.timeToLive).toBe(9);
     expect(decision.packet.network.origin.equals(Source)).toBe(true);
     expect(decision.packet.network.destination.equals(Dest)).toBe(true);
     expect(decision.packet.transport).toEqual(packet.transport);
     expect([...decision.packet.payload]).toEqual([...packet.payload]);
+  });
+
+  it("never bounces a datagram back to the callsign it came from, on ANY port", () => {
+    // The only onward route to Dest runs via the arrival callsign on ANOTHER
+    // port. It is still the same node the datagram came from, so forwarding it
+    // there loops: the exclusion is callsign-based, not (port, callsign)-based.
+    const decision = decideForward(
+      datagram(Source, Dest, 10),
+      FromNbr,
+      Me,
+      routesTo(Dest, { neighbour: FromNbr, quality: 200, portId: "hf" }),
+      25,
+    );
+    expect(decision.outcome).toBe(ForwardOutcome.DropNoRoute);
+    expect(decision.nextHopPortId).toBeNull();
   });
 
   it("drops when the TTL reaches zero", () => {
@@ -174,10 +191,11 @@ describe("decideForward — NET/ROM L3 forwarding decision", () => {
   // is { neighbour, quality, targetTimeMs, hop }. Quality-first ordering as passed.
   function inp3RoutesTo(
     dest: Callsign,
-    ...routes: Array<{ neighbour: Callsign; quality: number; targetTimeMs: number; hop: number }>
+    ...routes: Array<{ neighbour: Callsign; quality: number; targetTimeMs: number; hop: number; portId?: string }>
   ): NetRomRoutingSnapshot {
     const list: NetRomRoute[] = routes.map((r) => ({
       neighbour: r.neighbour,
+      portId: r.portId ?? "p1",
       quality: r.quality,
       obsolescence: 6,
       inp3: { targetTimeMs: r.targetTimeMs, hopCount: r.hop },
@@ -262,10 +280,10 @@ describe("decideForward — NET/ROM L3 forwarding decision", () => {
           destination: Dest,
           alias: "DEST",
           routes: [
-            { neighbour: FromNbr, quality: 100, obsolescence: 6, inp3: { targetTimeMs: 50, hopCount: 1 } }, // INP3, but the way it came
-            { neighbour: AltNbr, quality: 200, obsolescence: 6 }, // quality-only alternate
+            { neighbour: FromNbr, portId: "p1", quality: 100, obsolescence: 6, inp3: { targetTimeMs: 50, hopCount: 1 } }, // INP3, but the way it came
+            { neighbour: AltNbr, portId: "p1", quality: 200, obsolescence: 6 }, // quality-only alternate
           ],
-          bestRoute: { neighbour: FromNbr, quality: 100, obsolescence: 6, inp3: { targetTimeMs: 50, hopCount: 1 } },
+          bestRoute: { neighbour: FromNbr, portId: "p1", quality: 100, obsolescence: 6, inp3: { targetTimeMs: 50, hopCount: 1 } },
         },
       ],
       neighbours: [],

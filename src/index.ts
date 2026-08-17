@@ -299,6 +299,10 @@ export {
   type NetRomRoutingSnapshot,
   EMPTY_NETROM_SNAPSHOT,
   NetRomRoutingTable,
+  NETROM_NEIGHBOUR_KEY_SEPARATOR,
+  neighbourKey,
+  neighbourKeyPort,
+  neighbourKeyCallsign,
   resolveDestination,
   neighbourFor,
   // the node-level service (the read-only tap + public API)

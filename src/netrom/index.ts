@@ -142,6 +142,11 @@ export {
   type NetRomRoutingSnapshot,
   EMPTY_NETROM_SNAPSHOT,
   NetRomRoutingTable,
+  // the (portId, callsign) neighbour key (routing table + interlink identity)
+  NETROM_NEIGHBOUR_KEY_SEPARATOR,
+  neighbourKey,
+  neighbourKeyPort,
+  neighbourKeyCallsign,
   // alias/callsign + neighbour resolution over a snapshot (connect-routing helpers)
   resolveDestination,
   neighbourFor,

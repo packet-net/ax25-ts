@@ -205,7 +205,7 @@ describe("NetRomRoutingTable — link-down failover (markNeighbourDown)", () => 
     table.ingest(NbrA, Me, "vhf", broadcast("RDG", [{ dest: DestSot, destAlias: "SOT", neighbour: NbrA, quality: 200 }]));
     expect(table.snapshot().destinations.some((d) => d.destination.equals(DestSot))).toBe(true);
 
-    const dropped = table.markNeighbourDown(NbrA);
+    const dropped = table.markNeighbourDown("vhf", NbrA);
 
     expect(dropped).toBeGreaterThan(0);
     const snap = table.snapshot();
@@ -219,7 +219,7 @@ describe("NetRomRoutingTable — link-down failover (markNeighbourDown)", () => 
     table.ingest(NbrB, Me, "vhf", broadcast("XYZ", [{ dest: DestSot, destAlias: "SOT", neighbour: NbrB, quality: 150 }]));
     expect(table.snapshot().destinations.find((d) => d.destination.equals(DestSot))!.bestRoute!.neighbour.equals(NbrA)).toBe(true);
 
-    table.markNeighbourDown(NbrA);
+    table.markNeighbourDown("vhf", NbrA);
 
     const after = table.snapshot().destinations.find((d) => d.destination.equals(DestSot))!;
     expect(after.routes.some((r) => r.neighbour.equals(NbrA))).toBe(false);
@@ -230,7 +230,7 @@ describe("NetRomRoutingTable — link-down failover (markNeighbourDown)", () => 
     const { table } = newTable();
     table.ingest(NbrA, Me, "vhf", broadcast("RDG", [{ dest: DestSot, destAlias: "SOT", neighbour: NbrA, quality: 200 }]));
 
-    expect(table.markNeighbourDown(NbrB)).toBe(0);
+    expect(table.markNeighbourDown("vhf", NbrB)).toBe(0);
     expect(table.snapshot().destinations.some((d) => d.destination.equals(DestSot))).toBe(true);
   });
 });
@@ -476,5 +476,188 @@ describe("NetRomRoutingTable — destination cap + snapshot shape", () => {
     expect(snap.neighbours).toHaveLength(0);
     expect(table.destinationCount).toBe(0);
     expect(table.neighbourCount).toBe(0);
+  });
+});
+
+describe("NetRomRoutingTable - per-port neighbours ((portId, callsign) keys)", () => {
+  it("the same callsign heard on two ports keeps two neighbour rows with their own quality", () => {
+    const { table } = newTable();
+    // GB7RDG is heard on "vhf" at quality 191 and on "hf" at quality 150.
+    table.ingest(NbrA, Me, "vhf", broadcast("RDGBPQ"), 191);
+    table.ingest(NbrA, Me, "hf", broadcast("RDGBPQ"), 150);
+
+    const snap = table.snapshot();
+    expect(snap.neighbours).toHaveLength(2); // one row per (portId, callsign) key
+    const vhf = snap.neighbours.find((n) => n.portId === "vhf")!;
+    const hf = snap.neighbours.find((n) => n.portId === "hf")!;
+    expect(vhf.neighbour.equals(NbrA)).toBe(true);
+    expect(hf.neighbour.equals(NbrA)).toBe(true);
+    expect(vhf.pathQuality).toBe(191);
+    expect(hf.pathQuality).toBe(150);
+
+    // Two direct routes to the originator too, one per port, each at its own
+    // quality - the second ingest did NOT overwrite the first port's row.
+    const direct = snap.destinations.find((d) => d.destination.equals(NbrA))!;
+    expect(direct.routes).toHaveLength(2);
+    const qualities = direct.routes.map((r) => r.quality).sort((a, b) => b - a);
+    expect(qualities).toEqual([191, 150]);
+    expect(direct.routes.map((r) => r.portId).sort()).toEqual(["hf", "vhf"]);
+  });
+
+  it("the better port wins route selection", () => {
+    const { table } = newTable();
+    table.ingest(NbrA, Me, "vhf", broadcast("RDG", [
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrA, quality: 200 },
+    ]), 191);
+    table.ingest(NbrA, Me, "hf", broadcast("RDG", [
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrA, quality: 200 },
+    ]), 150);
+
+    const sot = table.snapshot().destinations.find((d) => d.destination.equals(DestSot))!;
+    expect(sot.routes).toHaveLength(2);
+    // Best quality wins: the route via the vhf port (191 basis) beats hf (150).
+    expect(sot.bestRoute!.portId).toBe("vhf");
+    expect(sot.bestRoute!.quality).toBe(combineQuality(200, 191));
+    expect(sot.routes[1]!.portId).toBe("hf");
+    expect(sot.routes[1]!.quality).toBe(combineQuality(200, 150));
+  });
+
+  it("markNeighbourDown on one port leaves the other port's routes intact", () => {
+    const { table } = newTable();
+    table.ingest(NbrA, Me, "vhf", broadcast("RDG", [
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrA, quality: 200 },
+    ]), 191);
+    table.ingest(NbrA, Me, "hf", broadcast("RDG", [
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrA, quality: 200 },
+    ]), 150);
+
+    // A failed dial on the vhf port drops ONLY the (vhf, NbrA) key.
+    const dropped = table.markNeighbourDown("vhf", NbrA);
+    expect(dropped).toBeGreaterThan(0);
+
+    const snap = table.snapshot();
+    // The hf neighbour row + its routes survive the vhf failure.
+    expect(snap.neighbours).toHaveLength(1);
+    expect(snap.neighbours[0]!.portId).toBe("hf");
+    const sot = snap.destinations.find((d) => d.destination.equals(DestSot))!;
+    expect(sot.routes).toHaveLength(1);
+    expect(sot.bestRoute!.portId).toBe("hf"); // failed over to the same callsign on hf
+    expect(sot.bestRoute!.quality).toBe(combineQuality(200, 150));
+  });
+
+  it("markPortDown drops only that port's neighbour rows and routes", () => {
+    const { table } = newTable();
+    table.ingest(NbrA, Me, "vhf", broadcast("RDG", [
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrA, quality: 200 },
+    ]), 191);
+    table.ingest(NbrA, Me, "hf", broadcast("RDG", [
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrA, quality: 200 },
+    ]), 150);
+    table.ingest(NbrB, Me, "vhf", broadcast("XYZ", [
+      { dest: DestMnc, destAlias: "MNC", neighbour: NbrB, quality: 200 },
+    ]));
+
+    const dropped = table.markPortDown("vhf");
+    // The vhf port carried: direct-to-RDG, SOT-via-RDG, direct-to-XYZ, MNC-via-XYZ.
+    expect(dropped).toBe(4);
+
+    const snap = table.snapshot();
+    expect(snap.neighbours).toHaveLength(1);
+    expect(snap.neighbours[0]!.portId).toBe("hf"); // only the hf row survives
+    // SOT keeps its hf route; MNC lost its only route and with it the destination.
+    expect(snap.destinations.some((d) => d.destination.equals(DestSot))).toBe(true);
+    expect(snap.destinations.some((d) => d.destination.equals(DestMnc))).toBe(false);
+    // An unknown port is a no-op.
+    expect(table.markPortDown("nope")).toBe(0);
+  });
+
+  it("the NODES advertisement still emits one entry per destination at the better quality", () => {
+    const { table } = newTable();
+    table.ingest(NbrA, Me, "vhf", broadcast("RDG", [
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrA, quality: 200 },
+    ]), 191);
+    table.ingest(NbrA, Me, "hf", broadcast("RDG", [
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrA, quality: 200 },
+    ]), 150);
+
+    const entries = table.buildAdvertisement(0);
+    // ONE entry per destination - the wire carries the best route's neighbour
+    // CALLSIGN and quality, no port. Two destinations: RDG itself + SOT.
+    expect(entries).toHaveLength(2);
+    const sot = entries.find((e) => e.destination.equals(DestSot))!;
+    expect(sot.bestNeighbour.equals(NbrA)).toBe(true);
+    expect(sot.quality).toBe(combineQuality(200, 191)); // the better port's quality
+    expect(Object.keys(sot).sort()).toEqual(
+      ["bestNeighbour", "destination", "destinationAlias", "quality"],
+    ); // no port field on the wire shape
+  });
+
+  it("obsolescence decays each per-port route independently", () => {
+    const { table } = newTable();
+    table.ingest(NbrA, Me, "vhf", broadcast("RDG", [
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrA, quality: 200 },
+    ]), 191);
+    table.ingest(NbrA, Me, "hf", broadcast("RDG", [
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrA, quality: 200 },
+    ]), 150);
+
+    table.sweep(); // both 6 -> 5
+    table.sweep(); // both 5 -> 4
+    // Only the vhf port keeps broadcasting: its route refreshes, hf keeps decaying.
+    table.ingest(NbrA, Me, "vhf", broadcast("RDG", [
+      { dest: DestSot, destAlias: "SOT", neighbour: NbrA, quality: 200 },
+    ]), 191);
+
+    const sot = table.snapshot().destinations.find((d) => d.destination.equals(DestSot))!;
+    const vhfRoute = sot.routes.find((r) => r.portId === "vhf")!;
+    const hfRoute = sot.routes.find((r) => r.portId === "hf")!;
+    expect(vhfRoute.obsolescence).toBe(6); // refreshed on its own key
+    expect(hfRoute.obsolescence).toBe(4); // aged on its own key
+
+    // Four more sweeps age the silent hf route out entirely; vhf survives.
+    table.sweep();
+    table.sweep();
+    table.sweep();
+    table.sweep();
+    const after = table.snapshot().destinations.find((d) => d.destination.equals(DestSot))!;
+    expect(after.routes.some((r) => r.portId === "hf")).toBe(false);
+    expect(after.routes.some((r) => r.portId === "vhf")).toBe(true);
+  });
+
+  it("equal-quality ties break deterministically by canonical port order, then callsign", () => {
+    // Same neighbour quality on both ports → equal route qualities. The default
+    // (no host port order) is a stable string-ordinal comparison of the port ids.
+    const { table } = newTable();
+    table.ingest(NbrA, Me, "b-port", broadcast("RDG"), 190);
+    table.ingest(NbrA, Me, "a-port", broadcast("RDG"), 190);
+
+    const direct = table.snapshot().destinations.find((d) => d.destination.equals(NbrA))!;
+    expect(direct.routes).toHaveLength(2);
+    expect(direct.bestRoute!.portId).toBe("a-port"); // ordinal: "a-port" < "b-port"
+
+    // A host-supplied port order wins over the ordinal default.
+    const ranked = new NetRomRoutingTable(
+      NETROM_ROUTING_DEFAULTS,
+      () => FIXED_NOW,
+      (portId) => (portId === "b-port" ? 0 : 1), // the host prefers b-port
+    );
+    ranked.ingest(NbrA, Me, "b-port", broadcast("RDG"), 190);
+    ranked.ingest(NbrA, Me, "a-port", broadcast("RDG"), 190);
+    const rankedDirect = ranked
+      .snapshot()
+      .destinations.find((d) => d.destination.equals(NbrA))!;
+    expect(rankedDirect.bestRoute!.portId).toBe("b-port");
+  });
+
+  it("two ports with different neighbour qualities advertise per port and never overwrite", () => {
+    // Re-hearing the neighbour on one port refreshes only that port's quality.
+    const { table } = newTable();
+    table.ingest(NbrA, Me, "vhf", broadcast("RDG"), 191);
+    table.ingest(NbrA, Me, "hf", broadcast("RDG"), 150);
+    table.ingest(NbrA, Me, "hf", broadcast("RDG"), 160); // hf QUALITY edit
+
+    const snap = table.snapshot();
+    expect(snap.neighbours.find((n) => n.portId === "vhf")!.pathQuality).toBe(191); // untouched
+    expect(snap.neighbours.find((n) => n.portId === "hf")!.pathQuality).toBe(160);
   });
 });

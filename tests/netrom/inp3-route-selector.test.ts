@@ -27,7 +27,7 @@ const Dest = new Callsign("GB7SOT", 0);
 
 // A quality-only route (today's vanilla triple; no INP3 metric).
 function q(nbr: Callsign, quality: number): NetRomRoute {
-  return { neighbour: nbr, quality, obsolescence: 6 };
+  return { neighbour: nbr, portId: "p1", quality, obsolescence: 6 };
 }
 
 // A route carrying both a quality and an INP3 (target-time) metric.
@@ -38,7 +38,7 @@ function t(
   hopCount: number,
 ): NetRomRoute {
   const inp3: Inp3RouteMetric = { targetTimeMs, hopCount };
-  return { neighbour: nbr, quality, obsolescence: 6, inp3 };
+  return { neighbour: nbr, portId: "p1", quality, obsolescence: 6, inp3 };
 }
 
 // Build a destination from a best-quality-first route list (the ordering the
