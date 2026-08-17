@@ -157,11 +157,28 @@ export interface Ax25SessionContext {
  * {@link Ax25SessionQuirks.ax25Spec13ClampSrejWindowToHalfModulus} (default on);
  * with the quirk off it is just `k`, reproducing the unbounded figure-literal
  * behaviour. Go-back-N links (SREJ off) are never capped.
+ *
+ * On top of that, and unconditionally (this is arithmetic, not a figure
+ * interpretation, so no quirk gates it), the window is bounded by the sequence
+ * space itself: at most `modulus - 1` I-frames may be outstanding. Section 4.2.4
+ * sizes V(S) modulo the modulus and Section 6.4.4.1 stops transmission once
+ * V(S) = V(A) + k; both transmit gates measure the outstanding count as
+ * `(V(S) - V(A)) mod modulus`, which can never reach the modulus, so a `k` at or
+ * above the modulus means "never full". {@link Ax25SessionContext.sentIFrames}
+ * is keyed by the bare N(S), so the (k = modulus)th frame overwrites the oldest
+ * unacknowledged one and a REJ then retransmits the wrong payload under the
+ * right sequence number: silent data corruption. A configured window of 8..127
+ * on a mod-8 link is the reachable vector, so the bound lives here, at the
+ * single point every gate reads. Mirrors the C#
+ * `Ax25SessionContext.EffectiveWindow` (packet.net#696 / C083).
  */
 export function effectiveWindow(ctx: Ax25SessionContext): number {
-  return ctx.quirks.ax25Spec13ClampSrejWindowToHalfModulus && ctx.srejEnabled
-    ? Math.min(ctx.k, Math.floor(modulus(ctx) / 2))
-    : ctx.k;
+  const m = modulus(ctx);
+  const window =
+    ctx.quirks.ax25Spec13ClampSrejWindowToHalfModulus && ctx.srejEnabled
+      ? Math.min(ctx.k, Math.floor(m / 2))
+      : ctx.k;
+  return Math.min(window, m - 1);
 }
 
 export function modulus(ctx: Ax25SessionContext): number {
