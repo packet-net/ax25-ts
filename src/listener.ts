@@ -894,6 +894,20 @@ export class Ax25Listener {
       return;
     }
 
+    // Sections 3.12.4 / 4.2.2: the has-been-repeated (H) bit on a repeater slot
+    // says the frame has already passed through that digipeater. A frame whose
+    // LAST repeater slot still has H=0 is in transit TO a digipeater, not at its
+    // destination: we are only overhearing it. Acting on it answers a frame that
+    // has not been delivered yet, and the digi's repeat (H=1) is then processed a
+    // second time, so one SABM drew two UAs (m0lte/packet.net#696). Monitor-only
+    // here: the trace has already fired in the pump, so a promiscuous consumer
+    // still sees it, exactly like LinBPQ / direwolf, which discard a
+    // not-fully-repeated frame at this point. Mirrors the C# DispatchInbound.
+    const lastDigi = routed.digipeaters[routed.digipeaters.length - 1];
+    if (lastDigi !== undefined && !lastDigi.crhBit) {
+      return;
+    }
+
     // Connectionless TEST (§4.3.4.2), addressed to us — handle it BEFORE any
     // session routing. TEST is link-independent: it must never enter the
     // session machine (where it would fall to the Disconnected t05 catch-all

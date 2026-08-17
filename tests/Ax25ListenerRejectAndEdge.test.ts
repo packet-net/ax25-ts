@@ -9,6 +9,7 @@
  * SABM with a digipeater chain.
  */
 import { describe, expect, it } from "vitest";
+import { ADDRESS_ENCODED_LENGTH } from "../src/address.js";
 import { Callsign } from "../src/callsign.js";
 import {
   classify,
@@ -252,13 +253,20 @@ describe("Ax25Listener — reject path & spec edge cases", () => {
 
     const digi1 = Callsign.parse("GB7CIP");
     const digi2 = Callsign.parse("MB7UR");
-    transport.injectInbound(
+    const sabmViaDigis = encodeFrame(
       sabm({
         destination: LocalCall,
         source: PeerCallA,
         digipeaters: [digi1, digi2],
       }),
     );
+    // Mark both repeater slots has-been-repeated (section 3.12.4): this is the
+    // copy the last digi put on the air, i.e. the one actually addressed to us. A
+    // copy with H=0 is still in transit and is monitor-only (see
+    // Ax25ListenerDigipeaterHBit.test.ts).
+    sabmViaDigis[2 * ADDRESS_ENCODED_LENGTH + 6] |= 0x80;
+    sabmViaDigis[3 * ADDRESS_ENCODED_LENGTH + 6] |= 0x80;
+    transport.injectInboundBytes(sabmViaDigis);
 
     const session = await withTimeout(accepted, 2000, "accepted");
     expect(session.context.remote.equals(PeerCallA)).toBe(true);
