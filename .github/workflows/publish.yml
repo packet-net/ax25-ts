@@ -10,7 +10,9 @@ on:
       - 'v*'
   workflow_dispatch:
     # Manual trigger lets you validate the workflow shape from a branch
-    # without actually publishing — the `if: env.NPM_TOKEN != ''` guard
+    # NOTE that npm now publishes via trusted publishing, which has no secret
+    # to leave unset, so a dispatch run WILL attempt a real npm upload. What
+    # follows describes the old token guard
     # on the publish step will skip the upload if the secret is unset.
     inputs:
       override_version:
@@ -54,17 +56,39 @@ jobs:
   publish-npm:
     name: publish @packet-net/ax25 to npmjs.com
     needs: resolve-version
-    runs-on: [self-hosted, Linux, X64]
+    # DELIBERATE EXCEPTION to the self-hosted-only rule, and the only one here.
+    # npm REFUSES a provenance attestation built anywhere else: "Unsupported
+    # GitHub Actions runner environment: self-hosted. Only github-hosted runners
+    # are supported when publishing with provenance" (E422 on PUT). Trusted
+    # publishing generates provenance by default, so the choice is a hosted
+    # runner or no attestation. Same call as packet-net/ax25sdl#84. Every other
+    # job here stays on [self-hosted, Linux, X64]; this one runs on release tags
+    # only and is a install/build/publish, so it costs almost no minutes.
+    runs-on: ubuntu-latest
+    # Trusted publishing (OIDC), configured at the npmjs end against
+    # packet-net/ax25-ts + this workflow file, so the runner mints a short-lived
+    # id-token per run and there is no long-lived NPM_TOKEN left to expire.
+    # `id-token: write` is what permits that, and what lets npm attach the
+    # provenance attestation.
+    permissions:
+      contents: read
+      id-token: write
     env:
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
       VERSION: ${{ needs.resolve-version.outputs.version }}
     steps:
       - uses: actions/checkout@v6
 
       - uses: actions/setup-node@v6
         with:
-          node-version: '22'
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org/'
+
+      - name: ensure an npm that speaks trusted publishing
+        # Trusted publishing needs npm >= 11.5.1. Pin the CLI forward rather
+        # than inheriting whatever the node image happens to bundle.
+        run: |
+          npm install -g npm@latest
+          npm --version
 
       - name: pin version from tag
         run: |
@@ -80,12 +104,4 @@ jobs:
         run: npm pack --dry-run
 
       - name: publish
-        if: env.NPM_TOKEN != ''
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --access public
-
-      - name: warn if NPM_TOKEN missing
-        if: env.NPM_TOKEN == ''
-        run: |
-          echo "::warning::NPM_TOKEN secret is not set — npm publish was skipped."
