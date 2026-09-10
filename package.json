@@ -4,11 +4,11 @@
   "description": "Browser-targeted TypeScript library for AX.25 v2.2 connected-mode sessions over Web Serial KISS modems.",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/M0LTE/ax25-ts.git"
+    "url": "git+https://github.com/packet-net/ax25-ts.git"
   },
-  "homepage": "https://github.com/M0LTE/ax25-ts#readme",
+  "homepage": "https://github.com/packet-net/ax25-ts#readme",
   "bugs": {
-    "url": "https://github.com/M0LTE/ax25-ts/issues"
+    "url": "https://github.com/packet-net/ax25-ts/issues"
   },
   "sideEffects": false,
   "engines": {
