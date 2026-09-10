@@ -4,7 +4,8 @@
  *   1. figc4.7 `Invoke_Retransmission` (timeout-driven go-back-N) — the loop
  *      body verbs `X := V(s)` / `V(s) := N(r)` and the `vs_eq_X` loop
  *      terminator.
- *   2. `ax25Spec40DiscardOutOfWindowIFrames` — receive-window discard guard.
+ *   2. `vr_lt_ns_lt_vr_plus_k` — the receive-window guard figc4.4/figc4.5
+ *      now draw themselves (ax25spec#40); was the ax25Spec40 quirk.
  *   3. `ax25Spec41KarnSrtSampling` — Karn's-algorithm SRT-sample gate.
  *   4. `ax25Spec42SrejTargetsGap` — retarget the SREJ to the missing gap.
  *   5. `ax25Spec47TimerRecoveryDrainAdvancesVR` — figc4.5 stored-frame drain
@@ -208,88 +209,101 @@ describe("ax25Spec42SrejTargetsGap quirk (packet.net#246)", () => {
   });
 });
 
-describe("ax25Spec40DiscardOutOfWindowIFrames quirk (packet.net#242)", () => {
-  // The guard ORs an out-of-window N(S) into `reject_exception`, scoped to an
-  // I_received trigger. Exercise the binding directly.
-  function rejectExceptionUnder(
-    quirkOn: boolean,
+describe("vr_lt_ns_lt_vr_plus_k receive-window guard (ax25spec#40)", () => {
+  // figc4.4 and figc4.5 draw this as a decision on the out-of-sequence arm
+  // since Packet.Ax25.Sdl 0.11.0, so it is bound as an atom rather than OR'd
+  // into `reject_exception` by the quirk that used to stand in for it. That
+  // means it holds under the strictly-faithful preset too, which the last case
+  // here is the point of.
+  function inWindowUnder(
+    quirks: "default" | "strictlyFaithful",
     event: Ax25Event,
     setup: (ctx: Ax25SessionContext) => void,
   ): boolean {
     const local = Callsign.parse("M0LTEA");
     const remote = Callsign.parse("M0LTEB");
     const ctx = createSessionContext(local, remote);
-    ctx.quirks = quirkOn
-      ? { ...defaultSessionQuirks }
-      : { ...strictlyFaithfulSessionQuirks };
+    ctx.quirks =
+      quirks === "default"
+        ? { ...defaultSessionQuirks }
+        : { ...strictlyFaithfulSessionQuirks };
     setup(ctx);
     const bindings = createSessionBindings(
       ctx,
       new RealTimerScheduler(),
       () => event,
     );
-    return bindings.get("reject_exception")!();
+    return bindings.get("vr_lt_ns_lt_vr_plus_k")!();
   }
 
-  it("on: an in-window I-frame does NOT trip reject_exception", () => {
+  it("an in-window out-of-sequence I-frame reads as in window (a real gap, SREJ/REJ it)", () => {
     const local = Callsign.parse("M0LTEA");
     const remote = Callsign.parse("M0LTEB");
-    // V(r)=0, k=4: N(s)=2 is inside [0,4). Window guard quiet.
-    const r = rejectExceptionUnder(true, iReceived(local, remote, 2, 0), (ctx) => {
+    // V(r)=0, k=4: N(s)=2 is inside the open interval (0, 4).
+    const r = inWindowUnder("default", iReceived(local, remote, 2, 0), (ctx) => {
+      ctx.vr = 0;
+      ctx.k = 4;
+    });
+    expect(r).toBe(true);
+  });
+
+  it("a duplicate behind V(r) reads as out of window (discard, raise nothing)", () => {
+    const local = Callsign.parse("M0LTEA");
+    const remote = Callsign.parse("M0LTEB");
+    // V(r)=2, k=4: N(s)=7 is offset (7-2) mod 8 = 5, past the granted window.
+    const r = inWindowUnder("default", iReceived(local, remote, 7, 0), (ctx) => {
+      ctx.vr = 2;
+      ctx.k = 4;
+    });
+    expect(r).toBe(false);
+  });
+
+  it("V(r)+k itself is out of window (the interval is open at the top)", () => {
+    const local = Callsign.parse("M0LTEA");
+    const remote = Callsign.parse("M0LTEB");
+    // V(r)=0, k=4: N(s)=4 is the first sequence number past the window.
+    const r = inWindowUnder("default", iReceived(local, remote, 4, 0), (ctx) => {
       ctx.vr = 0;
       ctx.k = 4;
     });
     expect(r).toBe(false);
   });
 
-  it("on: an out-of-window (duplicate-behind-V(r)) I-frame trips reject_exception → discard path", () => {
+  it("reads the effective window, not the raw k (the SREJ half-modulus clamp)", () => {
     const local = Callsign.parse("M0LTEA");
     const remote = Callsign.parse("M0LTEB");
-    // V(r)=2, k=4: N(s)=7 is offset (7-2) mod 8 = 5 ≥ k=4 → out of window.
-    // (A stale duplicate behind V(r) lands the same way under mod arithmetic.)
-    const r = rejectExceptionUnder(true, iReceived(local, remote, 7, 0), (ctx) => {
-      ctx.vr = 2;
-      ctx.k = 4;
+    // k=7 but SREJ clamps the granted window to 4 at mod-8, so N(s)=5 is
+    // inside the configured k and outside what this receiver actually granted.
+    const r = inWindowUnder("default", iReceived(local, remote, 5, 0), (ctx) => {
+      ctx.vr = 0;
+      ctx.k = 7;
+      ctx.srejEnabled = true;
     });
-    expect(r).toBe(true);
+    expect(r).toBe(false);
   });
 
-  it("off (strictly faithful): out-of-window I-frame does NOT trip reject_exception (figure as drawn → SREJ/REJ)", () => {
+  it("holds under the strictly-faithful preset (it is the figure now, not a quirk)", () => {
     const local = Callsign.parse("M0LTEA");
     const remote = Callsign.parse("M0LTEB");
-    const r = rejectExceptionUnder(false, iReceived(local, remote, 7, 0), (ctx) => {
+    const r = inWindowUnder("strictlyFaithful", iReceived(local, remote, 7, 0), (ctx) => {
       ctx.vr = 2;
       ctx.k = 4;
     });
     expect(r).toBe(false);
   });
 
-  it("on: the guard is inert on a non-I_received trigger even if N(s)-bits are out of window", () => {
+  it("is inert on a non-I_received trigger", () => {
     const local = Callsign.parse("M0LTEA");
     const remote = Callsign.parse("M0LTEB");
-    // RR_received carrying a control byte whose N(s)-position bits would be
-    // out-of-window — must be ignored because the guard is I_received-scoped.
     const ev: Ax25Event = {
       name: "RR_received",
-      frame: iFrame({ destination: local, source: remote, ns: 7, nr: 0, info: new Uint8Array([1]), pid: PID }),
+      frame: rr({ destination: local, source: remote, nr: 0, command: true, pollFinal: false }),
     };
-    const r = rejectExceptionUnder(true, ev, (ctx) => {
+    const r = inWindowUnder("default", ev, (ctx) => {
       ctx.vr = 2;
       ctx.k = 4;
     });
     expect(r).toBe(false);
-  });
-
-  it("on: the base reject_exception flag still reads through when set", () => {
-    const local = Callsign.parse("M0LTEA");
-    const remote = Callsign.parse("M0LTEB");
-    // In-window frame, but the flag is already set — OR must keep it true.
-    const r = rejectExceptionUnder(true, iReceived(local, remote, 1, 0), (ctx) => {
-      ctx.vr = 0;
-      ctx.k = 4;
-      ctx.rejectException = true;
-    });
-    expect(r).toBe(true);
   });
 });
 

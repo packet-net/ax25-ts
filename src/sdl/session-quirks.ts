@@ -107,35 +107,6 @@ export interface Ax25SessionQuirks {
    */
   srejCommandIgnored: boolean;
 
-  /**
-   * Work around `packethacking/ax25spec#40`: figc4.4's out-of-sequence
-   * `I_received` handling has no receive-window guard. Any frame whose
-   * N(S) ≠ V(R) is treated as a future gap and gets SREJ'd (or REJ'd) —
-   * including a *duplicate* whose N(S) lies behind V(R), a frame the
-   * receiver has already delivered. AX.25 inherits its sequencing from
-   * ITU-T X.25 §2.4.6.4, which *discards* any I-frame whose N(S) falls
-   * outside the receive window [V(R), V(R)+k) rather than rejecting it.
-   * Without that guard a duplicate provokes an SREJ, the sender re-sends,
-   * the re-send is again out-of-window, provokes another SREJ … a livelock
-   * that never converges under multi-frame selective-reject recovery.
-   *
-   * When `true` (default), an I-frame whose N(S) is outside the receive
-   * window is routed to figc4.4's own discard path (the
-   * `reject_exception:Yes` branch — process the acknowledgement, discard
-   * the data, respond RR(V(R)) only if P=1) instead of the SREJ/REJ path.
-   * The window predicate is OR'd into the figure's `reject_exception`
-   * decision — the exact point where the figure already chooses
-   * discard-over-reject — so no new transition or per-action rewrite is
-   * needed, and the fix covers both the SREJ and REJ out-of-sequence
-   * branches (the decision precedes the `srej_enabled` split). When
-   * `false`, the figure runs as drawn (out-of-window frames are SREJ'd,
-   * reproducing the livelock for strict conformance study). Delete once
-   * `ax25sdl` ships a figc4.4 carrying the upstream window guard.
-   *
-   * Mirrors `Ax25SessionQuirks.Ax25Spec40DiscardOutOfWindowIFrames` in
-   * m0lte/packet.net (PR #242).
-   */
-  ax25Spec40DiscardOutOfWindowIFrames: boolean;
 
   /**
    * Work around `packethacking/ax25spec#41`: figc4.7 `Select_T1_Value`
@@ -431,7 +402,7 @@ export interface Ax25SessionQuirks {
    * When `true` (default), {@link effectiveWindow} caps the outstanding-I-frame
    * window at `modulus/2` whenever {@link Ax25SessionContext.srejEnabled} is set
    * — both the `vs_eq_va_plus_k` guard / the I-frame-queue drain (send side) AND
-   * the ax25Spec40 out-of-window discard (receive side) honour the cap, so no
+   * the `vr_lt_ns_lt_vr_plus_k` receive-window guard honour the cap, so no
    * more than `modulus/2` frames are ever outstanding/accepted and two in-flight
    * frames can never share an N(S). A configured `k` above the cap runs at the
    * safe window while SREJ is in effect (the configured value is untouched and
@@ -452,7 +423,6 @@ export interface Ax25SessionQuirks {
 export const defaultSessionQuirks: Ax25SessionQuirks = {
   segmentFirstCarriesL3Pid: true,
   srejCommandIgnored: true,
-  ax25Spec40DiscardOutOfWindowIFrames: true,
   ax25Spec41KarnSrtSampling: true,
   ax25Spec42SrejTargetsGap: true,
   ax25Spec43DlFlowOffEntersBusy: true,
@@ -473,7 +443,6 @@ export const defaultSessionQuirks: Ax25SessionQuirks = {
 export const strictlyFaithfulSessionQuirks: Ax25SessionQuirks = {
   segmentFirstCarriesL3Pid: false,
   srejCommandIgnored: false,
-  ax25Spec40DiscardOutOfWindowIFrames: false,
   ax25Spec41KarnSrtSampling: false,
   ax25Spec42SrejTargetsGap: false,
   ax25Spec43DlFlowOffEntersBusy: false,

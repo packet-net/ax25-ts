@@ -10,17 +10,19 @@
  *
  * The recovery logic in `src/sdl/session-bindings.ts` is already mod-aware:
  * every sequence computation reads `modulus(context)` (8 or 128) and is done
- * `% m` (the `V_s_eq_V_a_plus_k` send-window check, the `ax25Spec40`
- * out-of-window discard guard, the `ns_eq_vr` / `nr_in_window` /
+ * `% m` (the `V_s_eq_V_a_plus_k` send-window check, the
+ * `vr_lt_ns_lt_vr_plus_k` receive-window guard, the `ns_eq_vr` / `nr_in_window` /
  * `ns_gt_vr_plus_1` comparisons), and the frame's `getNs` / `getNr` read 7-bit
  * values on extended frames (v2.2 arc V1). So SREJ/REJ recovery works at
  * modulo-128 with NO recovery-path code change — these tests prove it and stand
  * as the regression guard, exactly as on the C# side.
  *
- * The three SREJ figc4.x quirks (`ax25Spec40` out-of-window discard,
- * `ax25Spec41` Karn SRT sampling, `ax25Spec42` SREJ-targets-gap) are on by
- * default in `TwoStationHarness.build`, so the burst / window-wrap selective-
- * recovery cases below exercise them at mod-128 too.
+ * The two remaining SREJ figc4.x quirks (`ax25Spec41` Karn SRT sampling,
+ * `ax25Spec42` SREJ-targets-gap) are on by default in
+ * `TwoStationHarness.build`, so the burst / window-wrap selective-recovery
+ * cases below exercise them at mod-128 too. The out-of-window discard that was
+ * the third of them is drawn in figc4.4/figc4.5 themselves since ax25spec#40,
+ * so it applies under the strictly-faithful preset as well.
  */
 import { describe, expect, it } from "vitest";
 import { classify, getNs, type Ax25Frame } from "../../src/frame.js";

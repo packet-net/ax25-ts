@@ -51,7 +51,8 @@
  *     harness drives k>1, but `stack.connect` leaves it at the default 4)
  *   ✓ REJ + SREJ loss recovery — go-back-N (`Invoke_Retransmission`) and
  *     single-frame selective reject over a real SREJ frame on the wire,
- *     with the SREJ recovery quirks (ax25Spec40/41/42); see the
+ *     with the SREJ recovery quirks (ax25Spec41/42) and the figure's own
+ *     out-of-window discard guard (ax25spec#40); see the
  *     loss-recovery conformance suite
  *   ✗ Full figc4.7 subroutine framework (the dispatcher inlines the
  *     subset the happy path needs; the rest route through the registry

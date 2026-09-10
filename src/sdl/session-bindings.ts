@@ -42,22 +42,21 @@ import type { TimerScheduler } from "./timer-scheduler.js";
  * the MDL driver via its `extraBindings`, not here — it reads the MDL context's
  * NM201, which the data-link session has no view of.
  */
+/**
+ * Every guard atom the data-link session is responsible for binding: the whole
+ * closed set except `RC_eq_NM201`, which belongs to the MDL driver. Excluding
+ * it by type rather than by convention is what lets the table below be checked
+ * for completeness at compile time.
+ */
+type SessionBoundGuard = Exclude<Ax25Guard, "RC_eq_NM201">;
+
 export function createSessionBindings(
   context: Ax25SessionContext,
   scheduler: TimerScheduler,
   currentTrigger: () => Ax25Event | null,
 ): GuardBindings {
-  const bindings = new Map<Ax25Guard, () => boolean>();
 
   // ─── Flags (§C4.3) ──────────────────────────────────────────────────
-  bindings.set("own_receiver_busy", () => context.ownReceiverBusy);
-  bindings.set("peer_receiver_busy", () => context.peerReceiverBusy);
-  bindings.set("ack_pending", () => context.acknowledgePending);
-  bindings.set("reject_exception", () => context.rejectException);
-  bindings.set("layer_3_initiated", () => context.layer3Initiated);
-  bindings.set("SREJ_enabled", () => context.srejEnabled);
-  bindings.set("version_2_2", () => context.isExtended);
-  bindings.set("sreject_exception_gt_0", () => context.srejExceptionCount > 0);
 
   // ─── Node policy ─────────────────────────────────────────────────────
   // "Able to establish?" — defer to station policy; default reads
@@ -68,42 +67,19 @@ export function createSessionBindings(
   // emits DM. Override the entry in the returned map before handing it
   // to GuardEvaluator if you need finer-grained acceptance control
   // (callsign allow-list, channel busy, resource limits).
-  bindings.set("able_to_establish", () => context.acceptIncoming);
 
   // ─── Sequence-variable comparisons (mod-aware) ──────────────────────
-  bindings.set("vs_eq_va", () => context.vs === context.va);
-  bindings.set("vs_eq_va_plus_k", () => {
-    const m = ctxModulus(context);
-    return ((context.vs - context.va + m) % m) >= effectiveWindow(context);
-  });
 
   // ─── Timer state ────────────────────────────────────────────────────
-  bindings.set("T1_running", () => scheduler.isRunning("T1"));
 
   // ─── Retry-counter comparison ──────────────────────────────────────
-  bindings.set("RC_eq_N2", () => context.rc === context.n2);
-  bindings.set("RC_eq_0", () => context.rc === 0);
 
   // ─── Queue / storage state ─────────────────────────────────────────
-  bindings.set("vr_I_frame_stored", () =>
-    context.storedReceivedIFrames.has(context.vr),
-  );
 
   // ─── figc4.7 subroutine predicates ─────────────────────────────────
-  bindings.set("mod_128", () => context.isExtended);
-  bindings.set("mod_8", () => !context.isExtended);
-  bindings.set("T1_expired", () => context.t1HadExpired);
-  bindings.set(
-    "out_of_sequence_frames_in_receive_buffer",
-    () => context.storedReceivedIFrames.size > 0,
-  );
   // Invoke_Retransmission loop terminator: V(s) caught up to its
   // saved-on-entry value X. Returns false if X hasn't been set (i.e. we're not
   // inside an Invoke_Retransmission call).
-  bindings.set(
-    "vs_eq_X",
-    () => context.x !== null && context.vs === context.x,
-  );
 
   // ─── Frame-aware predicates ─────────────────────────────────────────
   // These all read off the current trigger's attached frame. When the
@@ -122,119 +98,148 @@ export function createSessionBindings(
     return f !== null && frameIsCommand(f);
   };
 
-  bindings.set("P_eq_1", incomingPollFinal);
-  bindings.set("F_eq_1", incomingPollFinal);
-  bindings.set("P_or_F_eq_1", incomingPollFinal);
-  bindings.set("command", incomingCommand);
-  bindings.set("response", () => {
-    const f = getFrame();
-    return f !== null && frameIsResponse(f);
-  });
 
-  bindings.set("ns_eq_vr", () => {
-    const f = getFrame();
-    if (f === null) return false;
-    return getNs(f) === context.vr;
-  });
-  bindings.set("ns_gt_vr_plus_1", () => {
-    const f = getFrame();
-    if (f === null) return false;
-    const m = ctxModulus(context);
-    const diff = (getNs(f) - context.vr + m) % m;
-    return diff > 1;
-  });
+  // `vr_lt_ns_lt_vr_plus_k` - is the out-of-sequence I frame's N(s) inside the
+  // receive window this station granted? The figure draws the open interval
+  // V(r) < N(s) < V(r)+k (packethacking/ax25spec#40, matching X.25 2.4.6.4(b)),
+  // so an N(s) outside it is a duplicate of a frame already received and
+  // acknowledged, and the No arm discards it. effectiveWindow, not context.k:
+  // it carries the ax25spec#13 SREJ half-modulus clamp and is what we granted.
 
   // `va_le_nr_le_vs` — incoming N(R) lies in [V(a), V(s)] (inclusive in mod-N
   // arithmetic).
-  bindings.set("va_le_nr_le_vs", () => {
-    const f = getFrame();
-    if (f === null) return false;
-    const m = ctxModulus(context);
-    const span = (context.vs - context.va + m) % m;
-    const nrDelta = (getNr(f) - context.va + m) % m;
-    return nrDelta <= span;
-  });
 
   // `info_field_length_le_N1_and_content_is_octet_aligned` — heuristic:
   // info-field present and within ctx.n1.
-  bindings.set("info_field_length_le_N1_and_content_is_octet_aligned", () => {
-    const f = getFrame();
-    if (f === null) return false;
-    return f.info.length <= context.n1;
-  });
 
   // N(r) comparisons for Check_I_Frame_Acknowledged.
-  bindings.set("nr_eq_vs", () => {
-    const f = getFrame();
-    if (f === null) return false;
-    return getNr(f) === context.vs;
-  });
   // ax25sdl#53: the figc4.5 recovery-complete decision is drawn after
   // "V(a) := N(r)", so it tests V(s) == N(r); the table emits the
   // post-assignment guard vs_eq_nr — the same comparison as nr_eq_vs.
-  bindings.set("vs_eq_nr", () => {
-    const f = getFrame();
-    if (f === null) return false;
-    return context.vs === getNr(f);
-  });
-  bindings.set("nr_eq_va", () => {
-    const f = getFrame();
-    if (f === null) return false;
-    return getNr(f) === context.va;
-  });
 
   // Compound flags for Check_Need_For_Response.
-  bindings.set("command_and_P_eq_1", () => {
-    const f = getFrame();
-    return f !== null && frameIsCommand(f) && pollFinal(f);
-  });
-  bindings.set("response_and_F_eq_1", () => {
-    const f = getFrame();
-    return f !== null && frameIsResponse(f) && pollFinal(f);
-  });
 
   // Enquiry_Response's compound: F=1 AND the triggering frame is an
   // RR / RNR / I (a poll-able shape). REJ/SREJ excluded per the figure.
-  bindings.set("F_eq_1_and_frame_eq_RR_or_frame_eq_RNR_or_frame_eq_I", () => {
-    const f = getFrame();
-    if (f === null || !pollFinal(f)) return false;
-    const ctrl = f.control;
-    const isI = (ctrl & 0x01) === 0;
-    const sBase = ctrl & 0x0f;
-    const isRR = sBase === 0x01;
-    const isRNR = sBase === 0x05;
-    return isI || isRR || isRNR;
-  });
 
-  // ─── ax25spec#40 receive-window discard guard ──────────────────────
-  // figc4.4's out-of-sequence I_received path has no window guard: any
-  // N(S) ≠ V(R) is SREJ'd/REJ'd, including a duplicate behind V(R) — which
-  // provokes a re-send that's again out-of-window, ad infinitum (the SREJ
-  // livelock). X.25 §2.4.6.4 discards any frame whose N(S) is outside the
-  // receive window [V(r), V(r)+k). The figure's `reject_exception` decision
-  // IS its discard-vs-reject switch in that region, so we OR the
-  // out-of-window condition into it (when ax25Spec40DiscardOutOfWindowIFrames
-  // is on): such a frame takes the figure's own discard path (process ack,
-  // discard data, RR(V(r)) only if P=1) ahead of the srej_enabled split,
-  // covering both REJ and SREJ modes. Scoped to the I_received trigger via the
-  // helper, so it's inert on every other trigger. See Ax25SessionQuirks.
-  // Mirrors the ax25spec#40 block in Ax25SessionBindings.cs (PR #242).
-  if (context.quirks.ax25Spec40DiscardOutOfWindowIFrames) {
-    const iFrameOutOfWindow = (): boolean => {
-      const trigger = currentTrigger();
-      if (trigger === null || trigger.name !== "I_received") return false;
-      const f = trigger.frame;
-      if (f == null) return false;
+  // The binding table is an object literal typed as a Record over the closed
+  // set, NOT an incrementally-built Map. That is deliberate: a Map built by
+  // .set() type-checks its keys but has no completeness check, so a new atom
+  // arriving in the Ax25Guard union upstream compiles clean here and then
+  // throws GuardEvaluationError the first time the new decision is reached -
+  // on air, on a real link. As a Record it is a compile error instead, which
+  // is the same gate C# gets from its exhaustive switch (CS8509) and Rust from
+  // its catch-all-free match. Found the hard way: ax25spec#40 added
+  // vr_lt_ns_lt_vr_plus_k and this leg was the only one of the three that
+  // would have shipped the gap silently.
+  //
+  // RC_eq_NM201 is excluded by type: the MDL driver supplies it via
+  // extraBindings, since it reads an NM201 the data-link session cannot see.
+  const table: Record<SessionBoundGuard, () => boolean> = {
+    "own_receiver_busy": () => context.ownReceiverBusy,
+    "peer_receiver_busy": () => context.peerReceiverBusy,
+    "ack_pending": () => context.acknowledgePending,
+    "reject_exception": () => context.rejectException,
+    "layer_3_initiated": () => context.layer3Initiated,
+    "SREJ_enabled": () => context.srejEnabled,
+    "version_2_2": () => context.isExtended,
+    "sreject_exception_gt_0": () => context.srejExceptionCount > 0,
+    "able_to_establish": () => context.acceptIncoming,
+    "vs_eq_va": () => context.vs === context.va,
+    "vs_eq_va_plus_k": () => {
+      const m = ctxModulus(context);
+      return ((context.vs - context.va + m) % m) >= effectiveWindow(context);
+    },
+    "T1_running": () => scheduler.isRunning("T1"),
+    "RC_eq_N2": () => context.rc === context.n2,
+    "RC_eq_0": () => context.rc === 0,
+    "vr_I_frame_stored": () =>
+      context.storedReceivedIFrames.has(context.vr),
+    "mod_128": () => context.isExtended,
+    "mod_8": () => !context.isExtended,
+    "T1_expired": () => context.t1HadExpired,
+    "out_of_sequence_frames_in_receive_buffer": () => context.storedReceivedIFrames.size > 0,
+    "vs_eq_X": () => context.x !== null && context.vs === context.x,
+    "P_eq_1": incomingPollFinal,
+    "F_eq_1": incomingPollFinal,
+    "P_or_F_eq_1": incomingPollFinal,
+    "command": incomingCommand,
+    "response": () => {
+      const f = getFrame();
+      return f !== null && frameIsResponse(f);
+    },
+    "ns_eq_vr": () => {
+      const f = getFrame();
+      if (f === null) return false;
+      return getNs(f) === context.vr;
+    },
+    "ns_gt_vr_plus_1": () => {
+      const f = getFrame();
+      if (f === null) return false;
+      const m = ctxModulus(context);
+      const diff = (getNs(f) - context.vr + m) % m;
+      return diff > 1;
+    },
+    "vr_lt_ns_lt_vr_plus_k": () => {
+      const f = getFrame();
+      if (f === null) return false;
       const m = ctxModulus(context);
       const offset = (getNs(f) - context.vr + m) % m;
-      return offset >= effectiveWindow(context); // N(S) outside [V(r), V(r)+effective k)
-    };
-    const baseRejectException = bindings.get("reject_exception")!;
-    bindings.set(
-      "reject_exception",
-      () => baseRejectException() || iFrameOutOfWindow(),
-    );
-  }
+      return offset > 0 && offset < effectiveWindow(context);
+    },
+    "va_le_nr_le_vs": () => {
+      const f = getFrame();
+      if (f === null) return false;
+      const m = ctxModulus(context);
+      const span = (context.vs - context.va + m) % m;
+      const nrDelta = (getNr(f) - context.va + m) % m;
+      return nrDelta <= span;
+    },
+    "info_field_length_le_N1_and_content_is_octet_aligned": () => {
+      const f = getFrame();
+      if (f === null) return false;
+      return f.info.length <= context.n1;
+    },
+    "nr_eq_vs": () => {
+      const f = getFrame();
+      if (f === null) return false;
+      return getNr(f) === context.vs;
+    },
+    "vs_eq_nr": () => {
+      const f = getFrame();
+      if (f === null) return false;
+      return context.vs === getNr(f);
+    },
+    "nr_eq_va": () => {
+      const f = getFrame();
+      if (f === null) return false;
+      return getNr(f) === context.va;
+    },
+    "command_and_P_eq_1": () => {
+      const f = getFrame();
+      return f !== null && frameIsCommand(f) && pollFinal(f);
+    },
+    "response_and_F_eq_1": () => {
+      const f = getFrame();
+      return f !== null && frameIsResponse(f) && pollFinal(f);
+    },
+    "F_eq_1_and_frame_eq_RR_or_frame_eq_RNR_or_frame_eq_I": () => {
+      const f = getFrame();
+      if (f === null || !pollFinal(f)) return false;
+      const ctrl = f.control;
+      const isI = (ctrl & 0x01) === 0;
+      const sBase = ctrl & 0x0f;
+      const isRR = sBase === 0x01;
+      const isRNR = sBase === 0x05;
+      return isI || isRR || isRNR;
+    },
+  };
+
+  // Mutable here so the trigger-scoped quirk below can wrap an entry; the
+  // return type widens it back to the ReadonlyMap callers see.
+  const bindings = new Map<Ax25Guard, () => boolean>(
+    Object.entries(table) as [Ax25Guard, () => boolean][],
+  );
 
   // ax25spec#43: figc4.4 gates DL-FLOW-OFF's Set-Own-Receiver-Busy/RNR actions on
   // the own_receiver_busy=Yes branch, so a not-busy station receiving DL-FLOW-OFF
