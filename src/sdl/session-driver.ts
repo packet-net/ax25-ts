@@ -448,7 +448,7 @@ export class SdlSessionDriver {
    * the figc4.6 FRMR fallback (t14) — which forces version 2.0, clearing
    * `isExtended` — routes to `AwaitingConnection` untouched, so the redirect is
    * self-consistent with the fallback (a later connect from that mod-8 state
-   * stays mod-8). Unlike the guard-rewriting quirks (ax25Spec40/42/43) this
+   * stays mod-8). Unlike the guard-rewriting quirks (ax25Spec42/43) this
    * rewrites a transition's *target state*. Mirrors the C#
    * `Ax25Session.ResolveNextState` (m0lte/packet.net #268).
    */
