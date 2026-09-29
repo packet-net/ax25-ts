@@ -1,5 +1,5 @@
 /**
- * `repeatedConnectUaIgnored` - the TS parity leg of packet.net's
+ * `ax25Spec114RepeatedConnectUaIgnored` - the TS parity leg of packet.net's
  * `Ax25ListenerRepeatedConnectUaTests` (packet-net/packet.net#842). The UA that
  * answers a dial, delivered twice: LinBPQ with two AXIP `MAP` lines for one
  * address sends every frame once per line. The first UA connects the link;
@@ -7,7 +7,7 @@
  * and re-establishes, which BPQ answers with two UAs again, for ever. The quirk
  * drops a UA that is byte for byte the one that just connected the link and is
  * the very next frame the peer sends; anything else is left to the figure.
- * `unexpectedUaIgnored` (packet-net/packet.net#874, on by default) goes further
+ * `ax25Spec114UnexpectedUaIgnored` (packet-net/packet.net#874, on by default) goes further
  * and drops every UA on an up link, so the shapes the narrow quirk leaves to
  * the figure are dropped by default and reset only with that quirk off.
  */
@@ -79,7 +79,7 @@ async function dial(
   return { listener, transport, connecting };
 }
 
-describe("repeatedConnectUaIgnored", () => {
+describe("ax25Spec114RepeatedConnectUaIgnored", () => {
   it.each([
     [false, 2],
     [false, 3],
@@ -118,9 +118,9 @@ describe("repeatedConnectUaIgnored", () => {
     await listener.dispose();
   });
 
-  it("with unexpectedUaIgnored off, repeatedConnectUaIgnored alone still absorbs a doubled connecting UA", async () => {
+  it("with ax25Spec114UnexpectedUaIgnored off, ax25Spec114RepeatedConnectUaIgnored alone still absorbs a doubled connecting UA", async () => {
     const { listener, transport, connecting } = await dial(
-      { ...defaultSessionQuirks, unexpectedUaIgnored: false },
+      { ...defaultSessionQuirks, ax25Spec114UnexpectedUaIgnored: false },
       false,
     );
     const connectingUa = ua({ destination: Local, source: Peer, finalBit: true });
@@ -138,7 +138,7 @@ describe("repeatedConnectUaIgnored", () => {
 
   // Two shapes the narrow quirk leaves to the figure: a UA after other traffic
   // from the peer, and a UA that differs from the connecting one (F=0).
-  // unexpectedUaIgnored (packet-net/packet.net#874) drops both.
+  // ax25Spec114UnexpectedUaIgnored (packet-net/packet.net#874) drops both.
   const lateUaShapes: [string, (transport: LoopbackTransport) => void][] = [
     [
       "a UA after other traffic from the peer",
@@ -174,10 +174,10 @@ describe("repeatedConnectUaIgnored", () => {
   });
 
   it.each(lateUaShapes)(
-    "%s still resets the link with unexpectedUaIgnored off",
+    "%s still resets the link with ax25Spec114UnexpectedUaIgnored off",
     async (_shape, inject) => {
       const { listener, transport, connecting } = await dial(
-        { ...defaultSessionQuirks, unexpectedUaIgnored: false },
+        { ...defaultSessionQuirks, ax25Spec114UnexpectedUaIgnored: false },
         false,
       );
       transport.injectInbound(ua({ destination: Local, source: Peer, finalBit: true }));

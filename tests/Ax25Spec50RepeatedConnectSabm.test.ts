@@ -1,5 +1,5 @@
 /**
- * `repeatedConnectSabmReacknowledged` - the TS parity leg of packet.net's
+ * `ax25Spec50RepeatedConnectSabmReacknowledged` - the TS parity leg of packet.net's
  * `Ax25ListenerRepeatedConnectSabmTests` (packet-net/packet.net#856). A peer
  * that sent SABM(E) and lost our UA sends it again on T1 (§6.3.1). If we are
  * connected by then, and may have sent data, figc4.4 reads the copy as the §6.5
@@ -88,7 +88,7 @@ async function answeredCall(t1Ms?: number): Promise<{
   return { listener, transport, session: accepted as unknown as Ax25ListenerSession };
 }
 
-describe("repeatedConnectSabmReacknowledged", () => {
+describe("ax25Spec50RepeatedConnectSabmReacknowledged", () => {
   it("a repeat of the crossing SABME is answered again and the data sent meanwhile stays queued", async () => {
     const { listener, transport, session } = await crossingDial(defaultSessionQuirks);
     const signals = watch(session);
@@ -106,7 +106,7 @@ describe("repeatedConnectSabmReacknowledged", () => {
   it("with the quirk off the repeat resets as the figure draws and the data is discarded", async () => {
     const { listener, transport, session } = await crossingDial({
       ...defaultSessionQuirks,
-      repeatedConnectSabmReacknowledged: false,
+      ax25Spec50RepeatedConnectSabmReacknowledged: false,
     });
     const signals = watch(session);
     listener.sendData(session, new TextEncoder().encode("exchange\r"));
@@ -130,7 +130,7 @@ describe("repeatedConnectSabmReacknowledged", () => {
     await listener.dispose();
   });
 
-  it("with repeatedConnectUaIgnored, a doubled connecting UA and a doubled SABME retry are both absorbed", async () => {
+  it("with ax25Spec114RepeatedConnectUaIgnored, a doubled connecting UA and a doubled SABME retry are both absorbed", async () => {
     // A path that delivers every frame twice (LinBPQ with two MAP lines):
     // neither quirk's window closes the other's.
     const transport = new LoopbackTransport();

@@ -1,5 +1,5 @@
 /**
- * `unexpectedUaIgnored` - the shape of packet-net/packet.net#874 at the
+ * `ax25Spec114UnexpectedUaIgnored` - the shape of packet-net/packet.net#874 at the
  * session level. Two stations dial each other at once. Our v2.2 dial's T1 runs
  * out once, so two SABMEs are on the wire; the peer's own SABME crosses ours
  * and we answer it with UA; the peer's UA to our first SABME connects us; data
@@ -82,7 +82,7 @@ async function crossedDialCarryingTraffic(quirks: Ax25SessionQuirks): Promise<{
   return { listener, transport, session, signals, received };
 }
 
-describe("unexpectedUaIgnored", () => {
+describe("ax25Spec114UnexpectedUaIgnored", () => {
   it("the UA answering our dial's T1 retry is dropped on a link carrying traffic", async () => {
     const { listener, transport, session, signals, received } =
       await crossedDialCarryingTraffic(defaultSessionQuirks);
@@ -104,7 +104,7 @@ describe("unexpectedUaIgnored", () => {
   it("with the quirk off the late UA resets the link as the figure draws", async () => {
     const { listener, transport, signals } = await crossedDialCarryingTraffic({
       ...defaultSessionQuirks,
-      unexpectedUaIgnored: false,
+      ax25Spec114UnexpectedUaIgnored: false,
     });
     const sabmesBefore = sent(transport).filter(isSabme).length;
 
@@ -135,8 +135,8 @@ describe("unexpectedUaIgnored", () => {
     await listener.dispose();
   });
   // packet-net/packet.net#877 review: a peer that follows the figures as
-  // drawn (direwolf, rax25, the Linux kernel; unexpectedUaIgnored,
-  // repeatedConnectUaIgnored and repeatedConnectSabmReacknowledged all off)
+  // drawn (direwolf, rax25, the Linux kernel; ax25Spec114UnexpectedUaIgnored,
+  // ax25Spec114RepeatedConnectUaIgnored and ax25Spec50RepeatedConnectSabmReacknowledged all off)
   // resets on our stale SABM retry, answers UA and sends again from N(S) = 0.
   // The peer is scripted here frame by frame as such a station sends them.
   async function figurePeerResetsOnOurRetry(): Promise<{

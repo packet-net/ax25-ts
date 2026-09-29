@@ -167,8 +167,8 @@ const isXidFromA = (h: TwoStationHarness, f: Ax25Frame): boolean =>
  */
 const figureArmsReachable: Ax25SessionQuirks = {
   ...defaultSessionQuirks,
-  unexpectedUaIgnored: false,
-  repeatedConnectSabmReacknowledged: false,
+  ax25Spec114UnexpectedUaIgnored: false,
+  ax25Spec50RepeatedConnectSabmReacknowledged: false,
 };
 
 /**
