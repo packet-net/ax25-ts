@@ -132,15 +132,21 @@ export interface Ax25SessionQuirks {
    * LinBPQ discards every UA on a link that is up (`L2Code.c` `SDUFRM`:
    * "DISCARD - PROBABLY REPEAT OF ACK OF SABM") and the Linux kernel drops
    * them too; direwolf and rax25 follow the figure, and
-   * {@link unexpectedUaIgnored} (on by default) does the same as LinBPQ,
+   * {@link ax25Spec114UnexpectedUaIgnored} (on by default) does the same as LinBPQ,
    * subsuming this quirk. When `false` ({@link strictlyFaithfulSessionQuirks})
-   * and {@link unexpectedUaIgnored} is off too, every UA in the connected
+   * and {@link ax25Spec114UnexpectedUaIgnored} is off too, every UA in the connected
    * state resets the link as drawn.
    *
-   * Mirrors `Ax25SessionQuirks.RepeatedConnectUaIgnored` in
+   * Named after the spec issue it works around,
+   * [packethacking/ax25spec#114](https://github.com/packethacking/ax25spec/issues/114),
+   * so it can be found and removed once the figure is fixed; packet.net
+   * tracks that removal in packet-net/packet.net#880. Called
+   * `repeatedConnectUaIgnored` before the rename.
+   *
+   * Mirrors `Ax25SessionQuirks.Ax25Spec114RepeatedConnectUaIgnored` in
    * packet-net/packet.net (issue #842).
    */
-  repeatedConnectUaIgnored: boolean;
+  ax25Spec114RepeatedConnectUaIgnored: boolean;
 
   /**
    * Drop every UA received while the link is up (Connected or Timer
@@ -161,12 +167,12 @@ export interface Ax25SessionQuirks {
    * When `true`, a UA received in Connected or Timer Recovery is dropped
    * before dispatch, whatever its F bit and whatever the peer sent before it.
    * Nothing else changes: no signal to layer 3, timers and sequence variables
-   * as they were, and neither the {@link repeatedConnectUaIgnored} nor the
-   * {@link repeatedConnectSabmReacknowledged} window is touched. This is what
+   * as they were, and neither the {@link ax25Spec114RepeatedConnectUaIgnored} nor the
+   * {@link ax25Spec50RepeatedConnectSabmReacknowledged} window is touched. This is what
    * LinBPQ does (`L2Code.c` `SDUFRM`: "DISCARD - PROBABLY REPEAT OF ACK OF
    * SABM") and what the Linux kernel does (`ax25_std_in.c`
    * `ax25_std_state3_machine` has no UA case); direwolf and rax25 follow the
-   * figure. It subsumes {@link repeatedConnectUaIgnored}, which stays for the
+   * figure. It subsumes {@link ax25Spec114RepeatedConnectUaIgnored}, which stays for the
    * narrow case on its own.
    *
    * One thing the UA can mean is kept: a peer that follows the figure resets
@@ -182,12 +188,18 @@ export interface Ax25SessionQuirks {
    * or a retransmission and is left to the figure as such, and an in-sequence
    * frame past 0 shows the peer carried on, which forgets the UA. When `false`
    * ({@link strictlyFaithfulSessionQuirks}), every UA on an up link resets it
-   * as drawn, unless {@link repeatedConnectUaIgnored} absorbs it.
+   * as drawn, unless {@link ax25Spec114RepeatedConnectUaIgnored} absorbs it.
    *
-   * Mirrors `Ax25SessionQuirks.UnexpectedUaIgnored` in packet-net/packet.net
-   * (issue #874).
+   * Named after the spec issue it works around,
+   * [packethacking/ax25spec#114](https://github.com/packethacking/ax25spec/issues/114),
+   * so it can be found and removed once the figure is fixed; packet.net
+   * tracks that removal in packet-net/packet.net#880. Called
+   * `unexpectedUaIgnored` before the rename.
+   *
+   * Mirrors `Ax25SessionQuirks.Ax25Spec114UnexpectedUaIgnored` in
+   * packet-net/packet.net (issue #874).
    */
-  unexpectedUaIgnored: boolean;
+  ax25Spec114UnexpectedUaIgnored: boolean;
 
   /**
    * Answer a repeat of the peer's connecting SABM or SABME with UA again,
@@ -238,10 +250,16 @@ export interface Ax25SessionQuirks {
    * any S frame too. When `false` ({@link strictlyFaithfulSessionQuirks}), the
    * repeat resets the link as drawn.
    *
-   * Mirrors `Ax25SessionQuirks.RepeatedConnectSabmReacknowledged` in
-   * packet-net/packet.net (issues #856 and #874).
+   * Named after the spec issue it works around,
+   * [packethacking/ax25spec#50](https://github.com/packethacking/ax25spec/issues/50),
+   * so it can be found and removed once the figure is fixed; packet.net
+   * tracks that removal in packet-net/packet.net#881. Called
+   * `repeatedConnectSabmReacknowledged` before the rename.
+   *
+   * Mirrors `Ax25SessionQuirks.Ax25Spec50RepeatedConnectSabmReacknowledged`
+   * in packet-net/packet.net (issues #856 and #874).
    */
-  repeatedConnectSabmReacknowledged: boolean;
+  ax25Spec50RepeatedConnectSabmReacknowledged: boolean;
 
 
   /**
@@ -559,9 +577,9 @@ export interface Ax25SessionQuirks {
 export const defaultSessionQuirks: Ax25SessionQuirks = {
   segmentFirstCarriesL3Pid: true,
   srejCommandIgnored: true,
-  repeatedConnectUaIgnored: true,
-  unexpectedUaIgnored: true,
-  repeatedConnectSabmReacknowledged: true,
+  ax25Spec114RepeatedConnectUaIgnored: true,
+  ax25Spec114UnexpectedUaIgnored: true,
+  ax25Spec50RepeatedConnectSabmReacknowledged: true,
   ax25Spec41KarnSrtSampling: true,
   ax25Spec42SrejTargetsGap: true,
   ax25Spec43DlFlowOffEntersBusy: true,
@@ -582,9 +600,9 @@ export const defaultSessionQuirks: Ax25SessionQuirks = {
 export const strictlyFaithfulSessionQuirks: Ax25SessionQuirks = {
   segmentFirstCarriesL3Pid: false,
   srejCommandIgnored: false,
-  repeatedConnectUaIgnored: false,
-  unexpectedUaIgnored: false,
-  repeatedConnectSabmReacknowledged: false,
+  ax25Spec114RepeatedConnectUaIgnored: false,
+  ax25Spec114UnexpectedUaIgnored: false,
+  ax25Spec50RepeatedConnectSabmReacknowledged: false,
   ax25Spec41KarnSrtSampling: false,
   ax25Spec42SrejTargetsGap: false,
   ax25Spec43DlFlowOffEntersBusy: false,

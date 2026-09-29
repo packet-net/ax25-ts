@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Changed
+
+- **Crossed-dial session quirks take their ax25spec issue numbers** - following the `ax25Spec<issue>` convention the C# reference uses for a quirk tied to a packethacking/ax25spec issue, so each is greppable and removable once the spec is fixed. `unexpectedUaIgnored` is now `ax25Spec114UnexpectedUaIgnored` and `repeatedConnectUaIgnored` is now `ax25Spec114RepeatedConnectUaIgnored` ([packethacking/ax25spec#114](https://github.com/packethacking/ax25spec/issues/114), removal tracked in packet-net/packet.net#880); `repeatedConnectSabmReacknowledged` is now `ax25Spec50RepeatedConnectSabmReacknowledged` ([packethacking/ax25spec#50](https://github.com/packethacking/ax25spec/issues/50), removal tracked in packet-net/packet.net#881). The old names are gone, so code that sets them needs the new names. Behaviour and defaults are unchanged. Mirrors the matching rename of `Ax25SessionQuirks` in packet.net.
+
 ## [0.22.0] - 2026-09-29
 
 Parity with the C# reference at packet.net **lib-v0.50.0** (packet-net/packet.net#877, packet-net/packet.net#874): two stations dialling each other at once.

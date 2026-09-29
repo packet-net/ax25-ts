@@ -158,14 +158,14 @@ export class SdlSessionDriver {
    */
   private vaAdvancedSinceT1Expiry = false;
   /**
-   * `repeatedConnectUaIgnored` (packet-net/packet.net#842): the encoded UA that
+   * `ax25Spec114RepeatedConnectUaIgnored` (packet-net/packet.net#842): the encoded UA that
    * took this link to Connected, kept only while it is still the last frame
    * the peer sent. A byte-identical UA arriving next is a second delivery of
    * it, not the figure's unexpected UA. See {@link isRepeatedConnectUa}.
    */
   private connectingUa: Uint8Array | null = null;
   /**
-   * `unexpectedUaIgnored` (packet-net/packet.net#874): the last UA dropped on
+   * `ax25Spec114UnexpectedUaIgnored` (packet-net/packet.net#874): the last UA dropped on
    * the up link, kept until the peer shows it carried on (an in-sequence I
    * frame) or the link leaves the connected states. If the peer's next I frame
    * instead restarts at N(S) = 0 while V(r) is not 0, the peer reset on the
@@ -183,7 +183,7 @@ export class SdlSessionDriver {
    */
   private lastFrameZero: Uint8Array | null = null;
   /**
-   * `repeatedConnectSabmReacknowledged` (packet-net/packet.net#856): true once
+   * `ax25Spec50RepeatedConnectSabmReacknowledged` (packet-net/packet.net#856): true once
    * this driver has answered a SABM(E) from the peer (figc4.1 accepting its
    * call, figc4.2 / figc4.6 answering it while our own dial waited, or the
    * figure's reset on one), until the peer sends anything that moves a
@@ -416,7 +416,7 @@ export class SdlSessionDriver {
   }
 
   /**
-   * `unexpectedUaIgnored`: true when `event` is a UA received while the link
+   * `ax25Spec114UnexpectedUaIgnored`: true when `event` is a UA received while the link
    * is up, which is then dropped before the figure can read it as the §6.5
    * unexpected UA (figc4.4 `t17_ua_received_*`, figc4.5 `t11_ua_received`)
    * and reset the link. With no SABM(E) or DISC of ours outstanding, it can
@@ -428,7 +428,7 @@ export class SdlSessionDriver {
    */
   private isUaOnUpLink(event: Ax25Event): boolean {
     return (
-      this.context.quirks.unexpectedUaIgnored &&
+      this.context.quirks.ax25Spec114UnexpectedUaIgnored &&
       event.name === "UA_received" &&
       (this.state === "Connected" || this.state === "TimerRecovery")
     );
@@ -494,7 +494,7 @@ export class SdlSessionDriver {
   }
 
   /**
-   * `repeatedConnectUaIgnored`: true when `event` is a second delivery of the
+   * `ax25Spec114RepeatedConnectUaIgnored`: true when `event` is a second delivery of the
    * UA that just connected this link, which is then dropped before the figure
    * can read it as an unexpected UA (figc4.4 `t17_ua_received_*`) and reset
    * the link. Any other frame from the peer ends the window, so only the frame
@@ -509,7 +509,7 @@ export class SdlSessionDriver {
     if (
       event.name === "UA_received" &&
       event.frame !== undefined &&
-      this.context.quirks.repeatedConnectUaIgnored &&
+      this.context.quirks.ax25Spec114RepeatedConnectUaIgnored &&
       this.state === "Connected" &&
       sameBytes(encodeFrame(event.frame), connecting)
     ) {
@@ -533,7 +533,7 @@ export class SdlSessionDriver {
     if (this.state !== "Connected") {
       this.connectingUa = null;
     } else if (
-      this.context.quirks.repeatedConnectUaIgnored &&
+      this.context.quirks.ax25Spec114RepeatedConnectUaIgnored &&
       event.name === "UA_received" &&
       event.frame !== undefined &&
       (stateBefore === "AwaitingConnection" || stateBefore === "AwaitingV22Connection")
@@ -543,7 +543,7 @@ export class SdlSessionDriver {
   }
 
   /**
-   * `repeatedConnectSabmReacknowledged`: true when `event` is a SABM(E) of the
+   * `ax25Spec50RepeatedConnectSabmReacknowledged`: true when `event` is a SABM(E) of the
    * link's modulo arriving on the connected link from a peer whose SABM(E)
    * this driver has answered, while the peer has sent nothing since that moved
    * a sequence variable. The peer is still waiting for that UA and has
@@ -563,7 +563,7 @@ export class SdlSessionDriver {
    */
   private isRepeatedConnectSabm(event: Ax25Event): boolean {
     if (
-      !this.context.quirks.repeatedConnectSabmReacknowledged ||
+      !this.context.quirks.ax25Spec50RepeatedConnectSabmReacknowledged ||
       !this.peerCallAnswered ||
       (this.state !== "Connected" && this.state !== "TimerRecovery")
     ) {
@@ -620,7 +620,7 @@ export class SdlSessionDriver {
     const connected = this.state === "Connected" || this.state === "TimerRecovery";
     const connecting =
       this.state === "AwaitingConnection" || this.state === "AwaitingV22Connection";
-    if (!this.context.quirks.repeatedConnectSabmReacknowledged || !(connected || connecting)) {
+    if (!this.context.quirks.ax25Spec50RepeatedConnectSabmReacknowledged || !(connected || connecting)) {
       this.peerCallAnswered = false;
       return;
     }
