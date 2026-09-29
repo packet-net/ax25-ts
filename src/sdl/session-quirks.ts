@@ -212,12 +212,17 @@ export interface Ax25SessionQuirks {
    * connected link, provided the answer left the link at
    * V(s) = V(a) = V(r) = 0 (figc4.5's V(s) = V(a) arms, `t13` / `t14` `_yes`,
    * keep the sequence variables, and re-acknowledging a retry from there would
-   * leave this end's V(r) ahead of a peer at zero). While the link is Connected or in Timer Recovery and the
-   * peer has sent nothing since that moved a sequence variable (an I, RR, RNR,
-   * REJ or SREJ frame), a SABM on a mod-8 link or a SABME on a mod-128 link is
-   * answered with UA (F = P) and nothing else happens. This end
-   * re-establishing the link itself, or the link leaving the connecting and
-   * connected states, ends that too. Frames that move no sequence variable
+   * leave this end's V(r) ahead of a peer at zero). While the link is
+   * Connected or in Timer Recovery and the peer has sent nothing since that
+   * moved a sequence variable (an I, RR, RNR, REJ or SREJ frame), a SABM on a
+   * mod-8 link or a SABME on a mod-128 link is answered with UA (F = P) and
+   * nothing else happens. The link leaving the connecting and connected states
+   * ends that too, but this end re-establishing the link itself does not: a
+   * DL-CONNECT request on a link the peer's call had just brought up
+   * (packet-net/packet.net#862) puts this end at zero too, so the peer's retry
+   * is still safe to answer, and the figure's reset on it would discard what
+   * this end queued on the new link with nothing said to its owner (seen on a
+   * simulated AFSK channel). Frames that move no sequence variable
    * (UA, XID, UI, TEST) leave the window open, and the P bit makes no
    * difference. The ends stay in step even if the peer did mean a reset: it
    * has sent and acknowledged nothing, so its V(s) = V(r) = 0 match this end's

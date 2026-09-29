@@ -294,4 +294,29 @@ describe("repeatedConnectSabmReacknowledged", () => {
     expect(signals.filter((s) => s.type === "DL_ERROR_indication")).toHaveLength(2);
     await listener.dispose();
   });
+  it("a DL-CONNECT request on the link the peer's call brought up keeps the window open", async () => {
+    // packet-net/packet.net#862's race: the peer's call brings the link up just
+    // as our layer 3 dials, so the DL-CONNECT request re-establishes the live
+    // link (figc4.4 t07). That puts this end at zero too, so the peer's retry
+    // SABME is still answered with UA, and the data queued on the new link
+    // stays queued.
+    const { listener, transport, session } = await answeredCall();
+    const redial = listener.connect(Peer, true, false);
+    await waitFor(() => sent(transport).some(isEstablish), 5000, "the re-establishing SABME is on the air");
+    transport.injectInbound(ua({ destination: Local, source: Peer, finalBit: true }));
+    await withTimeout(redial, 10_000);
+    expect(session.state).toBe("Connected");
+
+    const signals = watch(session);
+    listener.sendData(session, new TextEncoder().encode("exchange\r"));
+    await waitFor(() => session.context.vs === 1, 5000, "the data is sent");
+
+    transport.injectInbound(sabme({ destination: Local, source: Peer }));
+    await waitFor(() => sent(transport).filter(isUa).length === 2, 5000, "the retry is answered with UA");
+
+    expect(sent(transport).filter(isEstablish)).toHaveLength(1);
+    expect(session.context.vs).toBe(1);
+    expect(signals.filter(isReset)).toHaveLength(0);
+    await listener.dispose();
+  });
 });

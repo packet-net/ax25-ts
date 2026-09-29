@@ -187,8 +187,9 @@ export class SdlSessionDriver {
    * this driver has answered a SABM(E) from the peer (figc4.1 accepting its
    * call, figc4.2 / figc4.6 answering it while our own dial waited, or the
    * figure's reset on one), until the peer sends anything that moves a
-   * sequence variable (an I or S frame), or this end re-establishes the link
-   * itself. A SABM(E) of the link's modulo arriving then is the peer still
+   * sequence variable (an I or S frame) or the link leaves the connecting and
+   * connected states; this end re-establishing the link itself does not end
+   * it. A SABM(E) of the link's modulo arriving then is the peer still
    * waiting for our UA, not the figure's reset: both ends are at
    * V(a) = V(r) = 0 either way. See {@link isRepeatedConnectSabm}.
    */
@@ -395,7 +396,7 @@ export class SdlSessionDriver {
       );
       this.state = this.resolveNextState(match);
       this.noteConnectingUa(event, stateBefore);
-      this.notePeerCall(event, stateBefore);
+      this.notePeerCall(event);
       this.noteFrameZero(event, stateBefore);
 
       // ax25spec#9 (ax25Spec9AckProgressResetsRc), step 1 of 2: note that this
@@ -606,12 +607,16 @@ export class SdlSessionDriver {
    * UA and that left the link at V(s) = V(a) = V(r) = 0: one that took the
    * link from Disconnected to Connected, one that crossed our own dial in
    * AwaitingConnection or AwaitingV22Connection, or one that reset a connected
-   * link. Cleared by any I or S frame from the
-   * peer, by this end re-establishing the link itself, and by leaving the
-   * connecting and connected states. Mirrors the C#
+   * link. Cleared by any I or S frame from the peer, and by leaving the
+   * connecting and connected states. This end re-establishing the link itself
+   * (a DL-CONNECT request on a link the peer's call had just brought up,
+   * packet-net/packet.net#862) does not clear it: that puts this end at zero
+   * too, so the peer's retry is still safe to answer, and the figure's reset on
+   * it would discard what this end queued on the new link with nothing said to
+   * its owner (seen on a simulated AFSK channel). Mirrors the C#
    * `Ax25Session.NotePeerCall`.
    */
-  private notePeerCall(event: Ax25Event, stateBefore: string): void {
+  private notePeerCall(event: Ax25Event): void {
     const connected = this.state === "Connected" || this.state === "TimerRecovery";
     const connecting =
       this.state === "AwaitingConnection" || this.state === "AwaitingV22Connection";
@@ -630,8 +635,6 @@ export class SdlSessionDriver {
       // retry from there would leave this end's V(r) ahead of a peer at zero.
       this.peerCallAnswered =
         this.context.vs === 0 && this.context.va === 0 && this.context.vr === 0;
-    } else if ((stateBefore === "Connected" || stateBefore === "TimerRecovery") && connecting) {
-      this.peerCallAnswered = false;
     } else if (SEQUENCE_EVENT_NAMES.has(event.name)) {
       this.peerCallAnswered = false;
     }
