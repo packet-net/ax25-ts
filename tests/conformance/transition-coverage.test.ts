@@ -64,7 +64,7 @@ import {
   ui,
   xid,
 } from "../../src/frame.js";
-import { defaultSessionQuirks } from "../../src/sdl/session-quirks.js";
+import { type Ax25SessionQuirks, defaultSessionQuirks } from "../../src/sdl/session-quirks.js";
 import { encodeXid } from "../../src/xid.js";
 import type { Endpoint } from "./two-station-harness.js";
 import { TwoStationHarness } from "./two-station-harness.js";
@@ -158,6 +158,20 @@ const isXidFromA = (h: TwoStationHarness, f: Ax25Frame): boolean =>
   classify(f) === "XID" && fromA(h, f);
 
 /**
+ * The battery measures which figure arms fire. Two crossing quirks pre-empt
+ * arms on an up link before dispatch (a UA: figc4.4 t17 / figc4.5 t11,
+ * packet.net#874; a SABM(E) while the peer has been quiet: t14 / t15 and
+ * figc4.5 t13 / t14, packet.net#856), so the battery runs with them off; their
+ * own behaviour is pinned by the RepeatedConnect* tests. Mirrors the C#
+ * `figureArmsReachable`.
+ */
+const figureArmsReachable: Ax25SessionQuirks = {
+  ...defaultSessionQuirks,
+  unexpectedUaIgnored: false,
+  repeatedConnectSabmReacknowledged: false,
+};
+
+/**
  * Build a coverage harness — the oracle (per-step invariant check) is suspended
  * because the injection scenarios post frames outside the submitted/delivered
  * model; correctness is asserted by the dedicated conformance suites, this
@@ -170,8 +184,9 @@ function New(opts: {
   n2?: number;
   segmenter?: boolean;
   n1?: number;
+  quirks?: Ax25SessionQuirks;
 } = {}): TwoStationHarness {
-  const h = TwoStationHarness.build(opts);
+  const h = TwoStationHarness.build({ ...opts, quirks: opts.quirks ?? figureArmsReachable });
   h.checkAfterEachStep = false;
   return h;
 }

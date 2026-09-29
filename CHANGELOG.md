@@ -6,6 +6,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+Parity with the C# reference for packet-net/packet.net#874: two stations dialling each other at once.
+
+### Added
+
+- **`unexpectedUaIgnored` session quirk** - drop every UA received while the link is up (Connected or Timer Recovery), rather than reading it as the §6.5 unexpected UA and resetting the link. Default `true`; cleared by `strictlyFaithfulSessionQuirks`. A station sends UA only to answer SABM, SABME or DISC, and on an up link we have none outstanding, so a UA there can only be a late or repeated answer to the SABM(E) that set the link up. When two stations dial each other at once and one dial's T1 runs out, the UA to that retry arrives after the peer's first data, and figc4.4 t17 / figc4.5 t11 reset a link that is carrying traffic. The dropped UA changes nothing: no signal to layer 3, timers and sequence variables as they were, and neither of the narrower quirks' windows is touched. LinBPQ (`L2Code.c` `SDUFRM`, "DISCARD - PROBABLY REPEAT OF ACK OF SABM") and the Linux kernel (`ax25_std_in.c`, no UA case in `ax25_std_state3_machine`) do the same; direwolf and rax25 follow the figure. It subsumes `repeatedConnectUaIgnored`, which stays for the narrow case on its own. Parity with `Ax25SessionQuirks.UnexpectedUaIgnored`.
+
+### Changed
+
+- **`repeatedConnectSabmReacknowledged` widened** - the window is no longer a byte-identical copy of the SABM(E) we answered while the link was set up. While the link is Connected or in Timer Recovery and the peer has sent no I or S frame since it came up (on our dial's UA, or on a SABM(E) from the peer, including the figure's own reset), a SABM on a mod-8 link or a SABME on a mod-128 link is answered with `F := P; UA` and nothing else. So a SABME with P=0, and a SABM(E) on a link that came up on the peer's UA to our dial (its own crossing dial's SABM(E) was lost), are now re-acknowledged instead of resetting. A SABM(E) of the other modulo, or one after the peer's I or S frame, still runs the figure. UA, XID, UI and TEST frames leave the window open. Parity with `Ax25Session.IsRepeatedConnectSabm` / `NotePeerQuietSinceUp`.
+
 ## [0.21.0] - 2026-09-29
 
 Parity with the C# reference at packet.net **lib-v0.48.0**: the repeated-connect-SABM session quirk.

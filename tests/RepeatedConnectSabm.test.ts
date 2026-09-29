@@ -5,13 +5,14 @@
  * connected by then, and may have sent data, figc4.4 reads the copy as the §6.5
  * reset and, with frames outstanding, discards the I-frame queue. Two stations
  * that dial each other at once and lose one UA of the crossing hit this, and
- * so does a banner sent on any call we answer. The quirk answers a
- * byte-identical copy of the SABM(E) we answered with UA again, until the peer
- * sends anything else; anything else still runs the figure.
+ * so does a banner sent on any call we answer. The quirk answers a SABM(E) of
+ * the link's modulo with UA again while the peer has sent no I or S frame since
+ * the link came up (widened from a byte-identical copy by
+ * packet-net/packet.net#874); anything else still runs the figure.
  */
 import { describe, expect, it } from "vitest";
 import { Callsign } from "../src/callsign.js";
-import { type Ax25Frame, rr, sabme, ua } from "../src/frame.js";
+import { type Ax25Frame, pollFinal, rr, sabm, sabme, ua } from "../src/frame.js";
 import { Ax25Listener, type Ax25ListenerSession } from "../src/listener.js";
 import type { DataLinkSignal } from "../src/sdl/action-dispatcher.js";
 import {
@@ -184,13 +185,64 @@ describe("repeatedConnectSabmReacknowledged", () => {
     await listener.dispose();
   });
 
-  it("a different SABME still resets the link", async () => {
+  it("a SABME with P=0 on a quiet up link is answered with UA F=0 and no reset", async () => {
+    // Widened for packet-net/packet.net#874: the window no longer needs a
+    // byte-identical copy, only a SABM(E) of the link's modulo before the
+    // peer's first I or S frame.
     const { listener, transport, session } = await answeredCall();
     const signals = watch(session);
     listener.sendData(session, new TextEncoder().encode("banner\r"));
 
     transport.injectInbound(sabme({ destination: Local, source: Peer, pollBit: false }));
-    await waitFor(() => signals.some((s) => s.type === "DL_CONNECT_indication"), 5000, "a different SABME is a reset");
+    await waitFor(() => sent(transport).filter(isUa).length === 2, 5000, "the SABME is answered with UA");
+
+    const answer = sent(transport).filter(isUa)[1]!;
+    expect(pollFinal(answer)).toBe(false);
+    expect(session.context.vs).toBe(1);
+    expect(signals.filter(isReset)).toHaveLength(0);
     await listener.dispose();
   });
+
+  it("a SABM on a mod-128 link still resets the link", async () => {
+    // The other modulo is not the peer still setting this link up.
+    const { listener, transport, session } = await answeredCall();
+    const signals = watch(session);
+    listener.sendData(session, new TextEncoder().encode("banner\r"));
+
+    transport.injectInbound(sabm({ destination: Local, source: Peer }));
+    await waitFor(() => signals.some((s) => s.type === "DL_CONNECT_indication"), 5000, "a SABM on a mod-128 link is a reset");
+    expect(session.context.vs).toBe(0);
+    await listener.dispose();
+  });
+
+  it.each([false, true])(
+    "a link that came up on the peer's UA to our dial absorbs a SABM(E) from the quiet peer (extended=%s)",
+    async (extended) => {
+      // We never answered a SABM(E) from this peer: our dial's UA brought the
+      // link up. A SABM(E) of the link's modulo before the peer's first I or S
+      // frame is still answered with UA and nothing else (packet-net/packet.net#874).
+      const transport = new LoopbackTransport();
+      const listener = new Ax25Listener(transport, { myCall: Local, quirks: defaultSessionQuirks });
+      await listener.start();
+      const connecting = listener.connect(Peer, extended, false);
+      await waitFor(() => sent(transport).some(isEstablish), 5000, "our dial is on the air");
+      transport.injectInbound(ua({ destination: Local, source: Peer, finalBit: true }));
+      const session = await withTimeout(connecting, 10_000);
+      const signals = watch(session);
+      listener.sendData(session, new TextEncoder().encode("exchange\r"));
+      await waitFor(() => session.context.vs === 1, 5000, "the data is sent");
+
+      transport.injectInbound(
+        extended ? sabme({ destination: Local, source: Peer }) : sabm({ destination: Local, source: Peer }),
+      );
+      await waitFor(() => sent(transport).some(isUa), 5000, "the SABM(E) is answered with UA");
+
+      expect(sent(transport).filter(isUa)).toHaveLength(1);
+      expect(sent(transport).filter(isEstablish)).toHaveLength(1);
+      expect(session.context.vs).toBe(1);
+      expect(["Connected", "TimerRecovery"]).toContain(session.state);
+      expect(signals.filter(isReset)).toHaveLength(0);
+      await listener.dispose();
+    },
+  );
 });
