@@ -191,28 +191,33 @@ export interface Ax25SessionQuirks {
    * indication, V(s) = V(a) = V(r) = 0. The figure keeps no memory of how the
    * link came up, so whatever this end sent after connecting is thrown away,
    * and the peer had already discarded it while it waited. Two stations that
-   * dial each other at once and lose a UA or a SABM(E) of the crossing do
-   * exactly this, and so does any call we answer with a banner when our UA is
-   * lost.
+   * dial each other at once and lose one UA of the crossing do exactly this,
+   * and so does any call we answer with a banner when our UA is lost.
    *
-   * When `true`, the driver notes that the peer has been quiet since the link
-   * came up: set when a transition ends in Connected or Timer Recovery on a UA
-   * received in AwaitingConnection or AwaitingV22Connection, or on a SABM(E)
-   * received (in any state, including the figure's own reset in Connected or
-   * Timer Recovery, after which both ends are at zero again); cleared by any
-   * I or S frame from the peer, and by the link leaving those states. While
-   * the link is Connected or in Timer Recovery and the peer has been quiet, a
-   * SABM on a mod-8 link or a SABME on a mod-128 link is answered with UA
-   * (F = P) and nothing else happens. A SABM(E) of the other modulo, or one
-   * after an I or S frame from the peer, runs the figure: that peer has moved
-   * on and may really mean a reset. Frames that move no sequence variable
-   * (UA, XID, UI, TEST) leave the window open. The ends stay in step even if
-   * the peer did mean a reset: it has sent and acknowledged nothing, so its
-   * V(s) = V(r) = 0 match this end's V(a) and V(r), and what this end has
-   * outstanding is retransmitted from N(S) = 0. LinBPQ answers every SABM on a
-   * link that has had no I frame yet with UA ("REPEAT OF ORIGINAL SABM COS
-   * OTHER END MISSED UA"). When `false` ({@link strictlyFaithfulSessionQuirks}),
-   * the repeat resets the link as drawn.
+   * When `true`, the driver notes that it answered a SABM(E) from the peer:
+   * one that took it from Disconnected to Connected (figc4.1), one that
+   * crossed our own dial in AwaitingConnection or AwaitingV22Connection
+   * (figc4.2 / figc4.6 answer it with UA and wait on), or one that reset a
+   * connected link. While the link is Connected or in Timer Recovery and the
+   * peer has sent nothing since that moved a sequence variable (an I, RR, RNR,
+   * REJ or SREJ frame), a SABM on a mod-8 link or a SABME on a mod-128 link is
+   * answered with UA (F = P) and nothing else happens. This end
+   * re-establishing the link itself, or the link leaving the connecting and
+   * connected states, ends that too. Frames that move no sequence variable
+   * (UA, XID, UI, TEST) leave the window open, and the P bit makes no
+   * difference. The ends stay in step even if the peer did mean a reset: it
+   * has sent and acknowledged nothing, so its V(s) = V(r) = 0 match this end's
+   * V(a) and V(r), and what this end has outstanding is retransmitted from
+   * N(S) = 0. A SABM(E) of the other modulo, or one after an I or S frame from
+   * the peer, runs the figure. So does one on a link this end dialled from a
+   * peer whose call it never answered (the peer's own SABM(E) lost in a
+   * crossing, say): on the wire that is the same frame as a peer that started
+   * over, which the node hands to a fresh owner, and the two cannot be told
+   * apart at this layer. LinBPQ answers every SABM on a link that has had no I
+   * frame yet with UA ("REPEAT OF ORIGINAL SABM COS OTHER END MISSED UA");
+   * this is narrower: only from a peer whose call we answered, and closed by
+   * any S frame too. When `false` ({@link strictlyFaithfulSessionQuirks}), the
+   * repeat resets the link as drawn.
    *
    * Mirrors `Ax25SessionQuirks.RepeatedConnectSabmReacknowledged` in
    * packet-net/packet.net (issues #856 and #874).

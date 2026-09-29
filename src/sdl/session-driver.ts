@@ -165,15 +165,16 @@ export class SdlSessionDriver {
    */
   private connectingUa: Uint8Array | null = null;
   /**
-   * `repeatedConnectSabmReacknowledged` (packet-net/packet.net#856, widened
-   * for #874): true while the link is up and the peer has sent nothing since
-   * it came up that moved a sequence variable (no I or S frame). A SABM(E) of
-   * the link's modulo arriving then is the peer still trying to set the link
-   * up (its UA from us lost, or its own dial's SABM(E) lost in a crossing),
-   * not the figure's reset: both ends are at V(a) = V(r) = 0 either way. See
-   * {@link isRepeatedConnectSabm}.
+   * `repeatedConnectSabmReacknowledged` (packet-net/packet.net#856): true once
+   * this driver has answered a SABM(E) from the peer (figc4.1 accepting its
+   * call, figc4.2 / figc4.6 answering it while our own dial waited, or the
+   * figure's reset on one), until the peer sends anything that moves a
+   * sequence variable (an I or S frame), or this end re-establishes the link
+   * itself. A SABM(E) of the link's modulo arriving then is the peer still
+   * waiting for our UA, not the figure's reset: both ends are at
+   * V(a) = V(r) = 0 either way. See {@link isRepeatedConnectSabm}.
    */
-  private peerQuietSinceUp = false;
+  private peerCallAnswered = false;
   /**
    * The state→page map this driver walks. Defaults to the data-link
    * {@link STATE_PAGES}; the MDL driver passes {@link MDL_STATE_PAGES} so the
@@ -349,7 +350,7 @@ export class SdlSessionDriver {
       );
       this.state = this.resolveNextState(match);
       this.noteConnectingUa(event, stateBefore);
-      this.notePeerQuietSinceUp(event, stateBefore);
+      this.notePeerCall(event, stateBefore);
 
       // ax25spec#9 (ax25Spec9AckProgressResetsRc), step 1 of 2: note that this
       // transition advanced V(A) — the peer acknowledged NEW data. The RC clamp
@@ -431,24 +432,27 @@ export class SdlSessionDriver {
 
   /**
    * `repeatedConnectSabmReacknowledged`: true when `event` is a SABM(E) of the
-   * link's modulo arriving on the connected link while the peer has sent
-   * nothing since the link came up that moved a sequence variable. The peer
-   * is still setting the link up (its UA from us was lost, or its own SABM(E)
-   * was lost in a crossing and this is its retry); the figure would read it as
-   * the §6.5 reset (figc4.4 / figc4.5 `t1x_sabm(e)_received_*`) and discard
-   * what this end has queued. Re-acknowledging keeps the two ends in step: the
-   * peer is at V(s) = V(r) = 0, and so are this end's V(a) and V(r), since
-   * nothing from the peer has moved them; what this end has outstanding is
-   * sent from N(S) = 0 by the usual recovery. A SABM(E) of the other modulo,
-   * or one after an I or S frame from the peer, runs the figure: that peer has
-   * moved on and may really mean a reset. Frames that move no sequence
-   * variable (UA, XID, UI, TEST) leave the window open. Mirrors the C#
+   * link's modulo arriving on the connected link from a peer whose SABM(E)
+   * this driver has answered, while the peer has sent nothing since that moved
+   * a sequence variable. The peer is still waiting for that UA and has
+   * retried; the figure would read the retry as the §6.5 reset (figc4.4 /
+   * figc4.5 `t1x_sabm(e)_received_*`) and discard what this end has queued.
+   * Re-acknowledging keeps the two ends in step: the peer is at
+   * V(s) = V(r) = 0, and so are this end's V(a) and V(r), since nothing from
+   * the peer has moved them; what this end has outstanding is sent from
+   * N(S) = 0 by the usual recovery. A SABM(E) of the other modulo, or one
+   * after an I or S frame from the peer, runs the figure: that peer has moved
+   * on and may really mean a reset. Frames that move no sequence variable
+   * (UA, XID, UI, TEST) leave the window open. A SABM(E) on a link this end
+   * dialled, from a peer whose call it never answered, runs the figure too: on
+   * the wire that is the same frame as a peer that started over, and the node
+   * hands such a link to a fresh owner. Mirrors the C#
    * `Ax25Session.IsRepeatedConnectSabm`.
    */
   private isRepeatedConnectSabm(event: Ax25Event): boolean {
     if (
       !this.context.quirks.repeatedConnectSabmReacknowledged ||
-      !this.peerQuietSinceUp ||
+      !this.peerCallAnswered ||
       (this.state !== "Connected" && this.state !== "TimerRecovery")
     ) {
       return false;
@@ -485,32 +489,35 @@ export class SdlSessionDriver {
   }
 
   /**
-   * Track whether the peer has been quiet since the link came up (for
-   * {@link isRepeatedConnectSabm}). The link comes up on a UA that answers our
-   * SABM(E), or on a SABM(E) from the peer that the figure answered, including
-   * the figure's own reset on one in Connected or Timer Recovery, after which
-   * both ends are at zero again. Any I or S frame from the peer ends the
-   * quiet, and so does leaving the connected states. Mirrors the C#
-   * `Ax25Session.NotePeerQuietSinceUp`.
+   * Track whether this driver has answered a SABM(E) from the peer and heard
+   * nothing from it since that moved a sequence variable (for
+   * {@link isRepeatedConnectSabm}). Set by a SABM(E) the figure answered with
+   * UA: one that took the link from Disconnected to Connected, one that
+   * crossed our own dial in AwaitingConnection or AwaitingV22Connection, or
+   * one that reset a connected link. Cleared by any I or S frame from the
+   * peer, by this end re-establishing the link itself, and by leaving the
+   * connecting and connected states. Mirrors the C#
+   * `Ax25Session.NotePeerCall`.
    */
-  private notePeerQuietSinceUp(event: Ax25Event, stateBefore: string): void {
-    if (
-      !this.context.quirks.repeatedConnectSabmReacknowledged ||
-      (this.state !== "Connected" && this.state !== "TimerRecovery")
-    ) {
-      this.peerQuietSinceUp = false;
+  private notePeerCall(event: Ax25Event, stateBefore: string): void {
+    const connected = this.state === "Connected" || this.state === "TimerRecovery";
+    const connecting =
+      this.state === "AwaitingConnection" || this.state === "AwaitingV22Connection";
+    if (!this.context.quirks.repeatedConnectSabmReacknowledged || !(connected || connecting)) {
+      this.peerCallAnswered = false;
       return;
     }
 
-    const cameUp =
-      event.name === "UA_received"
-        ? stateBefore === "AwaitingConnection" || stateBefore === "AwaitingV22Connection"
-        : event.name === "SABM_received" || event.name === "SABME_received";
+    const answered =
+      (event.name === "SABM_received" && (connected || this.state === "AwaitingConnection")) ||
+      (event.name === "SABME_received" && (connected || this.state === "AwaitingV22Connection"));
 
-    if (cameUp) {
-      this.peerQuietSinceUp = true;
+    if (answered) {
+      this.peerCallAnswered = true;
+    } else if ((stateBefore === "Connected" || stateBefore === "TimerRecovery") && connecting) {
+      this.peerCallAnswered = false;
     } else if (SEQUENCE_EVENT_NAMES.has(event.name)) {
-      this.peerQuietSinceUp = false;
+      this.peerCallAnswered = false;
     }
   }
 
@@ -732,8 +739,8 @@ const FRAME_EVENT_NAMES: ReadonlySet<string> = new Set([
 
 /**
  * The events made from the peer's I and S frames, the ones that can move a
- * sequence variable; any of them ends `peerQuietSinceUp`. Mirrors the type
- * test in the C# `Ax25Session.NotePeerQuietSinceUp`.
+ * sequence variable; any of them ends `peerCallAnswered`. Mirrors the type
+ * test in the C# `Ax25Session.NotePeerCall`.
  */
 const SEQUENCE_EVENT_NAMES: ReadonlySet<string> = new Set([
   "I_received",
