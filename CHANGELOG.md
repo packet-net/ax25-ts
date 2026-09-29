@@ -6,7 +6,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
-Parity with the C# reference for packet-net/packet.net#874: two stations dialling each other at once.
+## [0.22.0] - 2026-09-29
+
+Parity with the C# reference at packet.net **lib-v0.50.0** (packet-net/packet.net#877, packet-net/packet.net#874): two stations dialling each other at once.
 
 ### Added
 
