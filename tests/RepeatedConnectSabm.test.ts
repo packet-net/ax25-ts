@@ -69,13 +69,13 @@ async function crossingDial(quirks: Ax25SessionQuirks): Promise<{
 }
 
 // A call we answer: the peer's SABME takes us from Disconnected to Connected.
-async function answeredCall(): Promise<{
+async function answeredCall(t1Ms?: number): Promise<{
   listener: Ax25Listener;
   transport: LoopbackTransport;
   session: Ax25ListenerSession;
 }> {
   const transport = new LoopbackTransport();
-  const listener = new Ax25Listener(transport, { myCall: Local });
+  const listener = new Ax25Listener(transport, { myCall: Local, t1Ms });
   await listener.start();
   let accepted: Ax25ListenerSession | null = null;
   listener.onSessionAccepted((s) => {
@@ -125,6 +125,51 @@ describe("repeatedConnectSabmReacknowledged", () => {
 
     expect(session.context.vs).toBe(1);
     expect(["Connected", "TimerRecovery"]).toContain(session.state);
+    await listener.dispose();
+  });
+
+  it("with repeatedConnectUaIgnored, a doubled connecting UA and a doubled SABME retry are both absorbed", async () => {
+    // A path that delivers every frame twice (LinBPQ with two MAP lines):
+    // neither quirk's window closes the other's.
+    const transport = new LoopbackTransport();
+    const listener = new Ax25Listener(transport, { myCall: Local, quirks: defaultSessionQuirks });
+    await listener.start();
+    const connecting = listener.connect(Peer, true, false);
+    await waitFor(() => sent(transport).some(isEstablish), 5000, "our SABME is on the air");
+    transport.injectInbound(sabme({ destination: Local, source: Peer }));
+    await waitFor(() => sent(transport).some(isUa), 5000, "the crossing SABME is answered while we wait");
+    const connectingUa = ua({ destination: Local, source: Peer, finalBit: true });
+    transport.injectInbound(connectingUa);
+    transport.injectInbound(connectingUa);
+    const session = await withTimeout(connecting, 10_000);
+    const signals = watch(session);
+    listener.sendData(session, new TextEncoder().encode("exchange\r"));
+
+    transport.injectInbound(sabme({ destination: Local, source: Peer }));
+    transport.injectInbound(sabme({ destination: Local, source: Peer }));
+    transport.injectInbound(connectingUa);
+    await waitFor(() => sent(transport).filter(isUa).length === 3, 5000, "both copies of the retry are answered");
+
+    expect(sent(transport).filter(isEstablish)).toHaveLength(1);
+    expect(session.context.vs).toBe(1);
+    expect(signals.filter(isReset)).toHaveLength(0);
+    await listener.dispose();
+  });
+
+  it("a repeat that arrives in TimerRecovery is answered again without a reset", async () => {
+    // The banner's T1 has run out before the peer's retry arrives (figc4.5
+    // has the same SABM(E) reset arms as figc4.4).
+    const { listener, transport, session } = await answeredCall(200);
+    const signals = watch(session);
+    listener.sendData(session, new TextEncoder().encode("banner\r"));
+    await waitFor(() => session.state === "TimerRecovery", 10_000, "the banner's T1 runs out");
+
+    transport.injectInbound(sabme({ destination: Local, source: Peer }));
+    await waitFor(() => sent(transport).filter(isUa).length === 2, 5000, "the repeat is answered with UA");
+
+    expect(session.state).toBe("TimerRecovery");
+    expect(session.context.vs).toBe(1);
+    expect(signals.filter(isReset)).toHaveLength(0);
     await listener.dispose();
   });
 
