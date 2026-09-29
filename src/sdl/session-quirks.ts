@@ -167,11 +167,22 @@ export interface Ax25SessionQuirks {
    * SABM") and what the Linux kernel does (`ax25_std_in.c`
    * `ax25_std_state3_machine` has no UA case); direwolf and rax25 follow the
    * figure. It subsumes {@link repeatedConnectUaIgnored}, which stays for the
-   * narrow case on its own. A peer that really has reset its link shows it by
-   * other means the figure handles: its SABM(E), or an N(R) that cannot be
-   * right. When `false` ({@link strictlyFaithfulSessionQuirks}), every UA on
-   * an up link resets it as drawn, unless {@link repeatedConnectUaIgnored}
-   * absorbs it.
+   * narrow case on its own.
+   *
+   * One thing the UA can mean is kept: a peer that follows the figure resets
+   * its link on our retry (§6.3.3), answers UA, and sends again from
+   * N(S) = 0. Dropping that UA and nothing more would take its restarted
+   * frames for duplicates of the ones already delivered, discard them and
+   * acknowledge them, and nobody would know (LinBPQ and Linux have that
+   * hole). So the dropped UA is remembered, and if the peer's next I frame is
+   * numbered 0 with new bytes (PID and information field) while V(r) is not
+   * 0, its sequence has restarted and the UA is dispatched then: the figure's
+   * reset runs, both ends are told, and the peer's data goes on the new link.
+   * A frame numbered 0 with the bytes of the one already taken is a duplicate
+   * or a retransmission and is left to the figure as such, and an in-sequence
+   * frame past 0 shows the peer carried on, which forgets the UA. When `false`
+   * ({@link strictlyFaithfulSessionQuirks}), every UA on an up link resets it
+   * as drawn, unless {@link repeatedConnectUaIgnored} absorbs it.
    *
    * Mirrors `Ax25SessionQuirks.UnexpectedUaIgnored` in packet-net/packet.net
    * (issue #874).
@@ -198,7 +209,10 @@ export interface Ax25SessionQuirks {
    * one that took it from Disconnected to Connected (figc4.1), one that
    * crossed our own dial in AwaitingConnection or AwaitingV22Connection
    * (figc4.2 / figc4.6 answer it with UA and wait on), or one that reset a
-   * connected link. While the link is Connected or in Timer Recovery and the
+   * connected link, provided the answer left the link at
+   * V(s) = V(a) = V(r) = 0 (figc4.5's V(s) = V(a) arms, `t13` / `t14` `_yes`,
+   * keep the sequence variables, and re-acknowledging a retry from there would
+   * leave this end's V(r) ahead of a peer at zero). While the link is Connected or in Timer Recovery and the
    * peer has sent nothing since that moved a sequence variable (an I, RR, RNR,
    * REJ or SREJ frame), a SABM on a mod-8 link or a SABME on a mod-128 link is
    * answered with UA (F = P) and nothing else happens. This end

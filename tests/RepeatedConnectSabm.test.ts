@@ -13,7 +13,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { Callsign } from "../src/callsign.js";
-import { type Ax25Frame, pollFinal, rr, sabm, sabme, ua, xid } from "../src/frame.js";
+import { type Ax25Frame, iFrame, pollFinal, rr, sabm, sabme, ua, xid } from "../src/frame.js";
 import { Ax25Listener, type Ax25ListenerSession } from "../src/listener.js";
 import type { DataLinkSignal } from "../src/sdl/action-dispatcher.js";
 import {
@@ -260,4 +260,38 @@ describe("repeatedConnectSabmReacknowledged", () => {
       await listener.dispose();
     },
   );
+  it("a second SABME after figc4.5's V(s) = V(a) arm runs the figure, not the re-ack", async () => {
+    // figc4.5 t14_sabme_received_yes answers a SABME in Timer Recovery with
+    // nothing outstanding but keeps V(r). Re-acknowledging a retry from there
+    // would leave this end's V(r) ahead of a peer at zero, so the window opens
+    // only when the answer left V(s) = V(a) = V(r) = 0.
+    const transport = new LoopbackTransport();
+    const listener = new Ax25Listener(transport, { myCall: Local, t3Ms: 200 });
+    await listener.start();
+    let accepted: Ax25ListenerSession | null = null;
+    listener.onSessionAccepted((s) => {
+      accepted = s;
+    });
+    transport.injectInbound(sabme({ destination: Local, source: Peer }));
+    await waitFor(() => accepted !== null, 5000, "the call is accepted");
+    const session = accepted as unknown as Ax25ListenerSession;
+    const signals = watch(session);
+
+    transport.injectInbound(
+      iFrame({ destination: Local, source: Peer, nr: 0, ns: 0, extended: true, info: new TextEncoder().encode("data\r") }),
+    );
+    await waitFor(() => session.context.vr === 1, 5000, "the peer's frame is taken");
+    await waitFor(() => session.state === "TimerRecovery", 10_000, "T3 runs out on the idle link");
+    expect(session.context.vs).toBe(session.context.va);
+
+    transport.injectInbound(sabme({ destination: Local, source: Peer }));
+    await waitFor(() => sent(transport).filter(isUa).length === 2, 5000, "the first SABME is answered");
+    expect(session.context.vr).toBe(1);
+
+    transport.injectInbound(sabme({ destination: Local, source: Peer }));
+    await waitFor(() => sent(transport).filter(isUa).length === 3, 5000, "the second SABME is answered");
+
+    expect(signals.filter((s) => s.type === "DL_ERROR_indication")).toHaveLength(2);
+    await listener.dispose();
+  });
 });
