@@ -12,7 +12,7 @@ import {
   type StatePage,
   type TransitionSpec,
 } from "ax25sdl";
-import { type Ax25Frame, encodeFrame } from "../frame.js";
+import { type Ax25Frame, encodeFrame, getNs } from "../frame.js";
 import {
   ActionDispatcher,
   type DataLinkSignal,
@@ -165,13 +165,35 @@ export class SdlSessionDriver {
    */
   private connectingUa: Uint8Array | null = null;
   /**
-   * `repeatedConnectSabmReacknowledged` (packet-net/packet.net#856): the
-   * encoded SABM(E) from the peer that this driver answered with UA while the
-   * link was being set up, kept until the peer sends anything else. A
-   * byte-identical copy on the connected link is the peer retrying after
-   * losing our UA, not the figure's reset. See {@link isRepeatedConnectSabm}.
+   * `unexpectedUaIgnored` (packet-net/packet.net#874): the last UA dropped on
+   * the up link, kept until the peer shows it carried on (an in-sequence I
+   * frame) or the link leaves the connected states. If the peer's next I frame
+   * instead restarts at N(S) = 0 while V(r) is not 0, the peer reset on the
+   * SABM(E) that UA answered, and this UA was the figure's unexpected UA after
+   * all: it is dispatched then, so the reset is run and reported rather than
+   * the peer's resent frames being taken for duplicates. See
+   * {@link isUaOnUpLink} and {@link peerSequenceRestarted}.
    */
-  private connectingSabm: Uint8Array | null = null;
+  private droppedUa: Ax25Event | null = null;
+  /**
+   * The information field (with its PID) of the last I frame numbered 0 taken
+   * from the peer, for {@link peerSequenceRestarted}: a duplicated or
+   * retransmitted 0 carries the same bytes as the one already delivered, a
+   * restarted sequence brings new ones.
+   */
+  private lastFrameZero: Uint8Array | null = null;
+  /**
+   * `repeatedConnectSabmReacknowledged` (packet-net/packet.net#856): true once
+   * this driver has answered a SABM(E) from the peer (figc4.1 accepting its
+   * call, figc4.2 / figc4.6 answering it while our own dial waited, or the
+   * figure's reset on one), until the peer sends anything that moves a
+   * sequence variable (an I or S frame) or the link leaves the connecting and
+   * connected states; this end re-establishing the link itself does not end
+   * it. A SABM(E) of the link's modulo arriving then is the peer still
+   * waiting for our UA, not the figure's reset: both ends are at
+   * V(a) = V(r) = 0 either way. See {@link isRepeatedConnectSabm}.
+   */
+  private peerCallAnswered = false;
   /**
    * The state→page map this driver walks. Defaults to the data-link
    * {@link STATE_PAGES}; the MDL driver passes {@link MDL_STATE_PAGES} so the
@@ -263,11 +285,6 @@ export class SdlSessionDriver {
   }
 
   private dispatchOne(event: Ax25Event): void {
-    const page = this.statePages[this.state];
-    if (!page) {
-      throw new Error(`no SDL page for current state '${this.state}'`);
-    }
-
     // ax25spec#9 (ax25Spec9AckProgressResetsRc), step 2 of 2: the figures only
     // reset RC on the fully-acked Timer-Recovery checkpoint (…_yes_yes_yes →
     // Connected re-initialises RC), so a sustained transfer that lives in Timer
@@ -293,8 +310,40 @@ export class SdlSessionDriver {
       return;
     }
 
+    if (this.isUaOnUpLink(event)) {
+      this.droppedUa = event;
+      return;
+    }
+
     if (this.isRepeatedConnectUa(event)) {
       return;
+    }
+
+    const droppedUa = this.droppedUa;
+    if (droppedUa !== null && this.peerSequenceRestarted(event)) {
+      // The peer's sequence starts over: it reset on the SABM(E) this UA
+      // answered. Run the figure's UA arm now (DL-ERROR, Establish Data Link),
+      // before this I frame, which the establishment state then discards as the
+      // figure does; the peer resets again on our SABM(E) and both ends start
+      // from zero, told.
+      this.droppedUa = null;
+      this.dispatchFigure(droppedUa);
+    } else if (droppedUa !== null && this.isInSequenceIFrame(event)) {
+      this.droppedUa = null;
+    }
+
+    this.dispatchFigure(event);
+  }
+
+  /**
+   * Run `event` through the figure for the current state: find the matching
+   * transition, execute it, advance the state and note what the quirks need.
+   * Mirrors the C# `Ax25Session.DispatchFigure`.
+   */
+  private dispatchFigure(event: Ax25Event): void {
+    const page = this.statePages[this.state];
+    if (!page) {
+      throw new Error(`no SDL page for current state '${this.state}'`);
     }
 
     this.currentTrigger = event;
@@ -347,7 +396,8 @@ export class SdlSessionDriver {
       );
       this.state = this.resolveNextState(match);
       this.noteConnectingUa(event, stateBefore);
-      this.noteConnectingSabm(event, stateBefore);
+      this.notePeerCall(event);
+      this.noteFrameZero(event, stateBefore);
 
       // ax25spec#9 (ax25Spec9AckProgressResetsRc), step 1 of 2: note that this
       // transition advanced V(A) — the peer acknowledged NEW data. The RC clamp
@@ -363,6 +413,84 @@ export class SdlSessionDriver {
     } finally {
       this.currentTrigger = null;
     }
+  }
+
+  /**
+   * `unexpectedUaIgnored`: true when `event` is a UA received while the link
+   * is up, which is then dropped before the figure can read it as the §6.5
+   * unexpected UA (figc4.4 `t17_ua_received_*`, figc4.5 `t11_ua_received`)
+   * and reset the link. With no SABM(E) or DISC of ours outstanding, it can
+   * only be a late or repeated answer to the one that set the link up. The
+   * windows of the two narrower quirks are left as they are: a UA closes
+   * neither. The dropped UA is kept in {@link droppedUa} in case the peer's
+   * sequence turns out to have restarted. Mirrors the C#
+   * `Ax25Session.IsUaOnUpLink`.
+   */
+  private isUaOnUpLink(event: Ax25Event): boolean {
+    return (
+      this.context.quirks.unexpectedUaIgnored &&
+      event.name === "UA_received" &&
+      (this.state === "Connected" || this.state === "TimerRecovery")
+    );
+  }
+
+  /**
+   * True when `event` is an I frame from the peer numbered 0 while this end
+   * has already received frames on the link (V(r) is not 0), carrying bytes
+   * other than the frame 0 already taken: the peer's send sequence has started
+   * over. After a dropped UA that is the sign of a peer that reset on the
+   * SABM(E) the UA answered, as a figure-following peer does (direwolf, rax25,
+   * the Linux kernel), rather than re-acknowledging it (LinBPQ). A plain drop
+   * took its restarted frames for duplicates, discarded them and acknowledged
+   * them to nobody; running the figure's reset instead costs what the peer's
+   * own reset already cost, and tells both ends. A 0 with the bytes already
+   * taken is a duplicate or a retransmission. Mirrors the C#
+   * `Ax25Session.PeerSequenceRestarted`.
+   */
+  private peerSequenceRestarted(event: Ax25Event): boolean {
+    if (
+      event.name !== "I_received" ||
+      event.frame === undefined ||
+      (this.state !== "Connected" && this.state !== "TimerRecovery") ||
+      getNs(event.frame) !== 0 ||
+      this.context.vr === 0
+    ) {
+      return false;
+    }
+    const seen = this.lastFrameZero;
+    return seen === null || !sameBytes(seen, infoWithPid(event.frame));
+  }
+
+  /**
+   * Remember the bytes of an I frame numbered 0 the figure has just taken in
+   * sequence, so a later copy of it is known for what it is. Forgotten when
+   * the link leaves the connected states. Mirrors the C#
+   * `Ax25Session.NoteFrameZero`.
+   */
+  private noteFrameZero(event: Ax25Event, stateBefore: string): void {
+    if (this.state !== "Connected" && this.state !== "TimerRecovery") {
+      this.lastFrameZero = null;
+    } else if (
+      event.name === "I_received" &&
+      event.frame !== undefined &&
+      getNs(event.frame) === 0 &&
+      (stateBefore === "Connected" || stateBefore === "TimerRecovery")
+    ) {
+      this.lastFrameZero = infoWithPid(event.frame);
+    }
+  }
+
+  /**
+   * True when `event` is an I frame carrying the N(S) this end expects next,
+   * other than 0: the peer's sequence carried on past the start, so the UA
+   * dropped before it was a repeat. An in-sequence 0 proves nothing: with
+   * V(r) = 0 it is as much a restarted sequence as a continued one, and the
+   * frames after it tell. Mirrors the C# `Ax25Session.IsInSequenceIFrame`.
+   */
+  private isInSequenceIFrame(event: Ax25Event): boolean {
+    if (event.name !== "I_received" || event.frame === undefined) return false;
+    const ns = getNs(event.frame);
+    return ns !== 0 && ns === this.context.vr;
   }
 
   /**
@@ -398,6 +526,10 @@ export class SdlSessionDriver {
    * `Ax25Session.NoteConnectingUa`.
    */
   private noteConnectingUa(event: Ax25Event, stateBefore: string): void {
+    if (this.state !== "Connected" && this.state !== "TimerRecovery") {
+      this.droppedUa = null;
+    }
+
     if (this.state !== "Connected") {
       this.connectingUa = null;
     } else if (
@@ -411,37 +543,34 @@ export class SdlSessionDriver {
   }
 
   /**
-   * `repeatedConnectSabmReacknowledged`: true when `event` is a byte-identical
-   * copy of the SABM(E) this driver answered with UA while the link was being
-   * set up, arriving on the connected link before the peer has sent anything
-   * else. The peer is still waiting for that UA and has retried; the figure
-   * would read the copy as the §6.5 reset. Any frame from the peer other than a
-   * UA or the same SABM(E) ends the window. Mirrors the C#
+   * `repeatedConnectSabmReacknowledged`: true when `event` is a SABM(E) of the
+   * link's modulo arriving on the connected link from a peer whose SABM(E)
+   * this driver has answered, while the peer has sent nothing since that moved
+   * a sequence variable. The peer is still waiting for that UA and has
+   * retried; the figure would read the retry as the §6.5 reset (figc4.4 /
+   * figc4.5 `t1x_sabm(e)_received_*`) and discard what this end has queued.
+   * Re-acknowledging keeps the two ends in step: the peer is at
+   * V(s) = V(r) = 0, and so are this end's V(a) and V(r), since nothing from
+   * the peer has moved them; what this end has outstanding is sent from
+   * N(S) = 0 by the usual recovery. A SABM(E) of the other modulo, or one
+   * after an I or S frame from the peer, runs the figure: that peer has moved
+   * on and may really mean a reset. Frames that move no sequence variable
+   * (UA, XID, UI, TEST) leave the window open. A SABM(E) on a link this end
+   * dialled, from a peer whose call it never answered, runs the figure too: on
+   * the wire that is the same frame as a peer that started over, and the node
+   * hands such a link to a fresh owner. Mirrors the C#
    * `Ax25Session.IsRepeatedConnectSabm`.
    */
   private isRepeatedConnectSabm(event: Ax25Event): boolean {
-    const connecting = this.connectingSabm;
-    if (connecting === null || !FRAME_EVENT_NAMES.has(event.name)) {
+    if (
+      !this.context.quirks.repeatedConnectSabmReacknowledged ||
+      !this.peerCallAnswered ||
+      (this.state !== "Connected" && this.state !== "TimerRecovery")
+    ) {
       return false;
     }
-    if (
-      (event.name === "SABM_received" || event.name === "SABME_received") &&
-      event.frame !== undefined &&
-      sameBytes(encodeFrame(event.frame), connecting)
-    ) {
-      // In AwaitingConnection / AwaitingV22Connection the figure itself answers
-      // the copy with UA and waits on, so only a copy on the connected link is
-      // ours to handle.
-      return (
-        this.context.quirks.repeatedConnectSabmReacknowledged &&
-        (this.state === "Connected" || this.state === "TimerRecovery")
-      );
-    }
-    // A UA is how a dial that crossed the peer's call connects, and a copy of
-    // it (repeatedConnectUaIgnored) is no sign the peer has moved on.
-    if (event.name !== "UA_received") {
-      this.connectingSabm = null;
-    }
+    if (event.name === "SABM_received") return !this.context.isExtended;
+    if (event.name === "SABME_received") return this.context.isExtended;
     return false;
   }
 
@@ -472,39 +601,42 @@ export class SdlSessionDriver {
   }
 
   /**
-   * Keep the SABM(E) this driver answered with UA while the link was being set
-   * up (for {@link isRepeatedConnectSabm}): one that took it from Disconnected
-   * to Connected (figc4.1), or one that crossed our own dial in
-   * AwaitingConnection or AwaitingV22Connection. Forget it once the link leaves
-   * the connecting and connected states, or when this end re-establishes the
-   * link itself. Mirrors the C# `Ax25Session.NoteConnectingSabm`.
+   * Track whether this driver has answered a SABM(E) from the peer and heard
+   * nothing from it since that moved a sequence variable (for
+   * {@link isRepeatedConnectSabm}). Set by a SABM(E) the figure answered with
+   * UA and that left the link at V(s) = V(a) = V(r) = 0: one that took the
+   * link from Disconnected to Connected, one that crossed our own dial in
+   * AwaitingConnection or AwaitingV22Connection, or one that reset a connected
+   * link. Cleared by any I or S frame from the peer, and by leaving the
+   * connecting and connected states. This end re-establishing the link itself
+   * (a DL-CONNECT request on a link the peer's call had just brought up,
+   * packet-net/packet.net#862) does not clear it: that puts this end at zero
+   * too, so the peer's retry is still safe to answer, and the figure's reset on
+   * it would discard what this end queued on the new link with nothing said to
+   * its owner (seen on a simulated AFSK channel). Mirrors the C#
+   * `Ax25Session.NotePeerCall`.
    */
-  private noteConnectingSabm(event: Ax25Event, stateBefore: string): void {
-    const live =
-      this.state === "AwaitingConnection" ||
-      this.state === "AwaitingV22Connection" ||
-      this.state === "Connected" ||
-      this.state === "TimerRecovery";
-    if (!this.context.quirks.repeatedConnectSabmReacknowledged || !live) {
-      this.connectingSabm = null;
+  private notePeerCall(event: Ax25Event): void {
+    const connected = this.state === "Connected" || this.state === "TimerRecovery";
+    const connecting =
+      this.state === "AwaitingConnection" || this.state === "AwaitingV22Connection";
+    if (!this.context.quirks.repeatedConnectSabmReacknowledged || !(connected || connecting)) {
+      this.peerCallAnswered = false;
       return;
     }
 
-    const isSabm = event.name === "SABM_received";
-    const isSabme = event.name === "SABME_received";
     const answered =
-      event.frame !== undefined &&
-      (((isSabm || isSabme) && stateBefore === "Disconnected" && this.state === "Connected") ||
-        (isSabm && (stateBefore === "AwaitingConnection" || stateBefore === "AwaitingV22Connection")) ||
-        (isSabme && stateBefore === "AwaitingV22Connection"));
+      (event.name === "SABM_received" && (connected || this.state === "AwaitingConnection")) ||
+      (event.name === "SABME_received" && (connected || this.state === "AwaitingV22Connection"));
 
-    if (answered && event.frame !== undefined) {
-      this.connectingSabm = encodeFrame(event.frame);
-    } else if (
-      (stateBefore === "Connected" || stateBefore === "TimerRecovery") &&
-      (this.state === "AwaitingConnection" || this.state === "AwaitingV22Connection")
-    ) {
-      this.connectingSabm = null;
+    if (answered) {
+      // Only when the answer left the link at zero: figc4.5's V(s) = V(a) arms
+      // (t13 / t14 `_yes`) keep the sequence variables, and re-acknowledging a
+      // retry from there would leave this end's V(r) ahead of a peer at zero.
+      this.peerCallAnswered =
+        this.context.vs === 0 && this.context.va === 0 && this.context.vr === 0;
+    } else if (SEQUENCE_EVENT_NAMES.has(event.name)) {
+      this.peerCallAnswered = false;
     }
   }
 
@@ -723,6 +855,28 @@ const FRAME_EVENT_NAMES: ReadonlySet<string> = new Set([
   "info_not_permitted_in_frame",
   "u_or_s_frame_length_error",
 ]);
+
+/**
+ * The events made from the peer's I and S frames, the ones that can move a
+ * sequence variable; any of them ends `peerCallAnswered`. Mirrors the type
+ * test in the C# `Ax25Session.NotePeerCall`.
+ */
+const SEQUENCE_EVENT_NAMES: ReadonlySet<string> = new Set([
+  "I_received",
+  "RR_received",
+  "RNR_received",
+  "REJ_received",
+  "SREJ_received",
+  "i_or_s_command_received",
+]);
+
+/** The PID byte (0 if none) followed by the information field. */
+function infoWithPid(frame: Ax25Frame): Uint8Array {
+  const bytes = new Uint8Array(frame.info.length + 1);
+  bytes[0] = frame.pid ?? 0;
+  bytes.set(frame.info, 1);
+  return bytes;
+}
 
 function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   if (a.length !== b.length) return false;

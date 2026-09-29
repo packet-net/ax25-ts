@@ -131,9 +131,11 @@ export interface Ax25SessionQuirks {
    * reset, and the figure's reset brings the two ends back into step).
    * LinBPQ discards every UA on a link that is up (`L2Code.c` `SDUFRM`:
    * "DISCARD - PROBABLY REPEAT OF ACK OF SABM") and the Linux kernel drops
-   * them too; direwolf and rax25 follow the figure. When `false`
-   * ({@link strictlyFaithfulSessionQuirks}), every UA in the connected state
-   * resets the link as drawn.
+   * them too; direwolf and rax25 follow the figure, and
+   * {@link unexpectedUaIgnored} (on by default) does the same as LinBPQ,
+   * subsuming this quirk. When `false` ({@link strictlyFaithfulSessionQuirks})
+   * and {@link unexpectedUaIgnored} is off too, every UA in the connected
+   * state resets the link as drawn.
    *
    * Mirrors `Ax25SessionQuirks.RepeatedConnectUaIgnored` in
    * packet-net/packet.net (issue #842).
@@ -141,39 +143,103 @@ export interface Ax25SessionQuirks {
   repeatedConnectUaIgnored: boolean;
 
   /**
+   * Drop every UA received while the link is up (Connected or Timer
+   * Recovery), rather than reading it as the §6.5 unexpected UA and resetting
+   * the link. Default `true`. A de-facto-interop quirk, not a figure defect.
+   *
+   * A station sends UA only in answer to a SABM, SABME or DISC. On a link that
+   * is up this end has none of those outstanding, so a UA that arrives can
+   * only be a late or repeated answer to the SABM(E) that set the link up: the
+   * answer to a T1 retry of it that was still queued behind a slow transmitter
+   * when the first answer arrived, or a second copy from a path that
+   * duplicates frames. figc4.4's and figc4.5's UA arms (`t17_ua_received_*`,
+   * `t11_ua_received`) reset on it as §6.5 asks, discarding what both ends
+   * have queued, and the retry's UA reaches the dialler after the peer's first
+   * data, so the reset lands on a link that is carrying traffic (two stations
+   * dialling each other at once, packet-net/packet.net#874).
+   *
+   * When `true`, a UA received in Connected or Timer Recovery is dropped
+   * before dispatch, whatever its F bit and whatever the peer sent before it.
+   * Nothing else changes: no signal to layer 3, timers and sequence variables
+   * as they were, and neither the {@link repeatedConnectUaIgnored} nor the
+   * {@link repeatedConnectSabmReacknowledged} window is touched. This is what
+   * LinBPQ does (`L2Code.c` `SDUFRM`: "DISCARD - PROBABLY REPEAT OF ACK OF
+   * SABM") and what the Linux kernel does (`ax25_std_in.c`
+   * `ax25_std_state3_machine` has no UA case); direwolf and rax25 follow the
+   * figure. It subsumes {@link repeatedConnectUaIgnored}, which stays for the
+   * narrow case on its own.
+   *
+   * One thing the UA can mean is kept: a peer that follows the figure resets
+   * its link on our retry (§6.3.3), answers UA, and sends again from
+   * N(S) = 0. Dropping that UA and nothing more would take its restarted
+   * frames for duplicates of the ones already delivered, discard them and
+   * acknowledge them, and nobody would know (LinBPQ and Linux have that
+   * hole). So the dropped UA is remembered, and if the peer's next I frame is
+   * numbered 0 with new bytes (PID and information field) while V(r) is not
+   * 0, its sequence has restarted and the UA is dispatched then: the figure's
+   * reset runs, both ends are told, and the peer's data goes on the new link.
+   * A frame numbered 0 with the bytes of the one already taken is a duplicate
+   * or a retransmission and is left to the figure as such, and an in-sequence
+   * frame past 0 shows the peer carried on, which forgets the UA. When `false`
+   * ({@link strictlyFaithfulSessionQuirks}), every UA on an up link resets it
+   * as drawn, unless {@link repeatedConnectUaIgnored} absorbs it.
+   *
+   * Mirrors `Ax25SessionQuirks.UnexpectedUaIgnored` in packet-net/packet.net
+   * (issue #874).
+   */
+  unexpectedUaIgnored: boolean;
+
+  /**
    * Answer a repeat of the peer's connecting SABM or SABME with UA again,
    * rather than reading it as the §6.5 reset and discarding what this end has
    * queued. Default `true`. A de-facto-interop quirk, not a figure defect.
    *
    * A station that sent SABM(E) and did not hear the UA sends it again when T1
-   * runs out (§6.3.1). If this end had answered it and is connected by then,
-   * figc4.4's SABM(E) arm (`t14_sabm_received_*`, `t15_sabme_received_*`;
-   * figc4.5 the same in Timer Recovery) runs the resetting procedure, as §6.3.3
-   * asks: UA, DL-ERROR (F), and with frames outstanding Discard I Frame Queue
-   * and DL-CONNECT indication, V(s) = V(a) = V(r) = 0. The figure keeps no
-   * memory of the SABM(E) that set the link up, so whatever this end sent after
-   * connecting is thrown away, and the peer had already discarded it while it
-   * waited. Two stations that dial each other at once and lose one UA of the
-   * crossing do exactly this, and so does any call we answer with a banner when
-   * our UA is lost.
+   * runs out (§6.3.1). If this end is connected by then, figc4.4's SABM(E) arm
+   * (`t14_sabm_received_*`, `t15_sabme_received_*`; figc4.5 the same in Timer
+   * Recovery) runs the resetting procedure, as §6.3.3 asks: UA, DL-ERROR (F),
+   * and with frames outstanding Discard I Frame Queue and DL-CONNECT
+   * indication, V(s) = V(a) = V(r) = 0. The figure keeps no memory of how the
+   * link came up, so whatever this end sent after connecting is thrown away,
+   * and the peer had already discarded it while it waited. Two stations that
+   * dial each other at once and lose one UA of the crossing do exactly this,
+   * and so does any call we answer with a banner when our UA is lost.
    *
-   * When `true`, the driver keeps the SABM(E) it answered with UA while the
-   * link was being set up: one that took it from Disconnected to Connected
-   * (figc4.1), or one that crossed our own dial in AwaitingConnection or
-   * AwaitingV22Connection. While the link is Connected or in Timer Recovery
-   * and the peer has sent nothing else since (a UA does not count), a
-   * byte-identical SABM(E) is answered with UA (F = P) and nothing else
-   * happens. Any other frame from the peer ends that, and so does the link
-   * leaving those states. The ends stay in step even if the peer did mean a
-   * reset: it has sent and acknowledged nothing, so what this end has
-   * outstanding is retransmitted from N(S) = 0. LinBPQ answers every SABM on a
-   * link that has had no I frame yet with UA ("REPEAT OF ORIGINAL SABM COS
-   * OTHER END MISSED UA"); this is narrower. When `false`
-   * ({@link strictlyFaithfulSessionQuirks}), the repeat resets the link as
-   * drawn.
+   * When `true`, the driver notes that it answered a SABM(E) from the peer:
+   * one that took it from Disconnected to Connected (figc4.1), one that
+   * crossed our own dial in AwaitingConnection or AwaitingV22Connection
+   * (figc4.2 / figc4.6 answer it with UA and wait on), or one that reset a
+   * connected link, provided the answer left the link at
+   * V(s) = V(a) = V(r) = 0 (figc4.5's V(s) = V(a) arms, `t13` / `t14` `_yes`,
+   * keep the sequence variables, and re-acknowledging a retry from there would
+   * leave this end's V(r) ahead of a peer at zero). While the link is
+   * Connected or in Timer Recovery and the peer has sent nothing since that
+   * moved a sequence variable (an I, RR, RNR, REJ or SREJ frame), a SABM on a
+   * mod-8 link or a SABME on a mod-128 link is answered with UA (F = P) and
+   * nothing else happens. The link leaving the connecting and connected states
+   * ends that too, but this end re-establishing the link itself does not: a
+   * DL-CONNECT request on a link the peer's call had just brought up
+   * (packet-net/packet.net#862) puts this end at zero too, so the peer's retry
+   * is still safe to answer, and the figure's reset on it would discard what
+   * this end queued on the new link with nothing said to its owner (seen on a
+   * simulated AFSK channel). Frames that move no sequence variable
+   * (UA, XID, UI, TEST) leave the window open, and the P bit makes no
+   * difference. The ends stay in step even if the peer did mean a reset: it
+   * has sent and acknowledged nothing, so its V(s) = V(r) = 0 match this end's
+   * V(a) and V(r), and what this end has outstanding is retransmitted from
+   * N(S) = 0. A SABM(E) of the other modulo, or one after an I or S frame from
+   * the peer, runs the figure. So does one on a link this end dialled from a
+   * peer whose call it never answered (the peer's own SABM(E) lost in a
+   * crossing, say): on the wire that is the same frame as a peer that started
+   * over, which the node hands to a fresh owner, and the two cannot be told
+   * apart at this layer. LinBPQ answers every SABM on a link that has had no I
+   * frame yet with UA ("REPEAT OF ORIGINAL SABM COS OTHER END MISSED UA");
+   * this is narrower: only from a peer whose call we answered, and closed by
+   * any S frame too. When `false` ({@link strictlyFaithfulSessionQuirks}), the
+   * repeat resets the link as drawn.
    *
    * Mirrors `Ax25SessionQuirks.RepeatedConnectSabmReacknowledged` in
-   * packet-net/packet.net (issue #856).
+   * packet-net/packet.net (issues #856 and #874).
    */
   repeatedConnectSabmReacknowledged: boolean;
 
@@ -494,6 +560,7 @@ export const defaultSessionQuirks: Ax25SessionQuirks = {
   segmentFirstCarriesL3Pid: true,
   srejCommandIgnored: true,
   repeatedConnectUaIgnored: true,
+  unexpectedUaIgnored: true,
   repeatedConnectSabmReacknowledged: true,
   ax25Spec41KarnSrtSampling: true,
   ax25Spec42SrejTargetsGap: true,
@@ -516,6 +583,7 @@ export const strictlyFaithfulSessionQuirks: Ax25SessionQuirks = {
   segmentFirstCarriesL3Pid: false,
   srejCommandIgnored: false,
   repeatedConnectUaIgnored: false,
+  unexpectedUaIgnored: false,
   repeatedConnectSabmReacknowledged: false,
   ax25Spec41KarnSrtSampling: false,
   ax25Spec42SrejTargetsGap: false,

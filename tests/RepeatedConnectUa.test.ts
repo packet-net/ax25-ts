@@ -6,12 +6,16 @@
  * figc4.4 then reads the second, in the connected state, as an unexpected UA
  * and re-establishes, which BPQ answers with two UAs again, for ever. The quirk
  * drops a UA that is byte for byte the one that just connected the link and is
- * the very next frame the peer sends; anything else still runs the figure.
+ * the very next frame the peer sends; anything else is left to the figure.
+ * `unexpectedUaIgnored` (packet-net/packet.net#874, on by default) goes further
+ * and drops every UA on an up link, so the shapes the narrow quirk leaves to
+ * the figure are dropped by default and reset only with that quirk off.
  */
 import { describe, expect, it } from "vitest";
 import { Callsign } from "../src/callsign.js";
-import { type Ax25Frame, iFrame, isCommand, rr, ua } from "../src/frame.js";
+import { type Ax25Frame, iFrame, isCommand, pollFinal, rr, ua } from "../src/frame.js";
 import { Ax25Listener, type Ax25ListenerSession } from "../src/listener.js";
+import type { DataLinkSignal } from "../src/sdl/action-dispatcher.js";
 import {
   type Ax25SessionQuirks,
   defaultSessionQuirks,
@@ -41,6 +45,19 @@ function isEstablish(f: Ax25Frame): boolean {
 
 function isRrResponse(f: Ax25Frame): boolean {
   return (f.control & 0x0f) === 0x01 && !isCommand(f);
+}
+
+function isPollAnswer(f: Ax25Frame): boolean {
+  return isRrResponse(f) && pollFinal(f);
+}
+
+const isReset = (s: DataLinkSignal): boolean =>
+  s.type === "DL_CONNECT_indication" || s.type === "DL_ERROR_indication";
+
+function watch(session: Ax25ListenerSession): DataLinkSignal[] {
+  const signals: DataLinkSignal[] = [];
+  session.onDataLinkSignal((s) => signals.push(s));
+  return signals;
 }
 
 async function dial(
@@ -101,30 +118,75 @@ describe("repeatedConnectUaIgnored", () => {
     await listener.dispose();
   });
 
-  it("a UA after other traffic from the peer still resets the link", async () => {
-    const { listener, transport, connecting } = await dial(defaultSessionQuirks, false);
+  it("with unexpectedUaIgnored off, repeatedConnectUaIgnored alone still absorbs a doubled connecting UA", async () => {
+    const { listener, transport, connecting } = await dial(
+      { ...defaultSessionQuirks, unexpectedUaIgnored: false },
+      false,
+    );
     const connectingUa = ua({ destination: Local, source: Peer, finalBit: true });
+    transport.injectInbound(connectingUa);
     transport.injectInbound(connectingUa);
     const session = await withTimeout(connecting, 10_000);
 
-    transport.injectInbound(
-      iFrame({ destination: Local, source: Peer, nr: 0, ns: 0, info: new TextEncoder().encode("DAPPSv1>\r") }),
-    );
-    transport.injectInbound(connectingUa);
+    transport.injectInbound(rr({ destination: Local, source: Peer, nr: 0, isCommand: true, pollFinal: true }));
+    await waitFor(() => sent(transport).some(isPollAnswer), 5000, "the poll is answered");
 
-    await waitFor(() => sent(transport).filter(isEstablish).length === 2, 5000, "a SABM follows the late UA");
-    expect(session.state).toBe("AwaitingConnection");
+    expect(session.state).toBe("Connected");
+    expect(sent(transport).filter(isEstablish)).toHaveLength(1);
     await listener.dispose();
   });
 
-  it("a UA that differs from the connecting one still resets the link", async () => {
+  // Two shapes the narrow quirk leaves to the figure: a UA after other traffic
+  // from the peer, and a UA that differs from the connecting one (F=0).
+  // unexpectedUaIgnored (packet-net/packet.net#874) drops both.
+  const lateUaShapes: [string, (transport: LoopbackTransport) => void][] = [
+    [
+      "a UA after other traffic from the peer",
+      (transport) => {
+        transport.injectInbound(
+          iFrame({ destination: Local, source: Peer, nr: 0, ns: 0, info: new TextEncoder().encode("DAPPSv1>\r") }),
+        );
+        transport.injectInbound(ua({ destination: Local, source: Peer, finalBit: true }));
+      },
+    ],
+    [
+      "a UA that differs from the connecting one",
+      (transport) => {
+        transport.injectInbound(ua({ destination: Local, source: Peer, finalBit: false }));
+      },
+    ],
+  ];
+
+  it.each(lateUaShapes)("%s is dropped under the default quirks", async (_shape, inject) => {
     const { listener, transport, connecting } = await dial(defaultSessionQuirks, false);
     transport.injectInbound(ua({ destination: Local, source: Peer, finalBit: true }));
     const session = await withTimeout(connecting, 10_000);
-    transport.injectInbound(ua({ destination: Local, source: Peer, finalBit: false }));
+    const signals = watch(session);
 
-    await waitFor(() => sent(transport).filter(isEstablish).length === 2, 5000, "a different UA is unexpected");
-    expect(session.state).toBe("AwaitingConnection");
+    inject(transport);
+    transport.injectInbound(rr({ destination: Local, source: Peer, nr: 0, isCommand: true, pollFinal: true }));
+    await waitFor(() => sent(transport).some(isPollAnswer), 5000, "the poll is answered");
+
+    expect(session.state).toBe("Connected");
+    expect(sent(transport).filter(isEstablish)).toHaveLength(1);
+    expect(signals.filter(isReset)).toHaveLength(0);
     await listener.dispose();
   });
+
+  it.each(lateUaShapes)(
+    "%s still resets the link with unexpectedUaIgnored off",
+    async (_shape, inject) => {
+      const { listener, transport, connecting } = await dial(
+        { ...defaultSessionQuirks, unexpectedUaIgnored: false },
+        false,
+      );
+      transport.injectInbound(ua({ destination: Local, source: Peer, finalBit: true }));
+      const session = await withTimeout(connecting, 10_000);
+
+      inject(transport);
+      await waitFor(() => sent(transport).filter(isEstablish).length === 2, 5000, "a SABM follows the late UA");
+      expect(session.state).toBe("AwaitingConnection");
+      await listener.dispose();
+    },
+  );
 });
