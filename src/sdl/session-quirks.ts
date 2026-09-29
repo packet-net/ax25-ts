@@ -613,3 +613,47 @@ export const strictlyFaithfulSessionQuirks: Ax25SessionQuirks = {
   ax25Spec9AckProgressResetsRc: false,
   ax25Spec13ClampSrejWindowToHalfModulus: false,
 };
+
+/**
+ * The `packethacking/ax25spec` issue behind an `ax25Spec<N>...` quirk, with
+ * the packet.net issue that tracks the quirk's removal where there is one.
+ */
+export interface Ax25SpecIssue {
+  /** The `packethacking/ax25spec` issue number, the `N` in the quirk's name. */
+  readonly issue: number;
+  /** Link to that issue. */
+  readonly url: string;
+  /** The packet-net/packet.net issue tracking this quirk's removal, if any. */
+  readonly removalTrackedIn?: number;
+}
+
+const specIssue = (issue: number, removalTrackedIn?: number): Ax25SpecIssue =>
+  Object.freeze({
+    issue,
+    url: `https://github.com/packethacking/ax25spec/issues/${issue}`,
+    ...(removalTrackedIn === undefined ? {} : { removalTrackedIn }),
+  });
+
+/**
+ * Every quirk named after a `packethacking/ax25spec` issue, keyed by quirk
+ * name, so the issue reference lives in code and a test can hold it to the
+ * number in the name. A quirk whose name starts `ax25Spec<N>` is listed here
+ * and nothing else is. Mirrors `Ax25SessionQuirks.SpecIssues` (built from the
+ * `[Ax25SpecIssue]` attributes) in packet-net/packet.net.
+ */
+export const sessionQuirkSpecIssues: Readonly<
+  Partial<Record<keyof Ax25SessionQuirks, Ax25SpecIssue>>
+> = Object.freeze({
+  ax25Spec9AckProgressResetsRc: specIssue(9),
+  ax25Spec13ClampSrejWindowToHalfModulus: specIssue(13),
+  ax25Spec41KarnSrtSampling: specIssue(41),
+  ax25Spec42SrejTargetsGap: specIssue(42),
+  ax25Spec43DlFlowOffEntersBusy: specIssue(43),
+  ax25Spec44Mod128ConnectRoutesToV22: specIssue(44),
+  ax25Spec45FrmrFallbackReestablishesV20: specIssue(45),
+  ax25Spec47TimerRecoveryDrainAdvancesVR: specIssue(47),
+  ax25Spec48DmRejectionDegradesToV20: specIssue(48),
+  ax25Spec50RepeatedConnectSabmReacknowledged: specIssue(50, 881),
+  ax25Spec114RepeatedConnectUaIgnored: specIssue(114, 880),
+  ax25Spec114UnexpectedUaIgnored: specIssue(114, 880),
+});

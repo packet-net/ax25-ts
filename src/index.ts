@@ -151,7 +151,9 @@ export type { Ax25Event } from "./sdl/events.js";
 export { classifyFrame } from "./sdl/frame-classifier.js";
 export {
   type Ax25SessionQuirks,
+  type Ax25SpecIssue,
   defaultSessionQuirks,
+  sessionQuirkSpecIssues,
   strictlyFaithfulSessionQuirks,
 } from "./sdl/session-quirks.js";
 export type { DataLinkSignal, MdlSignal } from "./sdl/action-dispatcher.js";
