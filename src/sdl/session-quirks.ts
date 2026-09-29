@@ -107,6 +107,39 @@ export interface Ax25SessionQuirks {
    */
   srejCommandIgnored: boolean;
 
+  /**
+   * Drop a repeated copy of the UA that just connected the link, rather than
+   * reading it as an unexpected UA and resetting. Default `true`. A
+   * de-facto-interop quirk, not a figure defect.
+   *
+   * figc4.4's connected-state UA arm (`t17_ua_received_*`) raises DL-ERROR and
+   * runs Establish Data Link, as §6.5 asks: "A TNC initiates a reset procedure
+   * whenever it receives an unexpected UA response frame." The figure keeps no
+   * memory of the UA that connected the link, so it cannot tell a second
+   * delivery of that UA from a genuinely unexpected one, and the spec does not
+   * consider duplicate delivery. A path that delivers every frame twice then
+   * never connects: the dialler resets on the copy, sends SABM(E) again, and
+   * gets two UAs again. LinBPQ with two AXIP `MAP` lines for one address does
+   * exactly that, and a UDP path can duplicate a datagram on its own.
+   *
+   * When `true`, a UA received in the connected state is dropped if it is byte
+   * for byte the UA that took this link from AwaitingConnection or
+   * AwaitingV22Connection to Connected, and no other frame from the peer has
+   * arrived since; any number of copies are dropped. Anything else still runs
+   * the figure: a UA that differs, or one that follows other traffic from the
+   * peer (a peer that answered a retried SABM after sending data has really
+   * reset, and the figure's reset brings the two ends back into step).
+   * LinBPQ discards every UA on a link that is up (`L2Code.c` `SDUFRM`:
+   * "DISCARD - PROBABLY REPEAT OF ACK OF SABM") and the Linux kernel drops
+   * them too; direwolf and rax25 follow the figure. When `false`
+   * ({@link strictlyFaithfulSessionQuirks}), every UA in the connected state
+   * resets the link as drawn.
+   *
+   * Mirrors `Ax25SessionQuirks.RepeatedConnectUaIgnored` in
+   * packet-net/packet.net (issue #842).
+   */
+  repeatedConnectUaIgnored: boolean;
+
 
   /**
    * Work around `packethacking/ax25spec#41`: figc4.7 `Select_T1_Value`
@@ -423,6 +456,7 @@ export interface Ax25SessionQuirks {
 export const defaultSessionQuirks: Ax25SessionQuirks = {
   segmentFirstCarriesL3Pid: true,
   srejCommandIgnored: true,
+  repeatedConnectUaIgnored: true,
   ax25Spec41KarnSrtSampling: true,
   ax25Spec42SrejTargetsGap: true,
   ax25Spec43DlFlowOffEntersBusy: true,
@@ -443,6 +477,7 @@ export const defaultSessionQuirks: Ax25SessionQuirks = {
 export const strictlyFaithfulSessionQuirks: Ax25SessionQuirks = {
   segmentFirstCarriesL3Pid: false,
   srejCommandIgnored: false,
+  repeatedConnectUaIgnored: false,
   ax25Spec41KarnSrtSampling: false,
   ax25Spec42SrejTargetsGap: false,
   ax25Spec43DlFlowOffEntersBusy: false,
