@@ -140,6 +140,43 @@ export interface Ax25SessionQuirks {
    */
   repeatedConnectUaIgnored: boolean;
 
+  /**
+   * Answer a repeat of the peer's connecting SABM or SABME with UA again,
+   * rather than reading it as the §6.5 reset and discarding what this end has
+   * queued. Default `true`. A de-facto-interop quirk, not a figure defect.
+   *
+   * A station that sent SABM(E) and did not hear the UA sends it again when T1
+   * runs out (§6.3.1). If this end had answered it and is connected by then,
+   * figc4.4's SABM(E) arm (`t14_sabm_received_*`, `t15_sabme_received_*`;
+   * figc4.5 the same in Timer Recovery) runs the resetting procedure, as §6.3.3
+   * asks: UA, DL-ERROR (F), and with frames outstanding Discard I Frame Queue
+   * and DL-CONNECT indication, V(s) = V(a) = V(r) = 0. The figure keeps no
+   * memory of the SABM(E) that set the link up, so whatever this end sent after
+   * connecting is thrown away, and the peer had already discarded it while it
+   * waited. Two stations that dial each other at once and lose one UA of the
+   * crossing do exactly this, and so does any call we answer with a banner when
+   * our UA is lost.
+   *
+   * When `true`, the driver keeps the SABM(E) it answered with UA while the
+   * link was being set up: one that took it from Disconnected to Connected
+   * (figc4.1), or one that crossed our own dial in AwaitingConnection or
+   * AwaitingV22Connection. While the link is Connected or in Timer Recovery
+   * and the peer has sent nothing else since (a UA does not count), a
+   * byte-identical SABM(E) is answered with UA (F = P) and nothing else
+   * happens. Any other frame from the peer ends that, and so does the link
+   * leaving those states. The ends stay in step even if the peer did mean a
+   * reset: it has sent and acknowledged nothing, so what this end has
+   * outstanding is retransmitted from N(S) = 0. LinBPQ answers every SABM on a
+   * link that has had no I frame yet with UA ("REPEAT OF ORIGINAL SABM COS
+   * OTHER END MISSED UA"); this is narrower. When `false`
+   * ({@link strictlyFaithfulSessionQuirks}), the repeat resets the link as
+   * drawn.
+   *
+   * Mirrors `Ax25SessionQuirks.RepeatedConnectSabmReacknowledged` in
+   * packet-net/packet.net (issue #856).
+   */
+  repeatedConnectSabmReacknowledged: boolean;
+
 
   /**
    * Work around `packethacking/ax25spec#41`: figc4.7 `Select_T1_Value`
@@ -457,6 +494,7 @@ export const defaultSessionQuirks: Ax25SessionQuirks = {
   segmentFirstCarriesL3Pid: true,
   srejCommandIgnored: true,
   repeatedConnectUaIgnored: true,
+  repeatedConnectSabmReacknowledged: true,
   ax25Spec41KarnSrtSampling: true,
   ax25Spec42SrejTargetsGap: true,
   ax25Spec43DlFlowOffEntersBusy: true,
@@ -478,6 +516,7 @@ export const strictlyFaithfulSessionQuirks: Ax25SessionQuirks = {
   segmentFirstCarriesL3Pid: false,
   srejCommandIgnored: false,
   repeatedConnectUaIgnored: false,
+  repeatedConnectSabmReacknowledged: false,
   ax25Spec41KarnSrtSampling: false,
   ax25Spec42SrejTargetsGap: false,
   ax25Spec43DlFlowOffEntersBusy: false,

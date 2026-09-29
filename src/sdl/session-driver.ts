@@ -1,4 +1,5 @@
 import {
+  type ActionStep,
   type Ax25Guard,
   DataLinkAwaitingConnection,
   DataLinkAwaitingV22Connection,
@@ -164,6 +165,14 @@ export class SdlSessionDriver {
    */
   private connectingUa: Uint8Array | null = null;
   /**
+   * `repeatedConnectSabmReacknowledged` (packet-net/packet.net#856): the
+   * encoded SABM(E) from the peer that this driver answered with UA while the
+   * link was being set up, kept until the peer sends anything else. A
+   * byte-identical copy on the connected link is the peer retrying after
+   * losing our UA, not the figure's reset. See {@link isRepeatedConnectSabm}.
+   */
+  private connectingSabm: Uint8Array | null = null;
+  /**
    * The state→page map this driver walks. Defaults to the data-link
    * {@link STATE_PAGES}; the MDL driver passes {@link MDL_STATE_PAGES} so the
    * same driver/dispatcher/guard machinery runs the 2-state management FSM.
@@ -279,6 +288,11 @@ export class SdlSessionDriver {
       this.vaAdvancedSinceT1Expiry = false;
     }
 
+    if (this.isRepeatedConnectSabm(event)) {
+      this.reacknowledgeConnectSabm(event);
+      return;
+    }
+
     if (this.isRepeatedConnectUa(event)) {
       return;
     }
@@ -333,6 +347,7 @@ export class SdlSessionDriver {
       );
       this.state = this.resolveNextState(match);
       this.noteConnectingUa(event, stateBefore);
+      this.noteConnectingSabm(event, stateBefore);
 
       // ax25spec#9 (ax25Spec9AckProgressResetsRc), step 1 of 2: note that this
       // transition advanced V(A) — the peer acknowledged NEW data. The RC clamp
@@ -392,6 +407,104 @@ export class SdlSessionDriver {
       (stateBefore === "AwaitingConnection" || stateBefore === "AwaitingV22Connection")
     ) {
       this.connectingUa = encodeFrame(event.frame);
+    }
+  }
+
+  /**
+   * `repeatedConnectSabmReacknowledged`: true when `event` is a byte-identical
+   * copy of the SABM(E) this driver answered with UA while the link was being
+   * set up, arriving on the connected link before the peer has sent anything
+   * else. The peer is still waiting for that UA and has retried; the figure
+   * would read the copy as the §6.5 reset. Any frame from the peer other than a
+   * UA or the same SABM(E) ends the window. Mirrors the C#
+   * `Ax25Session.IsRepeatedConnectSabm`.
+   */
+  private isRepeatedConnectSabm(event: Ax25Event): boolean {
+    const connecting = this.connectingSabm;
+    if (connecting === null || !FRAME_EVENT_NAMES.has(event.name)) {
+      return false;
+    }
+    if (
+      (event.name === "SABM_received" || event.name === "SABME_received") &&
+      event.frame !== undefined &&
+      sameBytes(encodeFrame(event.frame), connecting)
+    ) {
+      // In AwaitingConnection / AwaitingV22Connection the figure itself answers
+      // the copy with UA and waits on, so only a copy on the connected link is
+      // ours to handle.
+      return (
+        this.context.quirks.repeatedConnectSabmReacknowledged &&
+        (this.state === "Connected" || this.state === "TimerRecovery")
+      );
+    }
+    // A UA is how a dial that crossed the peer's call connects, and a copy of
+    // it (repeatedConnectUaIgnored) is no sign the peer has moved on.
+    if (event.name !== "UA_received") {
+      this.connectingSabm = null;
+    }
+    return false;
+  }
+
+  /**
+   * Answer the peer's repeated connecting SABM(E) as the figure answers a
+   * SABM(E) it does not act on (figc4.2 `t16_sabm_received`: `F := P`, `UA`),
+   * and change nothing else: no reset, no signal to layer 3, the I-frame queue
+   * and timers left as they are. Mirrors the C#
+   * `Ax25Session.ReacknowledgeConnectSabm`.
+   */
+  private reacknowledgeConnectSabm(event: Ax25Event): void {
+    this.currentTrigger = event;
+    try {
+      const tx: TransitionContext = {
+        context: this.context,
+        scheduler: this.scheduler,
+        event,
+        pending: { nr: null, ns: null, pfBit: null },
+        sendFrame: this.hooks.sendFrame,
+        emitUpward: this.hooks.emitUpward,
+        subroutines: this.subroutines,
+        postEvent: (evt) => this.pendingEvents.push(evt),
+      };
+      this.dispatcher.execute(REACKNOWLEDGE_STEPS, tx, this.state);
+    } finally {
+      this.currentTrigger = null;
+    }
+  }
+
+  /**
+   * Keep the SABM(E) this driver answered with UA while the link was being set
+   * up (for {@link isRepeatedConnectSabm}): one that took it from Disconnected
+   * to Connected (figc4.1), or one that crossed our own dial in
+   * AwaitingConnection or AwaitingV22Connection. Forget it once the link leaves
+   * the connecting and connected states, or when this end re-establishes the
+   * link itself. Mirrors the C# `Ax25Session.NoteConnectingSabm`.
+   */
+  private noteConnectingSabm(event: Ax25Event, stateBefore: string): void {
+    const live =
+      this.state === "AwaitingConnection" ||
+      this.state === "AwaitingV22Connection" ||
+      this.state === "Connected" ||
+      this.state === "TimerRecovery";
+    if (!this.context.quirks.repeatedConnectSabmReacknowledged || !live) {
+      this.connectingSabm = null;
+      return;
+    }
+
+    const isSabm = event.name === "SABM_received";
+    const isSabme = event.name === "SABME_received";
+    const answered =
+      event.frame !== undefined &&
+      (((isSabm || isSabme) && stateBefore === "Disconnected" && this.state === "Connected") ||
+        (isSabm && (stateBefore === "AwaitingConnection" || stateBefore === "AwaitingV22Connection")) ||
+        (isSabme && stateBefore === "AwaitingV22Connection"));
+
+    if (answered && event.frame !== undefined) {
+      this.connectingSabm = encodeFrame(event.frame);
+    } else if (
+      (stateBefore === "Connected" || stateBefore === "TimerRecovery") &&
+      (this.state === "AwaitingConnection" || this.state === "AwaitingV22Connection")
+    ) {
+      this.connectingSabm = null;
     }
   }
 
@@ -576,6 +689,12 @@ export class SdlSessionDriver {
     this.postEvent({ name: `${name}_expiry` });
   }
 }
+
+/** figc4.2 `t16_sabm_received`'s answer: `F := P`, then UA. */
+const REACKNOWLEDGE_STEPS: readonly ActionStep[] = [
+  { verb: "F := P", kind: "processing" },
+  { verb: "UA", kind: "signal_lower" },
+];
 
 /**
  * The events made from a frame the peer sent, as opposed to upper-layer
