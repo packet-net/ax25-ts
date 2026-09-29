@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+### Added
+
+- **`repeatedConnectSabmReacknowledged` session quirk** - answer a repeat of the peer's connecting SABM or SABME with UA again, rather than reading it as the §6.5 reset and discarding what this end has queued. Default `true`; cleared by `strictlyFaithfulSessionQuirks`. A peer that lost our UA retries its SABM(E) on T1; if we are connected by then, figc4.4 / figc4.5 reset the link and, with frames outstanding, discard the I-frame queue, so data we sent at once (a crossed call, a banner) is lost at both ends. The quirk answers only a byte-identical copy of the SABM(E) we answered with UA while the link was set up, and only until the peer sends anything but a UA; anything else still resets as drawn. LinBPQ answers every SABM on a link that has had no I frame yet with UA ("REPEAT OF ORIGINAL SABM COS OTHER END MISSED UA"). Parity with `Ax25SessionQuirks.RepeatedConnectSabmReacknowledged` (packet-net/packet.net#856).
+
 ## [0.20.0] - 2026-09-29
 
 Parity with the C# reference at packet.net **lib-v0.45.0**: the repeated-connect-UA session quirk.
