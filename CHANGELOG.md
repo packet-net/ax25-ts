@@ -6,6 +6,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-09-29
+
+Parity with the C# reference at packet.net **lib-v0.45.0**: the repeated-connect-UA session quirk.
+
 ### Added
 
 - **`repeatedConnectUaIgnored` session quirk** - drop a repeated copy of the UA that just connected a dial, rather than reading it as an unexpected UA and resetting the link. Default `true`; cleared by `strictlyFaithfulSessionQuirks`. LinBPQ with two AXIP `MAP` lines for one address sends every frame twice, and figc4.4's connected-state UA arm (DL-ERROR, Establish Data Link, as §6.5 asks for an unexpected UA) then re-establishes for ever. The quirk drops only a byte-identical UA that is the peer's very next frame; a UA that differs, or one after other traffic from the peer, still resets as drawn. LinBPQ itself discards every UA on an up link (`L2Code.c` `SDUFRM`: "PROBABLY REPEAT OF ACK OF SABM"). Parity with `Ax25SessionQuirks.RepeatedConnectUaIgnored` (packet-net/packet.net#842).
