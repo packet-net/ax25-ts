@@ -11,7 +11,7 @@ import {
   type StatePage,
   type TransitionSpec,
 } from "ax25sdl";
-import type { Ax25Frame } from "../frame.js";
+import { type Ax25Frame, encodeFrame } from "../frame.js";
 import {
   ActionDispatcher,
   type DataLinkSignal,
@@ -157,6 +157,13 @@ export class SdlSessionDriver {
    */
   private vaAdvancedSinceT1Expiry = false;
   /**
+   * `repeatedConnectUaIgnored` (packet-net/packet.net#842): the encoded UA that
+   * took this link to Connected, kept only while it is still the last frame
+   * the peer sent. A byte-identical UA arriving next is a second delivery of
+   * it, not the figure's unexpected UA. See {@link isRepeatedConnectUa}.
+   */
+  private connectingUa: Uint8Array | null = null;
+  /**
    * The state→page map this driver walks. Defaults to the data-link
    * {@link STATE_PAGES}; the MDL driver passes {@link MDL_STATE_PAGES} so the
    * same driver/dispatcher/guard machinery runs the 2-state management FSM.
@@ -272,6 +279,10 @@ export class SdlSessionDriver {
       this.vaAdvancedSinceT1Expiry = false;
     }
 
+    if (this.isRepeatedConnectUa(event)) {
+      return;
+    }
+
     this.currentTrigger = event;
     try {
       const rawMatch = this.findMatchingTransition(page, event);
@@ -310,6 +321,7 @@ export class SdlSessionDriver {
         postEvent: (evt) => this.pendingEvents.push(evt),
       };
       const vaBefore = this.context.va;
+      const stateBefore = this.state;
       this.applyPreExecutionQuirks(match);
       executeWithLoops(
         match.actions,
@@ -320,6 +332,7 @@ export class SdlSessionDriver {
         this.state,
       );
       this.state = this.resolveNextState(match);
+      this.noteConnectingUa(event, stateBefore);
 
       // ax25spec#9 (ax25Spec9AckProgressResetsRc), step 1 of 2: note that this
       // transition advanced V(A) — the peer acknowledged NEW data. The RC clamp
@@ -334,6 +347,51 @@ export class SdlSessionDriver {
       }
     } finally {
       this.currentTrigger = null;
+    }
+  }
+
+  /**
+   * `repeatedConnectUaIgnored`: true when `event` is a second delivery of the
+   * UA that just connected this link, which is then dropped before the figure
+   * can read it as an unexpected UA (figc4.4 `t17_ua_received_*`) and reset
+   * the link. Any other frame from the peer ends the window, so only the frame
+   * straight after the connecting UA, and further identical copies of it, can
+   * be dropped. Mirrors the C# `Ax25Session.IsRepeatedConnectUa`.
+   */
+  private isRepeatedConnectUa(event: Ax25Event): boolean {
+    const connecting = this.connectingUa;
+    if (connecting === null || !FRAME_EVENT_NAMES.has(event.name)) {
+      return false;
+    }
+    if (
+      event.name === "UA_received" &&
+      event.frame !== undefined &&
+      this.context.quirks.repeatedConnectUaIgnored &&
+      this.state === "Connected" &&
+      sameBytes(encodeFrame(event.frame), connecting)
+    ) {
+      return true;
+    }
+    this.connectingUa = null;
+    return false;
+  }
+
+  /**
+   * Keep the UA that took a dial from AwaitingConnection or
+   * AwaitingV22Connection to Connected (for {@link isRepeatedConnectUa}), and
+   * forget it once the link leaves Connected by any route. Mirrors the C#
+   * `Ax25Session.NoteConnectingUa`.
+   */
+  private noteConnectingUa(event: Ax25Event, stateBefore: string): void {
+    if (this.state !== "Connected") {
+      this.connectingUa = null;
+    } else if (
+      this.context.quirks.repeatedConnectUaIgnored &&
+      event.name === "UA_received" &&
+      event.frame !== undefined &&
+      (stateBefore === "AwaitingConnection" || stateBefore === "AwaitingV22Connection")
+    ) {
+      this.connectingUa = encodeFrame(event.frame);
     }
   }
 
@@ -517,4 +575,40 @@ export class SdlSessionDriver {
     this.context.t1HadExpired = name === "T1" ? true : this.context.t1HadExpired;
     this.postEvent({ name: `${name}_expiry` });
   }
+}
+
+/**
+ * The events made from a frame the peer sent, as opposed to upper-layer
+ * primitives, timers and the driver's own internal events. Mirrors the C#
+ * `Ax25Session.IsFrameFromPeer`.
+ */
+const FRAME_EVENT_NAMES: ReadonlySet<string> = new Set([
+  "I_received",
+  "RR_received",
+  "RNR_received",
+  "REJ_received",
+  "SREJ_received",
+  "UI_received",
+  "SABM_received",
+  "SABME_received",
+  "DISC_received",
+  "UA_received",
+  "DM_received",
+  "FRMR_received",
+  "XID_received",
+  "TEST_received",
+  "i_or_s_command_received",
+  "all_other_commands",
+  "all_other_primitives__from_lower_layer",
+  "control_field_error",
+  "info_not_permitted_in_frame",
+  "u_or_s_frame_length_error",
+]);
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
 }
