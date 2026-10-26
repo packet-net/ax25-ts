@@ -52,6 +52,9 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Check the tools this job needs
+        run: scripts/ci-require-tools.sh git:git
+
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
